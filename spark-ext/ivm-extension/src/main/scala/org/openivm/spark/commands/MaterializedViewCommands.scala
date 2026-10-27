@@ -2844,7 +2844,7 @@ case class CreateMaterializedViewCommand(
             }
           // An existing view is only looked up; there is no state change to publish.
           if (finalizeUnderLock) {
-            if (outcome != "create_already_exists") OpenIvmStateSync.backupNow(spark)
+            if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
             createOutcome = outcome
           }
           outcome
@@ -2853,7 +2853,7 @@ case class CreateMaterializedViewCommand(
         }
       }
       if (!finalizeUnderLock) {
-        if (outcome != "create_already_exists") OpenIvmStateSync.backupNow(spark)
+        if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
         createOutcome = outcome
       }
       if (outcome == "create_executed")
@@ -4042,13 +4042,18 @@ case class RefreshMaterializedViewCommand(
           }
         } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
       }
-      // Garbage is read before the publish and deleted only after it, so the published state
-      // never references a deleted staging location.
+      // In async mode the same publication ordering holds in the background.
       val garbage = OpenIvmGarbageCollector.prepare(spark)
-      RefreshProfile.timeActiveStep("state_backup") {
-        OpenIvmStateSync.backupNow(spark)
+      if (FeatureGate.stateSyncAsyncEnabled(spark)) {
+        RefreshProfile.timeActiveStep("state_backup_enqueue") {
+          OpenIvmStateSync.backupForCommand(spark, () => OpenIvmGarbageCollector.collect(spark, garbage))
+        }
+      } else {
+        RefreshProfile.timeActiveStep("state_backup") {
+          OpenIvmStateSync.backupForCommand(spark)
+        }
+        OpenIvmGarbageCollector.collect(spark, garbage)
       }
-      OpenIvmGarbageCollector.collect(spark, garbage)
       commandCompleted = true
       rows
     } finally {
