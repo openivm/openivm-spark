@@ -10,6 +10,7 @@ import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException, UnresolvedAttribute}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
+  And,
   AttributeReference,
   EqualNullSafe,
   Expression,
@@ -37,7 +38,7 @@ import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.functions.{col, lit, sum, when}
 import org.apache.spark.sql.delta.DeltaLog
-import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructField, StructType}
+import org.apache.spark.sql.types.{ArrayType, ByteType, DataType, IntegerType, LongType, MapType, ShortType, StructField, StructType}
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
@@ -58,7 +59,7 @@ import org.openivm.spark.telemetry.{
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
-import java.util.{Collections, UUID}
+import java.util.{Collections, LinkedHashMap, UUID}
 import java.util.concurrent.locks.ReentrantLock
 import scala.util.control.NonFatal
 
@@ -67,14 +68,38 @@ import scala.util.control.NonFatal
 // ---------------------------------------------------------------------------
 private[commands] object OpenIvmCompilers {
 
-  private val cache: java.util.Map[SparkContext, Map[Option[String], OpenIvmCompiler]] =
-    Collections.synchronizedMap(new java.util.WeakHashMap[SparkContext, Map[Option[String], OpenIvmCompiler]]())
+  final class SessionCompiler(val compiler: OpenIvmCompiler) {
+    private val refreshPrograms = new LinkedHashMap[CompileRequest, CompiledRefresh](16, 0.75f, true)
 
-  def forSession(spark: SparkSession): OpenIvmCompiler = {
+    def cachedRefresh(request: CompileRequest): Option[CompiledRefresh] =
+      refreshPrograms.synchronized(Option(refreshPrograms.get(request)))
+
+    def rememberRefresh(request: CompileRequest, compiled: CompiledRefresh): Unit =
+      if (
+        compiled.refreshType != RefreshTypeCode.FullRefresh && compiled.sql.nonEmpty &&
+        compiled.sql.length.toLong + compiled.initialLoadSql.length <= 256 * 1024
+      ) {
+        refreshPrograms.synchronized {
+          refreshPrograms.put(request, compiled)
+          if (refreshPrograms.size() > 64) {
+            val oldest = refreshPrograms.keySet().iterator()
+            oldest.next()
+            oldest.remove()
+          }
+        }
+      }
+  }
+
+  private val cache: java.util.Map[SparkContext, Map[Option[String], SessionCompiler]] =
+    Collections.synchronizedMap(new java.util.WeakHashMap[SparkContext, Map[Option[String], SessionCompiler]]())
+
+  def forSession(spark: SparkSession): OpenIvmCompiler = session(spark).compiler
+
+  def session(spark: SparkSession): SessionCompiler = {
     // CREATE and REFRESH clone their SparkSession to isolate temporary views.
     // The compiler itself owns no session/request state; each compile starts
-    // an independent native subprocess in a unique directory. Share only the
-    // immutable runtime, keeping different effective loader settings separate.
+    // an independent native subprocess in a unique directory. Reuse programs
+    // keyed by their full compile request and separate loader settings.
     val context = spark.sparkContext
     val cliLibraryPath = spark.conf
       .getOption("spark.openivm.compiler.cliLibraryPath")
@@ -96,9 +121,10 @@ private[commands] object OpenIvmCompilers {
           c.close()
           throw e
       }
-      cache.put(context, runtimes + (cliLibraryPath -> c))
+      val session = new SessionCompiler(c)
+      cache.put(context, runtimes + (cliLibraryPath -> session))
       Runtime.getRuntime.addShutdownHook(new Thread(() => c.close()))
-      c
+      session
     }
   }
 
@@ -133,7 +159,7 @@ private[commands] object OpenIvmCompilers {
       OpenIvmCompiler.build(
         extensionPath = extEnv,
         cliPath = cliEnv,
-        nativeLibraryPath = cliLibraryPath
+        nativeLibraryPath = cliLibraryPath.orElse(Option(new java.io.File(cliEnv).getParent))
       )
     else {
       val (extPath, cliPath, bundledLibraryPath) = extractBundledAssets(spark)
@@ -182,6 +208,11 @@ private[commands] object OpenIvmCompilers {
 
     extract("/openivm-native/openivm.duckdb_extension", ext)
     extract("/openivm-native/duckdb", cli)
+    Seq("libstdc++.so.6", "libgcc_s.so.1").foreach { name =>
+      val resource = s"/openivm-native/$name"
+      if (getClass.getResource(resource) != null)
+        extract(resource, new java.io.File(localDir, name))
+    }
     cli.setExecutable(true, /* ownerOnly = */ false)
     // Keep the CLI and extension on the same C++ runtime. Do not alter the JVM's loader.
     val libraryProbe = resource("/openivm-native/libstdc++.so.6")
@@ -2297,7 +2328,7 @@ private[commands] object MvCommandHelper {
       case None                                       => spec
       case Some(_) if compiled.initialLoadSql.isEmpty => spec.copy(suffixSql = None)
       case Some(suffix) =>
-        val inner = org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        val inner = compiled.initialLoadSql
         val cols  = userOutputColumns.map(c => s"`${c.replace("`", "``")}`").mkString(", ")
         try {
           spark.sql(s"SELECT $cols FROM ($inner) __openivm_topk_preview $suffix").queryExecution.analyzed
@@ -2473,7 +2504,7 @@ private[commands] object MvCommandHelper {
     else {
       val incrementalViewBodySql =
         if (compiled.initialLoadSql.isEmpty) originalQueryText
-        else org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        else compiled.initialLoadSql
       try
         Some(
           spark
@@ -2994,6 +3025,8 @@ case class CreateMaterializedViewCommand(
       try compiler.compile(createCompileRequest)
       catch {
         case e: org.openivm.spark.compiler.OpenIvmCompileException =>
+          val compileCause = Option(e.getMessage).getOrElse(e.toString).replace('\n', ' ').take(512)
+          profile.timeStep("create_compile_failure", s"cause=$compileCause") { () }
           val compileFailedClassification =
             authoritativeFullRefreshClassification(
               compileRefreshTypeName = "COMPILE_FAILED",
@@ -3178,6 +3211,10 @@ case class CreateMaterializedViewCommand(
         s"effective_refresh_type=$effectiveRefreshTypeName;reason=$classifyReason",
       0L
     )
+    profile.timeStep(
+      "create_compiler_verdict",
+      s"compiled=${classification.compileRefreshTypeName};effective=$effectiveRefreshTypeName;reason=$classifyReason"
+    ) { () }
     OpenIvmExecutionSpan.recordActiveRefreshClassification(
       compileRefreshType = Some(classification.compileRefreshTypeName),
       effectiveRefreshType = Some(effectiveRefreshTypeName),
@@ -3250,7 +3287,7 @@ case class CreateMaterializedViewCommand(
           pinBinding.resolvedPins
         )
       else
-        org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        compiled.initialLoadSql
     val physicalOutput = profile.timeStep("create_analyze_physical_schema") {
       spark.sql(viewBodySql).queryExecution.analyzed.output
     }
@@ -4000,7 +4037,7 @@ case class RefreshMaterializedViewCommand(
         try {
           DriverHeavyOperationAdmission.withPermit(spark, "refresh") {
             org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
-              runUnderLock(cloned, lockAcqMs)
+              runUnderLock(cloned, lockAcqMs, spark)
             }
           }
         } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
@@ -4369,7 +4406,7 @@ case class RefreshMaterializedViewCommand(
     recovered
   }
 
-  private def runUnderLock(spark: SparkSession, lockAcqMs: Long): Seq[Row] = {
+  private def runUnderLock(spark: SparkSession, lockAcqMs: Long, compilerSession: SparkSession): Seq[Row] = {
     import MvCommandHelper._
     import org.openivm.spark.compiler.LptsSparkDialect
 
@@ -5319,12 +5356,8 @@ case class RefreshMaterializedViewCommand(
           .toSet
       }
 
-      // Base-table inserts are not sufficient to prove a view delta monotone:
-      // an outer join can retract a NULL-padded row, and multi-source joins can
-      // generate cross terms. Restrict insert-only aggregate compilation to the
-      // single-source, join-free shape whose output is monotone under inserts.
-      // Downstream consumers do not affect this proof; they only determine
-      // whether the cascade delta must remain materialized.
+      // Restrict insert-only aggregation to a single source without joins.
+      // Appends to one side of an outer join can retract NULL-padded input rows.
       lazy val insertOnlyAggregateShapeCandidate: Boolean =
         !propagation.requiresDmlInterception &&
           meta.refreshType == RefreshTypeCode.AggregateGroup &&
@@ -5353,19 +5386,11 @@ case class RefreshMaterializedViewCommand(
           (batchInsertOnly || cdfRowsInsertOnly) &&
           changeBatches.nonEmpty
 
-      // CDF consumers discover an upstream MV through its Delta change feed.
-      // Only a grouped aggregate with no consumer may inline and discard its
-      // durable cascade delta. Non-terminal aggregates still use the same
-      // insert-only MIN/MAX merge, but retain OpenIVM's signed cascade output.
-      lazy val terminalInsertOnlyAggregate: Boolean =
-        insertOnlyAggregate && downstreamSourceKeysForThisMv.isEmpty
-
       profile.appendStep(
         "generate_refresh_sql.eligibility",
         s"batch_insert_only=$batchInsertOnly;cdf_rows_insert_only=$cdfRowsInsertOnly;" +
           s"insert_only_aggregate_shape_candidate=$insertOnlyAggregateShapeCandidate;" +
           s"insert_only_aggregate=$insertOnlyAggregate;" +
-          s"terminal_insert_only_aggregate=$terminalInsertOnlyAggregate;" +
           s"requires_dml_interception=${propagation.requiresDmlInterception};" +
           s"source_delta_shape=${sourceDeltaShape.toSeq.sortBy(_._1).mkString("|")};" +
           s"downstream_sources=${downstreamSourceKeysForThisMv.toSeq.sorted.mkString("|")}",
@@ -5668,19 +5693,27 @@ case class RefreshMaterializedViewCommand(
       val constraintFacts = WorkloadFactsRegistry
         .forRefresh()
         .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
-      val cacheTierFacts = WorkloadFacts(
-        forceViewDeltaCascade = !terminalInsertOnlyAggregate,
-        runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
+      val runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark)
+      val compileFacts = WorkloadFacts(
+        // Delta CDF supplies pre/post images to downstream consumers of these grouped aggregates.
+        forceViewDeltaCascade = !insertOnlyAggregate,
         assumeInsertOnly = insertOnlyAggregate ||
-          (FeatureGate.windowRunningIncrementalEnabled(spark) &&
-            meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
+          (runningWindowIncremental && meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
+        runningWindowIncremental = runningWindowIncremental,
         deltaShape = sourceDeltaShape,
         fkRelations = constraintFacts.fkRelations,
         uniqueKeys = constraintFacts.uniqueKeys,
         declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
       )
-      val compiler = profile.timeStep("generate_refresh_sql.compiler_context", "verify_runtime_before_cache") {
-        OpenIvmCompilers.forSession(spark)
+      // Quantitative statistics are consumed by Spark's cost model. The native
+      // compiler receives shape and constraint facts, so row counts do not
+      // invalidate a reusable SQL program.
+      lazy val refreshCostFacts = {
+        val stats = SparkDeltaStatsService.forRefresh().workloadFactsFor(spark, meta.sourceTables, changeBatches)
+        compileFacts.copy(tableStats = stats.tableStats, columnStats = stats.columnStats, deltaStats = stats.deltaStats)
+      }
+      val sessionCompiler = profile.timeStep("generate_refresh_sql.compiler_context", "verify_runtime_before_cache") {
+        OpenIvmCompilers.session(compilerSession)
       }
       val compileRequest = CompileRequest(
         viewName = name.table,
@@ -5688,29 +5721,20 @@ case class RefreshMaterializedViewCommand(
         sources = compileSchemas,
         sourceQualifiedNames = shortToQual,
         sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
-        facts = cacheTierFacts
+        facts = compileFacts
       )
-      val compileCacheTier = compiler.compileCacheTier(compileRequest)
+      val compileCacheTier = sessionCompiler.compiler.compileCacheTier(compileRequest)
       var refreshProperties =
-        if (compileCacheEnabled) MvMetadata.withCompileCacheGeneration(meta.properties, compiler.cacheGeneration)
+        if (compileCacheEnabled) MvMetadata.withCompileCacheGeneration(meta.properties, sessionCompiler.compiler.cacheGeneration)
         else meta.properties
-      lazy val refreshCompileFacts: WorkloadFacts = {
-        val statsFacts = SparkDeltaStatsService
-          .forRefresh()
-          .workloadFactsFor(spark, meta.sourceTables, changeBatches)
-        cacheTierFacts.copy(
-          tableStats = statsFacts.tableStats,
-          columnStats = statsFacts.columnStats,
-          deltaStats = statsFacts.deltaStats
-        )
-      }
+      val reuseInSession = preparedSourceAdvance.isEmpty && refreshResolvedPins.isEmpty
 
       // Reuse only the schema/tier-keyed, shape-stable compiled SQL.  The cached
       // text is intentionally NOT rewritten SQL: every REFRESH below still calls
       // SparkRefreshRewriter.rewrite, which recreates the per-refresh
       // `openivm_old_*` / `openivm_new_*` snapshot temp views and substitutes a
       // fresh view-delta path before execution.
-      val cachedCompiled =
+      val persisted =
         if (compileCacheEnabled) {
           for {
             sql <- MvMetadata.cachedCompiledSql(refreshProperties, meta.sourceSchemaFingerprint, compileCacheTier)
@@ -5719,7 +5743,7 @@ case class RefreshMaterializedViewCommand(
               meta.sourceSchemaFingerprint,
               compileCacheTier
             )
-          } yield org.openivm.spark.compiler.CompiledRefresh(
+          } yield CompiledRefresh(
             refreshType = classification._1,
             refreshTypeName = classification._2,
             sql = sql,
@@ -5732,7 +5756,8 @@ case class RefreshMaterializedViewCommand(
               .getOrElse("")
           )
         } else None
-      val compileCacheHit = cachedCompiled.isDefined
+      val cached = persisted.orElse(if (reuseInSession) sessionCompiler.cachedRefresh(compileRequest) else None)
+      val compileCacheHit = cached.isDefined
       OpenIvmMetrics.recordCompileCache(compileCacheHit)
       val compiled = profile.timeStep(
         "generate_refresh_sql.compile",
@@ -5744,32 +5769,31 @@ case class RefreshMaterializedViewCommand(
           "compile",
           s"compile_cache_hit=$compileCacheHit compile_cache_tier=$compileCacheTier"
         ) {
-          cachedCompiled match {
-            case Some(program) => program
-            case None =>
-              val fresh = compiler.compile(compileRequest)
-              if (compileCacheEnabled && fresh.sql.nonEmpty) {
-                val backfilled = refreshProperties ++
-                  MvMetadata.compiledProperties(
-                    meta.sourceSchemaFingerprint,
-                    compileCacheTier,
-                    fresh.sql,
-                    fresh.initialLoadSql,
-                    fresh.refreshType,
-                    fresh.refreshTypeName
+          cached.getOrElse {
+            val fresh = sessionCompiler.compiler.compile(compileRequest)
+            if (reuseInSession) sessionCompiler.rememberRefresh(compileRequest, fresh)
+            if (compileCacheEnabled && fresh.sql.nonEmpty) {
+              val backfilled = refreshProperties ++
+                MvMetadata.compiledProperties(
+                  meta.sourceSchemaFingerprint,
+                  compileCacheTier,
+                  fresh.sql,
+                  fresh.initialLoadSql,
+                  fresh.refreshType,
+                  fresh.refreshTypeName
+                )
+              try {
+                MvCatalog.updateProperties(spark, name, backfilled)
+                refreshProperties = backfilled
+              } catch {
+                case NonFatal(t) =>
+                  logWarning(
+                    s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
+                      s"${t.getClass.getName}: ${t.getMessage}"
                   )
-                try {
-                  MvCatalog.updateProperties(spark, name, backfilled)
-                  refreshProperties = backfilled
-                } catch {
-                  case NonFatal(t) =>
-                    logWarning(
-                      s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
-                        s"${t.getClass.getName}: ${t.getMessage}"
-                    )
-                }
               }
-              fresh
+            }
+            fresh
           }
         }
       }
@@ -5893,7 +5917,7 @@ case class RefreshMaterializedViewCommand(
             } else None
 
           if (unifiedIntelligenceEnabled || FeatureGate.costModelEnabled(spark)) {
-            val facts    = refreshCompileFacts
+            val facts    = refreshCostFacts
             val estimate = RefreshCostModel.estimate(facts)
             val decision = RefreshIntelligence.decide(facts, estimate, runtimeDeltaSizeForDecision)
             OpenIvmInsightEvents.refreshDecision(spark, refreshId, viewMeta, decision)
@@ -6230,7 +6254,7 @@ case class RefreshMaterializedViewCommand(
             lazy val hasNonAppendRows = hasNonAppendSimpleProjectionRows(spark, viewDeltaPath)
 
             val directAggregateMerge: Option[String] =
-              if (terminalInsertOnlyAggregate && rewritten.statements.size == 2)
+              if (insertOnlyAggregate && rewritten.statements.size == 2)
                 SparkRefreshRewriter.inlineViewDeltaCtasIntoMerge(
                   rewritten.statements.head,
                   rewritten.statements(1),
@@ -6365,16 +6389,27 @@ case class RefreshMaterializedViewCommand(
               RefreshPerf.logStmt(refreshId, viewLabel, 0, "view_delta_inlined", 0L)
               profile.appendStep(
                 "execute_refresh_sql_stmt",
-                "statement=1;stmt_kind=view_delta_inlined;terminal=true;insert_only=true",
+                "statement=1;stmt_kind=view_delta_inlined;insert_only=true",
                 0L
               )
               RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='direct_insert_only_aggregate'")
               logInfo(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                  "outcome='direct_insert_only_aggregate' reason='terminal_insert_only_batch'"
+                  "outcome='direct_insert_only_aggregate' reason='insert_only_batch'"
               )
+              val merge = directAggregateMerge.get
+              val prunedMerge = profile.timeStep("prune_insert_only_aggregate_target") {
+                pruneInsertOnlyAggregateTarget(
+                  spark,
+                  meta.location,
+                  merge,
+                  rewritten.statements.head,
+                  viewDeltaPath,
+                  cdfChangeBatches
+                )
+              }
               withPlanTimeBroadcastDisabled {
-                executeSqlAt(directAggregateMerge.get, 1)
+                executeSqlAt(prunedMerge, 1)
               }
             } else if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
               // ── Scratch-CTAS fuse fast path ────────────────────────────────────
@@ -6501,14 +6536,19 @@ case class RefreshMaterializedViewCommand(
                       case Some(view) => StagingDeltaView.CachedViewDeltaRef.sqlRef(view)
                       case None       => s"delta.`${viewDeltaPath.replace("`", "``")}`"
                     }
-                    val deltaCols =
-                      (fusedView match {
+                    val deltaRows =
+                      fusedView match {
                         case Some(view) => spark.table(s"global_temp.$view")
                         case None       => spark.read.format("delta").load(viewDeltaPath)
-                      }).columns.toSet
-                    val mvCols = spark.table(sqlIdent(mergeTargetId)).columns.toSeq
+                      }
+                    val deltaCols = deltaRows.columns.toSet
+                    val mvCols    = spark.table(sqlIdent(mergeTargetId)).columns.toSeq
                     if (
-                      deltaCols.contains("openivm_multiplicity") && mvCols.nonEmpty && mvCols.forall(deltaCols.contains)
+                      deltaCols
+                        .contains("openivm_multiplicity") && mvCols.nonEmpty && mvCols.forall(deltaCols.contains) &&
+                      // Partial-recompute deltas may carry keys with unknown weights.
+                      // They cannot be expanded as an exact bag of appended rows.
+                      deltaRows.filter("openivm_multiplicity IS NULL OR openivm_multiplicity <= 0").head(1).isEmpty
                     ) {
                       val colList = mvCols.map(c => s"`$c`").mkString(", ")
                       Some(
@@ -6694,10 +6734,14 @@ case class RefreshMaterializedViewCommand(
                 } else executeRunningWindowSql(sql, idx)
               }
             } else {
+              // Native suffix programs already contain both fallback and fast writes.
+              // Recompute-only optimizations cannot replace just their fallback half.
+              val optimizeWindowRecompute = meta.refreshType == RefreshTypeCode.WindowPartition &&
+                !rewritten.hasRunningWindowProgram
               val windowSuffixSql: Option[WindowSuffixSql] =
                 if (
                   FeatureGate.windowSuffixSkipEnabled(spark) &&
-                  meta.refreshType == RefreshTypeCode.WindowPartition &&
+                  optimizeWindowRecompute &&
                   batchInsertOnly
                 )
                   buildWindowSuffixSql(spark, meta, mergeTargetId, viewDeltaPath)
@@ -6712,14 +6756,14 @@ case class RefreshMaterializedViewCommand(
                   !windowSuffixSafe &&
                   !propagation.requiresDmlInterception &&
                   FeatureGate.boundedRankEnabled(spark) &&
-                  meta.refreshType == RefreshTypeCode.WindowPartition
+                  optimizeWindowRecompute
                 ) buildBoundedRankInsertSql(spark, meta, mergeTargetId)
                 else None
               val rewrittenSql = rewritten.statements.map(SparkRefreshRewriter.stripExecutionMarker)
               val windowCascadeMergeShape: Option[WindowCascadeMergeShape] =
                 if (
                   FeatureGate.windowCascadeMergeEnabled(spark) &&
-                  meta.refreshType == RefreshTypeCode.WindowPartition &&
+                  optimizeWindowRecompute &&
                   !windowSuffixSafe &&
                   boundedRankInsertSql.isEmpty
                 )
@@ -6733,7 +6777,7 @@ case class RefreshMaterializedViewCommand(
                 if (
                   windowCascadeMergeShape.isEmpty &&
                   FeatureGate.windowSinglePassReplaceEnabled(spark) &&
-                  meta.refreshType == RefreshTypeCode.WindowPartition &&
+                  optimizeWindowRecompute &&
                   !windowSuffixSafe &&
                   boundedRankInsertSql.isEmpty
                 )
@@ -7112,7 +7156,7 @@ case class RefreshMaterializedViewCommand(
             // used as the bookkeeping count is either openivm_count_star
             // (added by openivm when the user query has no COUNT(*)) or the
             // user's COUNT(*) alias (extracted at CREATE time).
-            if (isCountMonoid(meta.refreshType) && !terminalInsertOnlyAggregate) {
+            if (isCountMonoid(meta.refreshType) && !insertOnlyAggregate) {
               countMonoidColumn(spark, mergeTargetId, meta).foreach { col =>
                 val q         = col.replace("`", "``")
                 val deleteSql = s"DELETE FROM ${sqlIdent(mergeTargetId)} WHERE `$q` = 0"
@@ -7381,6 +7425,8 @@ case class RefreshMaterializedViewCommand(
                   s"Rewritten SQL:\n$sqlSnippet",
                 t
               )
+          } finally {
+            rewritten.aggregateInputPath.foreach(deletePathIfExists)
           }
 
           if (preparedSourceAdvance.nonEmpty)
@@ -7770,6 +7816,68 @@ case class RefreshMaterializedViewCommand(
             |HAVING SUM(CAST(`openivm_multiplicity` AS BIGINT)) <> 0
             |LIMIT 1""".stripMargin
       )
+    }
+  }
+
+  private def pruneInsertOnlyAggregateTarget(
+      spark: SparkSession,
+      targetLocation: String,
+      merge: String,
+      deltaCtas: String,
+      deltaPath: String,
+      batches: Seq[CdfChangeBatch]
+  ): String = {
+    // Only spend a Spark job collecting keys when CDF statistics indicate a small
+    // delta and there are enough target files to benefit from file skipping.
+    val maxKeys = 8
+    if (batches.size != 1) return merge
+    try {
+      val snapshot = DeltaLog.forTable(spark, new Path(targetLocation)).update()
+      if (snapshot.numOfFiles <= maxKeys) return merge
+      val stats = SparkDeltaStatsService.forRefresh().deltaStatsFor(spark, batches)
+      if (!stats.get(batches.head.baseTable).flatMap(_.rowCount).exists(rows => rows > 0 && rows <= 128)) return merge
+
+      def keyColumns(condition: Expression): Seq[String] = condition match {
+        case And(left, right) => keyColumns(left) ++ keyColumns(right)
+        case EqualNullSafe(v: UnresolvedAttribute, d: UnresolvedAttribute) =>
+          (v.nameParts, d.nameParts) match {
+            case (Seq("v", target), Seq("d", source)) if target == source => Seq(target)
+            case _                                                        => Nil
+          }
+        case _ => Nil
+      }
+
+      val keys = spark.sessionState.sqlParser
+        .parsePlan(merge)
+        .collect {
+          case m: MergeIntoTable if m.notMatchedBySourceActions.isEmpty => keyColumns(m.mergeCondition)
+        }
+        .flatten
+      if (keys.isEmpty) return merge
+      val source = SparkRefreshRewriter.extractViewDeltaCtasBody(deltaCtas, deltaPath).map(spark.sql)
+      val pruned = for {
+        delta <- source
+        key <- keys.find(k =>
+          delta.schema.fields.exists { field =>
+            field.name == k && Set[DataType](ByteType, ShortType, IntegerType, LongType)(field.dataType)
+          }
+        )
+        values = delta.select(col(quoteCol(key))).distinct().limit(maxKeys + 1).collect()
+        if values.nonEmpty && values.length <= maxKeys
+      } yield {
+        val target = s"v.${quoteCol(key)}"
+        // Delta reduces an IN list to a min/max range for file skipping.
+        val predicate = values
+          .map(row => if (row.isNullAt(0)) s"$target IS NULL" else s"$target = ${row.get(0)}")
+          .sorted
+          .mkString(" OR ")
+        SparkRefreshRewriter.restrictAggregateMergeTarget(merge, predicate)
+      }
+      pruned.getOrElse(merge)
+    } catch {
+      case NonFatal(e) =>
+        logWarning(s"[openivm-mv] aggregate MERGE file pruning skipped: ${e.getMessage}")
+        merge
     }
   }
 
@@ -8294,7 +8402,9 @@ case class RefreshMaterializedViewCommand(
           val targetContextPartExists =
             partitionMatch("openivm_target_context", "a", shape.partitionCols)
           val maxExists = partitionMatch("openivm_suffix", "m", shape.partitionCols)
-          replaceWindowSuffixSource(meta.querySql, "context_source").map { suffixBody =>
+          // The physical query also computes native ROWS-window position state.
+          val physicalQuery = meta.properties.getOrElse(MvMetadata.CompiledInitialLoadSqlKey, meta.querySql)
+          replaceWindowSuffixSource(physicalQuery, "context_source", shape.sourceShort).map { suffixBody =>
             def suffixQuery(selectList: String): String =
               s"""|WITH affected AS (
                   |  SELECT DISTINCT $partList
@@ -8416,7 +8526,7 @@ case class RefreshMaterializedViewCommand(
           val deltaRef    = s"`openivm_delta_${shape.sourceShort.replace("`", "``")}`"
           val baseMatch   = partitionMatch("openivm_base", "a", shape.partitionCols)
           val resultMatch = partitionMatch("openivm_bounded", "a", shape.partitionCols)
-          replaceWindowSuffixSource(meta.querySql, "bounded_source").map { boundedBody =>
+          replaceWindowSuffixSource(meta.querySql, "bounded_source", shape.sourceShort).map { boundedBody =>
             s"""|INSERT INTO $targetRef ($colList)
                 |WITH affected AS (
                 |  SELECT DISTINCT $partList
@@ -8559,11 +8669,14 @@ case class RefreshMaterializedViewCommand(
   private def quoteCol(col: String): String =
     s"`${col.replace("`", "``")}`"
 
-  private def replaceWindowSuffixSource(sql: String, replacement: String): Option[String] = {
+  private def replaceWindowSuffixSource(sql: String, replacement: String, sourceShort: String): Option[String] = {
     val fromRe =
       ("(?is)\\bFROM\\s+((?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))?)" +
         "(\\s+(?:AS\\s+)?[A-Za-z_][A-Za-z0-9_]*)?").r
-    val matches = fromRe.findAllMatchIn(sql).toVector
+    val matches = fromRe
+      .findAllMatchIn(sql)
+      .filter(m => stripSqlIdent(m.group(1).split("\\.").last).equalsIgnoreCase(sourceShort))
+      .toVector
     if (matches.size != 1) None
     else {
       val m      = matches.head

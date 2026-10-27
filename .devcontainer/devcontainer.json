@@ -1,6 +1,6 @@
 {
   "name": "openivm-spark",
-  "image": "ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:a9bc450e13285b21bb49e973d954538a0fdbe8987ecf2e35cd7c4b60726348bf",
+  "image": "ghcr.io/openivm/openivm-spark-devcontainer:8aa35e2a6ebce6f17583044f098207c71e7d957d482bbb93f9ad6620faece73c",
   "containerUser": "vscode",
   "containerEnv": {
     "NX_DAEMON": "false",

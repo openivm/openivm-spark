@@ -171,18 +171,22 @@ abstract class CompileRefreshScenarios extends IvmParitySpecBase("compile-refres
     // OpenIvmCompiler always sets the SPARK dialect on its embedded DuckDB
     // session, so we verify by compiling a SIMPLE_PROJECTION view (which
     // exercises the lpts SPARK pipeline) and asserting the generated SQL
-    // maps the native compiler's private internal references to logical names.
-    it("emits logical internal references for SIMPLE_PROJECTION") {
+    // retains qualified source reads while binding private delta helpers by
+    // the canonical names the Spark refresh path registers.
+    it("emits SPARK-dialect SQL with qualified sources and canonical delta helpers for SIMPLE_PROJECTION") {
       val result = sharedCompiler.compile(
         CompileRequest(
           viewName = "mv_sales_proj",
           viewSql = "SELECT region FROM sales WHERE amount > 0",
-          sources = Map("sales" -> salesSchema)
+          sources = Map("sales" -> salesSchema),
+          sourceQualifiedNames = Map("sales" -> "`analytics`.`sales`")
         )
       )
       result.refreshType shouldBe 2
       result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
-      result.sql should include("openivm_delta_sales")
+      result.sql should include regex """(?is)\bFROM\s+openivm_delta_sales\b"""
+      result.sql should not include "`memory`.`main`.`openivm_delta_sales`"
+      result.initialLoadSql should include("`analytics`.`sales`")
       result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
       result.sql should include("FROM openivm_data_mv_sales_proj")
       result.sql should not include "openivm_data___openivm_mv_"

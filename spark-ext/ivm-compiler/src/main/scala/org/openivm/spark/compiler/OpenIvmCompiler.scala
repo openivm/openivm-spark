@@ -25,7 +25,7 @@ final case class CompiledRefresh(
     refreshType: Int,        // RefreshType enum ordinal (0 = AGGREGATE_GROUP, 2 = SIMPLE_PROJECTION, …)
     refreshTypeName: String, // e.g. "AGGREGATE_GROUP"
     sql: String,             // full refresh SQL program in the target dialect
-    initialLoadSql: String   // SELECT query for initial MV load including hidden columns; empty if unavailable
+    initialLoadSql: String   // Spark SQL for initial MV load including hidden columns; empty if unavailable
 )
 
 /** Sources: Spark table name → resolved StructType.  Used by the bridge to
@@ -323,6 +323,8 @@ class OpenIvmCompiler private (
   ): String = {
     val sb = new StringBuilder
     sb ++= s"LOAD '${escapeSql(extensionPath)}';\n"
+    // Bind omitted NULL ordering with Spark's defaults before serializing refresh SQL.
+    sb ++= "SET default_null_order='NULLS_FIRST_ON_ASC_LAST_ON_DESC';\n"
     // Force grouped MIN/MAX to always emit the affected-groups DELETE+recompute SQL
     // (refresh_compiler.cpp:372-387). Without this, openivm reads its empty
     // compile-time delta tables and picks the insert-only MERGE fast path
@@ -358,6 +360,8 @@ class OpenIvmCompiler private (
     sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS $normalizedViewSql;\n"
     sb ++= "SELECT view_name AS openivm_bridge_view_key FROM openivm_views " +
       s"WHERE view_sql_name='${escapeSql(req.viewName)}' AND view_catalog=current_database() AND view_schema=current_schema();\n"
+    // Spark owns the public Delta view; the private DuckDB instance only binds maintenance state.
+    sb ++= s"UPDATE openivm_views SET published_query=NULL WHERE view_sql_name='${escapeSql(req.viewName)}';\n"
     // openivm_compile_with_facts is the per-call compile entry point. It
     // takes the view name plus a JSON CompileFacts payload and returns one
     // row per top-level refresh statement without mutating openivm aux
@@ -990,6 +994,28 @@ class OpenIvmCompiler private (
 
 object OpenIvmCompiler {
 
+  /** Spark names maintenance objects after its logical view, while native
+    * OpenIVM uses a catalog-qualified encoded key in its private catalog.
+    */
+  private[compiler] def normalizeNativeViewObjects(sql: String, nativeKey: String, viewName: String): String = {
+    val objects = java.util.regex.Pattern
+      .compile(
+        """(?i)(?<![A-Za-z0-9_`"])(?:(?:`memory`|"memory"|memory)\.(?:`main`|"main"|main)\.)?(?:`(openivm_[A-Za-z0-9_]+)`|"(openivm_[A-Za-z0-9_]+)"|(openivm_[A-Za-z0-9_]+))(?![A-Za-z0-9_`"])|(`(?:``|[^`])*`)"""
+      )
+      .matcher(sql)
+      .useTransparentBounds(true)
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectDoubleQuotes = false) { index =>
+      objects.region(index, sql.length)
+      if (objects.lookingAt()) {
+        val replacement = Option(objects.group(4)).getOrElse {
+          val name = Option(objects.group(1)).orElse(Option(objects.group(2))).getOrElse(objects.group(3))
+          name.replace(nativeKey, viewName)
+        }
+        Some(objects.end() -> replacement)
+      } else None
+    }
+  }
+
   /** Distinguishes which stage of the compile script a DuckDB CLI failure
     * occurred in, for [[classifyCompileFailureStage]].
     */
@@ -1013,13 +1039,13 @@ object OpenIvmCompiler {
     * `-jsonlines` stdout alone.
     *
     * `buildScript` always emits `CREATE OR REPLACE MATERIALIZED VIEW ...`
-    * immediately followed by `SELECT * FROM openivm_compile_with_facts(...)`.
+    * before `SELECT * FROM openivm_compile_with_facts(...)`.
     * When `CREATE` fails, the DuckDB CLI reports the error on stderr and
     * (in `-jsonlines` mode) simply continues to the next statement without
     * emitting any output line for the failed one — so stdout never contains
     * the view-creation confirmation row. When `CREATE` succeeds but
     * `openivm_compile_with_facts` itself fails, that confirmation row IS
-    * present, followed by nothing further (no `refresh_type` rows). This
+    * present even though no `refresh_type` rows follow. This
     * gives a reliable, non-heuristic signal from stdout content alone,
     * without parsing or pattern-matching stderr text.
     */
@@ -1210,6 +1236,7 @@ object OpenIvmCompiler {
       "CREATE OR REPLACE MACRO __sparkfn_to_date(s, fmt) AS CAST(strptime(s, fmt) AS DATE);",
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp_1arg(s) AS CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS TIMESTAMP);",
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);",
+      "CREATE OR REPLACE MACRO __sparkfn_try_to_timestamp(s, fmt) AS try_strptime(s, fmt);",
       "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);",
       // The nonnumeric marker branch is always NULL, but keeps all seven
       // arguments visible to LPTS for exact scanner-based recovery. The

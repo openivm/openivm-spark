@@ -795,6 +795,24 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       }
     }
 
+    it("keeps staged source rows visible in DuckDB 2.0 simple projection SQL") {
+      val duckdb2Sql = simpleProjectionInput.replace(
+        "openivm_timestamp >= '2026-05-16 10:00:55'::TIMESTAMP",
+        "((openivm_timestamp) >= (TIMESTAMP '2026-05-16 10:00:55'))"
+      )
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = duckdb2Sql,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map("users" -> "openivm_delta_users"),
+        viewDeltaPath = viewDeltaPath
+      )
+      rewritten.statements should not be empty
+      rewritten.statements.foreach(_ should not include "TIMESTAMP '2026-05-16 10:00:55'")
+      rewritten.statements.head should include("openivm_delta_users")
+    }
+
     it("strips trailing `AND openivm_timestamp >= '...'::TIMESTAMP` from a compound WHERE (CTE-with-filter pattern)") {
       val cteInput = {
         val scanLine =
@@ -1187,6 +1205,65 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       rewritten.statements.last should include("WHEN NOT MATCHED THEN INSERT")
     }
 
+    Seq(false, true).foreach { inlineSource =>
+      it(s"keeps leading CTEs inside an EXISTS delete MERGE source (inline=$inlineSource)") {
+        val source =
+          if (inlineSource)
+            "(SELECT openivm_left_key FROM openivm_affected WHERE openivm_left_key IS NULL OR openivm_left_key = 1)"
+          else "openivm_affected"
+        val input =
+          s"""WITH affected_seed AS (SELECT 1 AS openivm_left_key),
+             |openivm_affected AS (SELECT openivm_left_key FROM affected_seed)
+             |DELETE FROM openivm_data_mv_r AS openivm_delete_target
+             |WHERE EXISTS (SELECT 1 FROM $source AS aff
+             |WHERE aff.openivm_left_key IS NOT DISTINCT FROM openivm_delete_target.openivm_left_key);
+             |""".stripMargin
+
+        val rewritten = SparkRefreshRewriter.rewrite(
+          compiledSql = input,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath
+        )
+
+        rewritten.statements should have size 1
+        val merge = rewritten.statements.head
+        merge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+        merge should include("WITH affected_seed AS")
+        merge should include("openivm_affected AS (SELECT openivm_left_key FROM affected_seed)")
+        merge should include(
+          if (inlineSource) "SELECT openivm_left_key FROM openivm_affected" else "SELECT * FROM openivm_affected"
+        )
+        merge should include("ON d.openivm_left_key IS NOT DISTINCT FROM v.openivm_left_key")
+        merge should include("WHEN MATCHED THEN DELETE")
+      }
+    }
+
+    it("keeps an unaliased FULL JOIN affected-key CTE inside a delete MERGE") {
+      val input =
+        """WITH openivm_affected AS (SELECT 1 AS _k UNION SELECT NULL AS _k)
+          |DELETE FROM openivm_data_mv_r WHERE EXISTS (
+          |SELECT 1 FROM openivm_affected WHERE _k <=> openivm_left_key OR _k <=> openivm_right_key);
+          |""".stripMargin
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath
+      )
+      rewritten.statements should have size 1
+      val merge = rewritten.statements.head
+      merge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
+      merge should include("WITH openivm_affected AS")
+      merge should include("SELECT * FROM openivm_affected")
+      merge should include("ON _k <=> openivm_left_key OR _k <=> openivm_right_key")
+      merge should include("WHEN MATCHED THEN DELETE")
+    }
+
     it("rewrites DELETE USING into a key-safe delete MERGE") {
       val input =
         """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
@@ -1375,6 +1452,92 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
   // ── 10. Recompute-cascade snapshot rewrite ───────────────────────────────
   describe("pragma-gated recompute cascade rewrite") {
+    it("separates aggregate MERGE input from the affected-group signed cascade") {
+      val input =
+        """INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity) SELECT 'west', 12, 1;
+          |DROP TABLE IF EXISTS openivm_old_affected_mv_r;
+          |CREATE TABLE openivm_old_affected_mv_r AS SELECT DISTINCT region FROM openivm_delta_mv_r
+          |  WHERE openivm_timestamp > CAST('2026-11-23' AS TIMESTAMP);
+          |DROP TABLE IF EXISTS openivm_old_snapshot_mv_r;
+          |CREATE TABLE openivm_old_snapshot_mv_r AS SELECT d.* FROM openivm_data_mv_r d
+          |  WHERE EXISTS (SELECT 1 FROM openivm_old_affected_mv_r a WHERE a.region <=> d.region);
+          |MERGE INTO openivm_data_mv_r d USING openivm_delta_mv_r c ON d.region <=> c.region
+          |  WHEN MATCHED THEN UPDATE SET d.total = d.total + c.total;
+          |DELETE FROM openivm_delta_mv_r WHERE 1=1;
+          |INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity)
+          |  SELECT region, total, -1 FROM openivm_old_snapshot_mv_r;
+          |INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity)
+          |  SELECT d.region, d.total, 1 FROM openivm_data_mv_r d
+          |  WHERE EXISTS (SELECT 1 FROM openivm_old_affected_mv_r a WHERE a.region <=> d.region);
+          |DROP TABLE openivm_old_snapshot_mv_r;
+          |DROP TABLE openivm_old_affected_mv_r;""".stripMargin
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(7L)
+      )
+      val raw = s"delta.`$viewDeltaPath-input`"
+      rewritten.aggregateInputPath shouldBe Some(s"$viewDeltaPath-input")
+      rewritten.statements should have size 3
+      rewritten.statements(0) should startWith(s"CREATE OR REPLACE TABLE $raw")
+      rewritten.statements(1) should include(s"USING $raw")
+      val publication = rewritten.statements.last
+      publication should startWith(s"CREATE OR REPLACE TABLE delta.`$viewDeltaPath`")
+      publication should include(s"SELECT DISTINCT region FROM $raw")
+      publication should include(s"delta.`$mvLocation` VERSION AS OF 7")
+      publication should include("UNION ALL SELECT d.region, d.total, 1 FROM `mydb`.`mv_r`")
+      publication should not include "openivm_timestamp"
+    }
+
+    it("reads the published target for a full replacement cascade, without changing partial replacement") {
+      val input =
+        """CREATE OR REPLACE TEMP TABLE openivm_old_mv_r AS SELECT * FROM openivm_data_mv_r;
+          |CREATE OR REPLACE TEMP TABLE openivm_new_mv_r AS SELECT id, region, amount FROM memory.main.sales;
+          |DELETE FROM openivm_data_mv_r;
+          |INSERT INTO openivm_data_mv_r SELECT * FROM openivm_new_mv_r;
+          |INSERT INTO openivm_delta_mv_r
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_mv_r
+          |UNION ALL SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_mv_r;
+          |DROP TABLE IF EXISTS openivm_old_mv_r;
+          |DROP TABLE IF EXISTS openivm_new_mv_r;
+          |""".stripMargin
+      def rewrite(sql: String) = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = sql,
+          mvName = mvName,
+          mvLocation = mvLocation,
+          viewLogicalName = viewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = viewDeltaPath,
+          mvVersionBeforeRefresh = Some(7L)
+        )
+        .statements
+
+      val full = rewrite(input)
+      val cascade = full
+        .find(_.startsWith(s"CREATE OR REPLACE TABLE delta.`$viewDeltaPath`"))
+        .getOrElse(fail("signed cascade missing"))
+      cascade should include("FROM openivm_old_mv_r")
+      cascade should include("FROM `mydb`.`mv_r`")
+      cascade should not include "FROM openivm_new_mv_r"
+      full should contain("INSERT INTO `mydb`.`mv_r` SELECT * FROM openivm_new_mv_r")
+
+      val partial = rewrite(
+        input.replace(
+          "DELETE FROM openivm_data_mv_r;",
+          "DELETE FROM openivm_data_mv_r WHERE region = 'west';"
+        )
+      )
+      val partialCascade = partial
+        .find(_.startsWith(s"CREATE OR REPLACE TABLE delta.`$viewDeltaPath`"))
+        .getOrElse(fail("partial signed cascade missing"))
+      partialCascade should include("FROM openivm_new_mv_r")
+    }
+
     it("canonicalizes NULL-safe materialized window keys for cascade reuse") {
       val input =
         """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
@@ -1566,6 +1729,26 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         )
         .statements
 
+    it("reports running-window programs independently of final SQL formatting") {
+      val recomputeOnly =
+        "CREATE OR REPLACE TEMP TABLE openivm_new_wradm_mv AS SELECT * FROM openivm_data_wradm_mv;"
+      Seq(p52Input -> true, recomputeOnly -> false).foreach { case (compiledSql, expected) =>
+        val rewritten = SparkRefreshRewriter.rewrite(
+          compiledSql = compiledSql,
+          mvName = p52MvName,
+          mvLocation = "dbfs:/delta/wradm_mv",
+          viewLogicalName = p52ViewLogicalName,
+          sourceTempViews = Map.empty,
+          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
+          postProcess = _.toUpperCase(java.util.Locale.ROOT),
+          mvVersionBeforeRefresh = Some(3)
+        )
+        rewritten.statements should not be empty
+        rewritten.hasRunningWindowProgram shouldBe expected
+        rewritten.statements.exists(_.startsWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_")) shouldBe false
+      }
+    }
+
     it("caches running-window snapshots but keeps bounds filters lazy") {
       val rewritten = rewriteP52()
       val creates   = rewritten.filter(_.startsWith("CREATE OR REPLACE TEMPORARY VIEW openivm_run_"))
@@ -1619,6 +1802,47 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       fastInsert should include("d.openivm_multiplicity > 0")
       fastInsert should not include "openivm_data_wradm_mv"
       fastInsert should not include "openivm_timestamp"
+    }
+
+    it("writes and cascades a materialized running-window suffix result") {
+      val sql =
+        """CREATE OR REPLACE TEMP TABLE openivm_old_wradm_mv AS SELECT * FROM openivm_data_wradm_mv;
+          |CREATE OR REPLACE TEMP TABLE openivm_new_wradm_mv AS SELECT * FROM openivm_data_wradm_mv;
+          |INSERT INTO openivm_delta_wradm_mv
+          |SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_wradm_mv
+          |UNION ALL SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_wradm_mv;
+          |CREATE OR REPLACE TEMP TABLE openivm_run_result_wradm_mv AS
+          |SELECT dm_s_symb, dm_date, dm_close, run_sum FROM openivm_run_fast_wradm_mv;
+          |INSERT INTO openivm_data_wradm_mv (dm_s_symb, dm_date, dm_close, run_sum)
+          |SELECT * FROM openivm_run_result_wradm_mv;
+          |INSERT INTO openivm_delta_wradm_mv
+          |SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_result_wradm_mv;
+          |DROP TABLE openivm_run_result_wradm_mv;
+          |""".stripMargin
+      val rewritten = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = sql,
+          mvName = p52MvName,
+          mvLocation = "dbfs:/delta/wradm_mv",
+          viewLogicalName = p52ViewLogicalName,
+          sourceTempViews = Map("wradm_daily_market" -> "openivm_delta_wradm_daily_market"),
+          viewDeltaPath = "dbfs:/delta/_tmp/wradm_mv_delta_uuid",
+          mvVersionBeforeRefresh = Some(3)
+        )
+        .statements
+      val dataInsert = rewritten
+        .find(_.startsWith("INSERT INTO `default`.`wradm_mv`"))
+        .getOrElse(fail("materialized suffix data insert missing"))
+      dataInsert should include("(dm_s_symb, dm_date, dm_close, run_sum)")
+      dataInsert should include("SELECT * FROM openivm_run_result_wradm_mv")
+      val append = rewritten
+        .find(_.startsWith("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`"))
+        .getOrElse(fail("materialized suffix cascade append missing"))
+      append should include("FROM openivm_run_result_wradm_mv")
+      append should not include "openivm_timestamp"
+      append should include("CURRENT_TIMESTAMP")
+      rewritten.count(_.startsWith("CACHE TABLE `openivm_run_result_wradm_mv`")) shouldBe 1
+      rewritten.count(_.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
     }
 
     it("drops running-window helper objects as views") {
@@ -2713,6 +2937,19 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           "openivm_multiplicity, region FROM x)"
       val out = SparkRefreshRewriter.deduplicateCteColumnAliases(sql)
       out should include("scan_0 (t3_mul, t3_mul_1, t3_region) AS (")
+    }
+
+    it("strips DuckDB 2.0 parenthesized timestamp literals from source delta scans") {
+      val cutoff = "((openivm_timestamp) >= (TIMESTAMP '2026-11-05 22:32:21.6993'))"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        s"SELECT * FROM openivm_delta_staging_holding_history WHERE $cutoff"
+      ) shouldBe "SELECT * FROM openivm_delta_staging_holding_history"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        s"SELECT * FROM t WHERE amount > 100 AND $cutoff"
+      ) shouldBe "SELECT * FROM t WHERE amount > 100"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        s"SELECT * FROM t WHERE $cutoff AND amount > 100"
+      ) shouldBe "SELECT * FROM t WHERE amount > 100"
     }
 
     it("is a no-op when there are no duplicate column aliases") {

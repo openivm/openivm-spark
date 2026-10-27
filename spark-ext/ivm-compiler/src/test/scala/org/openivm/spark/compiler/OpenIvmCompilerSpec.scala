@@ -7,6 +7,7 @@ import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Executors, T
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.{DeltaShape, ForeignKeyRelation, UniqueKey, WorkloadFacts}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
@@ -424,6 +425,92 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result.sql should not be empty
   }
 
+  it should "translate native struct access and LAG SQL for Spark initial load" in {
+    val result = sharedCompiler.compile(
+      CompileRequest(
+        viewName = "mv_struct_lag",
+        viewSql =
+          "SELECT id, payload.name AS name, LAG(ts) OVER (PARTITION BY id ORDER BY ts) AS prior FROM struct_src",
+        sources = Map("struct_src" -> StructType.fromDDL("id INT, payload STRUCT<name: STRING>, ts TIMESTAMP"))
+      )
+    )
+    val sql = LptsSparkDialect.translate(result.initialLoadSql)
+    sql.toLowerCase(java.util.Locale.ROOT) should not include "system.main"
+    sql.toUpperCase(java.util.Locale.ROOT) should not include "LAG(TS) OVER (PARTITION BY ID ORDER BY TS ROWS"
+    noException should be thrownBy org.apache.spark.sql.catalyst.parser.CatalystSqlParser.parsePlan(sql)
+  }
+
+  it should "translate the joined TPC-DI offset window initial load" in {
+    val schemas = Map(
+      "brokerage_trade"         -> StructType.fromDDL("t_id BIGINT, t_dts TIMESTAMP, t_st_id STRING, t_tt_id STRING"),
+      "brokerage_trade_history" -> StructType.fromDDL("th_t_id BIGINT, th_dts TIMESTAMP, th_st_id STRING"),
+      "reference_trade_type"    -> StructType.fromDDL("tt_id STRING"),
+      "reference_status_type"   -> StructType.fromDDL("st_id STRING")
+    )
+    val result = sharedCompiler.compile(
+      CompileRequest(
+        viewName = "mv_joined_lag",
+        viewSql = """SELECT t.t_id, coalesce(lag(h.th_dts) OVER (
+            | PARTITION BY t.t_id ORDER BY h.th_dts DESC, t.t_dts DESC, t.t_st_id DESC, h.th_st_id DESC
+            |) - INTERVAL 1 MILLISECOND, to_timestamp('9999-12-31 23:59:59.999')) AS end_timestamp,
+            |CASE WHEN row_number() OVER (
+            | PARTITION BY t.t_id ORDER BY h.th_dts DESC, t.t_dts DESC, t.t_st_id DESC, h.th_st_id DESC
+            |) = 1 THEN true ELSE false END AS is_current
+            |FROM brokerage_trade t JOIN brokerage_trade_history h ON t.t_id = h.th_t_id
+            |JOIN reference_trade_type tt ON t.t_tt_id = tt.tt_id
+            |JOIN reference_status_type ts ON t.t_st_id = ts.st_id
+            |JOIN reference_status_type us ON h.th_st_id = us.st_id""".stripMargin,
+        sources = schemas
+      )
+    )
+    val sql = LptsSparkDialect.translate(result.initialLoadSql)
+    // DuckDB 2.0 may serialize LAG's implicit offset and default explicitly.
+    sql.toLowerCase(java.util.Locale.ROOT) should fullyMatch regex
+      "(?s).*lag\\(th_dts(?:, 1, cast\\(null as timestamp\\))?\\) over.*"
+    noException should be thrownBy org.apache.spark.sql.catalyst.parser.CatalystSqlParser.parsePlan(sql)
+    val spark = SparkSession
+      .builder()
+      .master("local[1]")
+      .appName("openivm-offset-window-test")
+      .config("spark.ui.enabled", "false")
+      .getOrCreate()
+    try {
+      schemas.foreach { case (name, schema) =>
+        spark.createDataFrame(spark.sparkContext.emptyRDD[Row], schema).createOrReplaceTempView(name)
+      }
+      noException should be thrownBy spark.sql(sql).queryExecution.analyzed
+      val leadSql = LptsSparkDialect.translate(
+        "SELECT lead(th_dts, CAST(2 AS BIGINT)) OVER (ORDER BY th_dts) FROM brokerage_trade_history"
+      )
+      noException should be thrownBy spark.sql(leadSql).queryExecution.analyzed
+      val monthSql = LptsSparkDialect.translate(
+        "SELECT CAST(DATE '2015-01-31' + system.main.add(system.main.to_months(1), system.main.to_days(0)) AS DATE)"
+      )
+      spark.sql(monthSql).collect()(0).getDate(0).toLocalDate shouldBe LocalDate.parse("2015-02-28")
+      val microsSql = LptsSparkDialect.translate(
+        "SELECT CAST(TIMESTAMP '2020-01-01 00:00:00.000001' - " +
+          "system.main.add(system.main.to_months(0), system.main.to_microseconds(1)) AS STRING)"
+      )
+      spark.sql(microsSql).collect()(0).getString(0) shouldBe "2020-01-01 00:00:00"
+    } finally spark.stop()
+  }
+
+  it should "preserve TRY_TO_TIMESTAMP in compiled refresh and initial load SQL" in {
+    val result = sharedCompiler.compile(
+      CompileRequest(
+        viewName = "mv_try_timestamp",
+        viewSql = "SELECT id, try_to_timestamp(d, 'yyyyMMdd') AS ts FROM events",
+        sources = Map("events" -> StructType.fromDDL("id INT, d STRING"))
+      )
+    )
+    Seq(LptsSparkDialect.translate(result.sql), result.initialLoadSql).foreach { sql =>
+      sql.toLowerCase should include("try_to_timestamp")
+      sql should not include "__sparkfn_"
+      sql.toLowerCase should not include "try_strptime"
+    }
+    org.apache.spark.sql.catalyst.parser.CatalystSqlParser.parsePlan(result.initialLoadSql)
+  }
+
   it should "preserve native and Spark add_months parity in the compiled initial load" in {
     val cases = Seq(
       ("2015-02-28", 1),
@@ -600,19 +687,22 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
   // With `target_dialect="spark"` set in the CompileFacts JSON payload,
   // OpenIVM compiles SIMPLE_PROJECTION via the lpts pipeline, which uses
   // fully-qualified `catalog.schema.table` identifiers in the generated SQL.
-  // The bridge removes the compiler's private catalog qualification from
-  // internal tables and maps encoded MV keys to the logical Spark view name.
+  // Real source reads retain their qualified names; compiler-private delta
+  // objects use the canonical helper names that Spark binds at refresh time.
 
-  it should "normalize SIMPLE_PROJECTION internal references to the Spark bridge's logical names" in {
+  it should "preserve qualified source reads and canonical delta helpers in SPARK dialect for SIMPLE_PROJECTION" in {
     val req = CompileRequest(
       viewName = "mv_sales_proj",
       viewSql = "SELECT region FROM sales WHERE amount > 0",
-      sources = Map("sales" -> salesSchema)
+      sources = Map("sales" -> salesSchema),
+      sourceQualifiedNames = Map("sales" -> "`analytics`.`sales`")
     )
     val result = sharedCompiler.compile(req)
     result.refreshType shouldBe 2
     result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
-    result.sql should include("FROM    openivm_delta_sales")
+    result.sql should include regex """(?is)\bFROM\s+openivm_delta_sales\b"""
+    result.sql should not include "`memory`.`main`.`openivm_delta_sales`"
+    result.initialLoadSql should include("`analytics`.`sales`")
     result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
     result.sql should include("FROM openivm_data_mv_sales_proj")
     result.sql should not include "openivm_data___openivm_mv_"
@@ -977,6 +1067,47 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     "CREATE TABLE openivm_data_mv_prefix_collision AS SELECT c.name, a.city " +
       "FROM memory.main.customer AS c JOIN memory.main.customer_address AS a ON a.id = c.id;"
 
+  it should "normalize native maintenance identifiers without changing SQL values or comments" in {
+    val key = "__openivm_mv_6d656d6f7279_6d61696e_6d76"
+    val sql = s"""SELECT 'memory.main.openivm_data_$key', "a openivm_data_$key", `a openivm_data_$key`,
+                 |  * FROM memory.main.openivm_data_$key
+                 |  JOIN `memory`.`main`.`openivm_delta_$key` USING (id)
+                 |  JOIN "memory"."main"."openivm_meta_$key" USING (id)
+                 |  -- "memory"."main"."openivm_data_$key"
+                 |  /* openivm_delta_$key */""".stripMargin
+    val normalized = OpenIvmCompiler.normalizeNativeViewObjects(sql, key, "mv")
+    normalized should include("FROM openivm_data_mv")
+    normalized should include("JOIN openivm_delta_mv USING")
+    normalized should include("JOIN openivm_meta_mv USING")
+    normalized should include(s"'memory.main.openivm_data_$key'")
+    normalized should include("\"a openivm_data_" + key + "\"")
+    normalized should include(s"`a openivm_data_$key`")
+    normalized should include("-- \"memory\".\"main\".\"openivm_data_" + key + "\"")
+    normalized should include(s"/* openivm_delta_$key */")
+  }
+
+  it should "read the encoded native initial-load file and retain hidden keys and source pins" in {
+    val key  = "__openivm_mv_6d656d6f7279_6d61696e_6d76"
+    val dir  = Files.createTempDirectory("openivm-native-initial-load-")
+    val file = dir.resolve(s"openivm_compiled_queries_$key.sql")
+    try {
+      Files.write(
+        file,
+        (s"CREATE TABLE memory.main.openivm_data_$key AS " +
+          "SELECT c.name, a.city, c.id AS openivm_left_key_0 " +
+          "FROM memory.main.customer AS c JOIN memory.main.customer_address AS a ON a.id = c.id;").getBytes("UTF-8")
+      )
+      val sql = sharedCompiler.parseInitialLoadSql(dir, prefixCollisionRequest, key)
+      sql should include("openivm_left_key_0")
+      sql should include(s"delta.`${pinPath("customer")}` VERSION AS OF 3 AS c")
+      sql should include("db.customer_address AS a")
+      sql should not include key
+    } finally {
+      Files.deleteIfExists(file)
+      Files.deleteIfExists(dir)
+    }
+  }
+
   it should "not bleed a shorter source's pin into a longer source name in the initial load" in {
     val sql = initialLoadSqlFor(prefixCollisionRequest, prefixCollisionQueries)
     sql should include(s"delta.`${pinPath("customer")}` VERSION AS OF 3 AS c")
@@ -1078,6 +1209,47 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
 
     sharedCompiler.declareRelyFkStatements(req) should contain only
       """PRAGMA openivm_declare_rely_fk('employees','["dept_id"]','departments','["dept_id"]');"""
+  }
+
+  it should "apply qualified source delta shapes to the short DuckDB compiler tables" in {
+    val sources = Map(
+      "orders"   -> StructType.fromDDL("order_id INT, product_id INT"),
+      "products" -> StructType.fromDDL("product_id INT, product_name STRING")
+    )
+    val qualifiedFacts = WorkloadFacts(
+      deltaShape = Map("sales.orders" -> DeltaShape.InsertOnly, "catalog.sales.products" -> DeltaShape.Unchanged)
+    )
+    val req = CompileRequest(
+      viewName = "mv_qualified_delta_shape",
+      viewSql =
+        "SELECT o.order_id, p.product_name FROM sales.orders o JOIN catalog.sales.products p ON o.product_id = p.product_id",
+      sources = sources,
+      sourceQualifiedNames = Map("orders" -> "sales.orders", "products" -> "catalog.sales.products"),
+      facts = qualifiedFacts
+    )
+    sharedCompiler.nativeDeltaShape(req) shouldBe Map(
+      "orders"   -> DeltaShape.InsertOnly,
+      "products" -> DeltaShape.Unchanged
+    )
+    sharedCompiler.nativeDeltaShape(
+      req.copy(facts = WorkloadFacts(deltaShape = Map("other.products" -> DeltaShape.Unchanged)))
+    ) shouldBe Map("other.products" -> DeltaShape.Unchanged)
+    sharedCompiler.nativeDeltaShape(
+      req.copy(facts =
+        WorkloadFacts(deltaShape =
+          Map(
+            "catalog.sales.products" -> DeltaShape.Unchanged,
+            "products"               -> DeltaShape.InsertOnly
+          )
+        )
+      )
+    ) shouldBe Map("products" -> DeltaShape.General)
+
+    val compiled = sharedCompiler.compile(req)
+    compiled.refreshTypeName shouldBe "SIMPLE_PROJECTION"
+    val viewDelta = compiled.sql.take(compiled.sql.indexOf("INSERT INTO openivm_delta_mv_qualified_delta_shape"))
+    viewDelta should include("openivm_delta_orders")
+    viewDelta should not include "openivm_delta_products"
   }
 
   it should "terminate a stalled DuckDB CLI within the compilation deadline" in {
