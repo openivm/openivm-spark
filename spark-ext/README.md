@@ -176,6 +176,11 @@ It checks independent source ranges before applying refresh SQL; unavailable or
 missing-baseline sources retain the existing recovery decision. It does not
 parallelize refresh SQL or change publication and acknowledgment ordering.
 
+`spark.openivm.cdf.watermarks.multiGet.enabled=true` enables experimental,
+default-off bulk reads of a view's existing watermark values. Missing values
+still use the existing per-source lookup and lazy legacy migration; durable
+writes are not buffered or grouped by this option.
+
 The experimental `spark.openivm.stateSync.checkpointReuse.enabled` setting defaults
 to `false`. When enabled, eligible unchanged, live single-process stores can reuse
 verified in-memory checkpoint bytes; other stores use the normal native checkpoint.

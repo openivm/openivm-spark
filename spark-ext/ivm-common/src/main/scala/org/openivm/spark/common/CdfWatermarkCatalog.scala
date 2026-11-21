@@ -67,8 +67,17 @@ private[common] object RocksDbCdfWatermarkBackend extends CdfWatermarkBackend {
     }
   }
 
-  def getAll(spark: SparkSession, viewName: String, sources: Seq[String]): Map[String, Long] =
-    sources.distinct.flatMap(source => get(spark, viewName, source).map(source -> _)).toMap
+  def getAll(spark: SparkSession, viewName: String, sources: Seq[String]): Map[String, Long] = {
+    val distinct = sources.distinct
+    if (distinct.size <= 1 || !spark.conf.get("spark.openivm.cdf.watermarks.multiGet.enabled", "false").toBoolean) {
+      distinct.flatMap(source => get(spark, viewName, source).map(source -> _)).toMap
+    } else {
+      val values = openMvDb(spark, viewName).multiGet(Cf, distinct.map(sourceKey))
+      distinct.zip(values).flatMap { case (source, encoded) =>
+        encoded.map(RocksDBCodec.decodeLongBE).orElse(get(spark, viewName, source)).map(source -> _)
+      }.toMap
+    }
+  }
 
   def put(spark: SparkSession, viewName: String, source: String, version: Long): Unit =
     putAll(spark, viewName, Map(source -> version))

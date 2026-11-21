@@ -4,6 +4,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.rocksdb.{OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -12,6 +13,7 @@ import java.io.File
 import java.nio.file.{Files, Paths}
 import java.sql.Timestamp
 import java.util.UUID
+import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
 
 class CdfWatermarkCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers {
 
@@ -147,6 +149,82 @@ class CdfWatermarkCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
       shard
         .get(IndexDbColumnFamilies.CdfWatermarks, RocksDBCodec.utf8("orders"))
         .map(RocksDBCodec.decodeLongBE) shouldBe Some(23L)
+    }
+
+    it("preserves watermark reads and lazy migration with multi-get off and on") {
+      val flag   = "spark.openivm.cdf.watermarks.multiGet.enabled"
+      val legacy = OpenIvmRocksDBRegistry.getOrOpen(spark, OpenIvmStatePaths.indexDbPath(spark), IndexDbColumnFamilies.All)
+      try {
+        Seq(false, true).foreach { enabled =>
+          spark.conf.set(flag, enabled.toString)
+          val view = s"mv_multiget_$enabled"
+          CdfWatermarkCatalog.putAll(spark, view, Map("modern" -> 7L, "other" -> 11L))
+          legacy.withBatch { batch =>
+            Seq("modern" -> 1L, "legacy" -> 23L).foreach { case (source, value) =>
+              val key = RocksDBCodec.compositeKey(Seq(RocksDBCodec.utf8(view), RocksDBCodec.utf8(source)))
+              OpenIvmRocksDBBatchOps.put(
+                legacy,
+                batch,
+                IndexDbColumnFamilies.CdfWatermarks,
+                key,
+                RocksDBCodec.encodeLongBE(value)
+              )
+            }
+          }
+          val sources = Seq("modern", "legacy", "other", "missing", "legacy")
+          CdfWatermarkCatalog.getAll(spark, view, sources) shouldBe Map(
+            "modern" -> 7L,
+            "legacy" -> 23L,
+            "other" -> 11L
+          )
+          val shard = OpenIvmRocksDBRegistry.getOrOpen(
+            spark,
+            OpenIvmStatePaths.perMvDbPath(spark, view),
+            OpenIvmStatePaths.PerMvColumnFamilies
+          )
+          shard.get(IndexDbColumnFamilies.CdfWatermarks, RocksDBCodec.utf8("legacy"))
+            .map(RocksDBCodec.decodeLongBE) shouldBe Some(23L)
+          CdfWatermarkCatalog.getAll(spark, view, Seq.empty) shouldBe Map.empty
+
+          val gets = OpenIvmMetrics.counter("rocksdb.scope.mv.operation.get.count").getCount
+          val multiGets = OpenIvmMetrics.counter("rocksdb.scope.mv.operation.multi_get.count").getCount
+          CdfWatermarkCatalog.getAll(spark, view, Seq("modern", "legacy", "other")) shouldBe
+            Map("modern" -> 7L, "legacy" -> 23L, "other" -> 11L)
+          OpenIvmMetrics.counter("rocksdb.scope.mv.operation.get.count").getCount - gets shouldBe
+            (if (enabled) 0L else 3L)
+          OpenIvmMetrics.counter("rocksdb.scope.mv.operation.multi_get.count").getCount - multiGets shouldBe
+            (if (enabled) 1L else 0L)
+        }
+      } finally spark.conf.unset(flag)
+    }
+
+    it("reads a consistent multi-get snapshot during concurrent watermark writes") {
+      val flag = "spark.openivm.cdf.watermarks.multiGet.enabled"
+      val view = "mv_multiget_concurrent"
+      val start = new CountDownLatch(1)
+      val pool = Executors.newSingleThreadExecutor()
+      spark.conf.set(flag, "true")
+      CdfWatermarkCatalog.putAll(spark, view, Map("left" -> 0L, "right" -> 0L))
+      try {
+        val writer = pool.submit(new Callable[Unit] {
+          override def call(): Unit = {
+            start.await()
+            (1L to 200L).foreach { version =>
+              CdfWatermarkCatalog.putAll(spark, view, Map("left" -> version, "right" -> version))
+            }
+          }
+        })
+        start.countDown()
+        (1 to 200).foreach { _ =>
+          val values = CdfWatermarkCatalog.getAll(spark, view, Seq("left", "right"))
+          values("left") shouldBe values("right")
+        }
+        writer.get(30, TimeUnit.SECONDS)
+      } finally {
+        pool.shutdownNow()
+        pool.awaitTermination(30, TimeUnit.SECONDS)
+        spark.conf.unset(flag)
+      }
     }
   }
 }
