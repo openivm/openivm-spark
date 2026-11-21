@@ -177,6 +177,7 @@ private[compiler] object SparkFunctionShimSql {
   }
 
   private val sparkFunctionRenameRules: Map[String, RenameRule] = Map(
+    "try_to_timestamp" -> RenameRule(Map(1 -> "__sparkfn_try_to_timestamp")),
     "to_date" -> RenameRule(
       Map(
         0 -> "__sparkfn_to_date_1arg",
@@ -512,11 +513,12 @@ private[compiler] object SparkFunctionShimSql {
     * `date_format(to_date(x, f), g)`.
     */
   def rewriteInlinedSparkShimCalls(sql: String): String =
-    rewriteOutsideProtected(sql) { i =>
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
       parseMakeIntervalShim(sql, i)
         .orElse(parseGetJsonObjectShim(sql, i))
-        .orElse(parseCastTemporalShim(sql, i))
+        .orElse(parseCastShim(sql, i))
         .orElse(parseFunctionRewrite(sql, i, "strptime", "to_timestamp", Some(OneArgToTimestampLiteral)))
+        .orElse(parseFunctionRewrite(sql, i, "try_strptime", "try_to_timestamp"))
         .orElse(parseFunctionRewrite(sql, i, "strftime", "date_format"))
         .orElse(parseWindowIgnoreNullsRewrite(sql, i, "last_value"))
         .orElse(parseWindowIgnoreNullsRewrite(sql, i, "first_value"))
@@ -890,7 +892,7 @@ private[compiler] object SparkFunctionShimSql {
     }
   }
 
-  private def parseCastTemporalShim(sql: String, start: Int): Option[(Int, String)] =
+  private def parseCastShim(sql: String, start: Int): Option[(Int, String)] =
     parseFunctionCallAt(sql, start, "cast").flatMap { castCall =>
       val bodyStart = castCall.openParen + 1
       val bodyEnd   = castCall.closeParen
@@ -912,6 +914,15 @@ private[compiler] object SparkFunctionShimSql {
                     .orElse(
                       rewriteCastTemporalBody(sql, exprStart, asStart, "to_timestamp", Some(OneArgToTimestampLiteral))
                     )
+                case integral @ ("TINYINT" | "SMALLINT" | "INTEGER" | "INT" | "BIGINT") =>
+                  // DuckDB inserts trunc before interval integer casts. Spark's
+                  // numeric CAST already truncates; its trunc() is date-only.
+                  parseFunctionCallAt(sql, exprStart, "trunc")
+                    .filter(call =>
+                      call.topLevelCommaCount == 0 && call.closeParen < asStart &&
+                        isTriviaOnly(sql, call.closeParen + 1, asStart)
+                    )
+                    .map(call => s"CAST(${rewriteInlinedSparkShimCalls(call.args(sql))} AS $integral)")
                 case _ =>
                   None
               }
@@ -933,7 +944,7 @@ private[compiler] object SparkFunctionShimSql {
     * and restores Spark's `current_date()` spelling.
     *
     * The inner `CAST(get_current_timestamp() AS TIMESTAMP)` is itself a
-    * [[parseCastTemporalShim]] match, so the cheap `CAST(` prefix guard below
+    * [[parseCastShim]] match, so the cheap `CAST(` prefix guard below
     * avoids wastefully recursing into ordinary `to_date` shim shapes (which
     * never start with a nested `CAST`), and the recursive
     * [[rewriteInlinedSparkShimCalls]] call normalizes the inner expression
@@ -1173,7 +1184,8 @@ private[compiler] object SparkFunctionShimSql {
   private[compiler] def rewriteOutsideProtected(
       sql: String,
       protectBackticks: Boolean = false,
-      protectSingleQuotes: Boolean = true
+      protectSingleQuotes: Boolean = true,
+      protectDoubleQuotes: Boolean = true
   )(
       matcher: Int => Option[(Int, String)]
   ): String = {
@@ -1184,7 +1196,7 @@ private[compiler] object SparkFunctionShimSql {
         if (startsLineComment(sql, i)) Some(consumeLineComment(sql, i))
         else if (startsBlockComment(sql, i)) Some(consumeBlockComment(sql, i))
         else if (protectSingleQuotes && sql.charAt(i) == '\'') Some(consumeSingleQuoted(sql, i))
-        else if (sql.charAt(i) == '"') Some(consumeDoubleQuoted(sql, i))
+        else if (protectDoubleQuotes && sql.charAt(i) == '"') Some(consumeDoubleQuoted(sql, i))
         else if (protectBackticks && sql.charAt(i) == '`') {
           var end    = i + 1
           var closed = false
@@ -1207,6 +1219,10 @@ private[compiler] object SparkFunctionShimSql {
             case Some((endExclusive, replacement)) =>
               out.append(replacement)
               i = endExclusive
+            case None if sql.charAt(i) == '"' =>
+              val end = consumeDoubleQuoted(sql, i)
+              out.append(sql.substring(i, end))
+              i = end
             case None =>
               out.append(sql.charAt(i))
               i += 1

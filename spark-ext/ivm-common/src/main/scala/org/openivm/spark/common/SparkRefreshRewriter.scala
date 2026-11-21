@@ -11,7 +11,8 @@ import org.apache.spark.sql.catalyst.TableIdentifier
   */
 final case class RewrittenRefresh(
     statements: Seq[String],
-    lineage: Option[RewriteLineage.Snapshot] = None
+    lineage: Option[RewriteLineage.Snapshot] = None,
+    hasRunningWindowProgram: Boolean = false
 )
 
 /** Opt-in structural provenance for one rewriter invocation.
@@ -731,6 +732,7 @@ object SparkRefreshRewriter {
       )
 
       var viewDeltaMaterialized = false
+      var hasRunningWindowProgram = false
       def rewriteOne(stmt: String): Seq[String] = {
         val kind = classify(stmt, viewLogicalName)
         val emitted = kind match {
@@ -781,6 +783,7 @@ object SparkRefreshRewriter {
           case StatementKind.PartitionScopedInsert =>
             Seq(rewritePartitionScopedInsert(stmt, viewLogicalName, mvName))
           case StatementKind.RunningWindowTempCreate =>
+            hasRunningWindowProgram = true
             rewriteRunningWindowTempCreate(stmt, viewLogicalName, mvName, mvLocation, mvVersionBeforeRefresh)
           case StatementKind.RunningWindowFastInsert =>
             Seq(rewriteRunningWindowFastInsert(stmt, viewLogicalName, mvName))
@@ -866,7 +869,7 @@ object SparkRefreshRewriter {
       // this boundary and must not inherit execution or timing credit here.
       val finalStatements = withSemiJoinRewrite.map(postProcess)
       lineageCapture match {
-        case None => RewrittenRefresh(finalStatements)
+        case None => RewrittenRefresh(finalStatements, hasRunningWindowProgram = hasRunningWindowProgram)
         case Some(_) =>
           val outputs = pendingLineage.get.zipWithIndex.map { case (pending, outputIndex) =>
             RewriteLineage.OutputStatement(
@@ -904,7 +907,8 @@ object SparkRefreshRewriter {
                 sources,
                 outputs
               )
-            )
+            ),
+            hasRunningWindowProgram
           )
       }
     } finally {
@@ -3436,8 +3440,11 @@ object SparkRefreshRewriter {
     val headerRe = ("(?is)\\bDELETE\\s+FROM\\s+" + java.util.regex.Pattern.quote(mvRef) +
       "(?:\\s+AS\\s+(\\w+))?\\s+WHERE\\s+EXISTS\\s*\\(").r
     headerRe.findFirstMatchIn(stmt) match {
-      case None => stmt
+      case None    => stmt
       case Some(m) =>
+        // The EXISTS source can refer to CTEs defined before DELETE. Keep
+        // those definitions in the MERGE source's query scope.
+        val ctePrefix   = stmt.substring(0, m.start).trim
         val tgtAlias    = Option(m.group(1)).getOrElse("v")
         val ctePrefix   = stmt.substring(0, m.start).trim
         val existsOpen  = m.end - 1
@@ -3474,16 +3481,17 @@ object SparkRefreshRewriter {
               .map { t =>
                 val affAlias = t.group(1)
                 val onCond   = normalizeDeleteExistsMatchAliases(t.group(2), tgtAlias, affAlias)
+                val source   = if (ctePrefix.isEmpty) subBody else s"$ctePrefix\n$subBody"
                 s"""|MERGE INTO $mvRef AS v
                   |USING (
-                  |$subBody
+                  |$source
                   |) AS d
                   |ON $onCond
                   |WHEN MATCHED THEN DELETE""".stripMargin
               }
               .getOrElse(stmt)
           case None =>
-            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)\s+(?:(?:AS\s+)?(\w+)\s+)?WHERE\s+(.+?)\s*$""".r
+            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)(?:\s+(?:AS\s+)?(\w+))?\s+WHERE\s+(.+?)\s*$""".r
             tempRe
               .findFirstMatchIn(existsBody)
               .map { t =>
@@ -3499,7 +3507,7 @@ object SparkRefreshRewriter {
                       t.group(3),
                       k => s"${if (k.group(1).equalsIgnoreCase("_k")) "d" else "v"}.${k.group(1)}"
                     )
-                  case None => return stmt
+                  case None => normalizeDeleteExistsMatchAliases(t.group(3), tgtAlias, src)
                 }
                 val usingSql = if (ctePrefix.isEmpty) src else s"(\n$ctePrefix\nSELECT * FROM $src\n)"
                 s"""|MERGE INTO $mvRef AS v

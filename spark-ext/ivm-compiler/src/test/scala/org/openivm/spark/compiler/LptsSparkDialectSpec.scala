@@ -125,6 +125,67 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     }
   }
 
+  describe("null-on-error timestamp parser shim") {
+    it("renames the safe parser without changing literals or comments") {
+      val sql = "SELECT try_to_timestamp(d, 'yyyyMMdd'), 'try_to_timestamp(d, f)' -- try_to_timestamp(d, f)"
+      SparkFunctionShimSql.renameSparkFunctionShimCalls(sql) shouldBe
+        sql.replace("SELECT try_to_timestamp", "SELECT __sparkfn_try_to_timestamp")
+    }
+
+    it("restores safe timestamp parsing after native macro expansion") {
+      val sql = "SELECT try_strptime(d, 'yyyyMMdd'), 'try_strptime(d, f)'"
+      LptsSparkDialect.translate(sql) shouldBe "SELECT try_to_timestamp(d, 'yyyyMMdd'), 'try_strptime(d, f)'"
+    }
+  }
+
+  describe("integer casts around DuckDB numeric truncation") {
+    it("uses Spark's truncating integer cast for native interval constructors") {
+      val input    = "SELECT to_months(CAST(trunc(CAST(-12 AS DOUBLE)) AS INTEGER))"
+      val expected = "SELECT ((CAST(CAST(-12 AS DOUBLE) AS INTEGER)) * INTERVAL 1 MONTH)"
+      LptsSparkDialect.translate(input) shouldBe expected
+      LptsSparkDialect.translate(expected) shouldBe expected
+    }
+
+    it("preserves date truncation, decimal truncation and protected text") {
+      val input = "SELECT trunc(d, 'month'), trunc(x), CAST(trunc(x, 2) AS INT), " +
+        """CAST(trunc(x) AS DOUBLE), 'CAST(trunc(x) AS INT)', `CAST(trunc(x) AS INT)`, "CAST(trunc(x) AS INT)" /* CAST(trunc(x) AS INT) */"""
+      LptsSparkDialect.translate(input) shouldBe input
+    }
+
+    it("keeps nested arguments and truncates signed fractions before narrowing") {
+      LptsSparkDialect.translate("SELECT CAST(trunc(coalesce(x, -1.9)) AS BIGINT)") shouldBe
+        "SELECT CAST(coalesce(x, -1.9) AS BIGINT)"
+    }
+  }
+
+  describe("rewriteQuotedCastTypes") {
+    it("normalizes quoted CAST and TRY_CAST types through nested expressions") {
+      val sql = """SELECT CAST(coalesce(TRY_CAST(x AS "DATE"), CAST(NULL AS `DATE`)) AS "DATE"),
+        |CAST(x AS "VARCHAR"), CAST(x AS "DECIMAL"(12, 2))""".stripMargin
+      LptsSparkDialect.rewriteQuotedCastTypes(sql) shouldBe
+        """SELECT CAST(coalesce(TRY_CAST(x AS DATE), CAST(NULL AS DATE)) AS DATE),
+          |CAST(x AS STRING), CAST(x AS DECIMAL(12, 2))""".stripMargin
+    }
+
+    it("preserves aliases, literals, quoted identifiers, and comments containing cast syntax") {
+      val sql = """SELECT CAST((SELECT x AS "DATE") AS "DATE"),
+        |'CAST(NULL AS "DATE")', "CAST(NULL AS ""DATE"")", `CAST(NULL AS "DATE")`,
+        |CAST(')' AS "DATE") /* CAST(NULL AS "DATE") */ -- CAST(NULL AS "DATE")
+        |""".stripMargin
+      LptsSparkDialect.rewriteQuotedCastTypes(sql) shouldBe
+        sql
+          .replace("(SELECT x AS \"DATE\") AS \"DATE\"", "(SELECT x AS \"DATE\") AS DATE")
+          .replace("CAST(')' AS \"DATE\")", "CAST(')' AS DATE)")
+    }
+
+    it("keeps DATE column aliases quoted and is idempotent through the full dialect pipeline") {
+      val sql      = """SELECT CAST(CASE WHEN x > 0 THEN d ELSE CAST(NULL AS "DATE") END AS "DATE") AS "DATE" FROM t"""
+      val expected = "SELECT CAST(CASE WHEN x > 0 THEN d ELSE CAST(NULL AS DATE) END AS DATE) AS `DATE` FROM t"
+      LptsSparkDialect.translate(sql) shouldBe expected
+      LptsSparkDialect.translate(expected) shouldBe expected
+    }
+  }
+
   // ── 1. generate_series (2-arg) ───────────────────────────────────────────────
   describe("rewriteGenerateSeries") {
     it("rewrites generate_series(1, 10) to sequence(1, 10)") {
