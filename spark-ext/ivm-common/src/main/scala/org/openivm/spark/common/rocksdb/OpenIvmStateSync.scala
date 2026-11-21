@@ -123,6 +123,7 @@ object OpenIvmStateSync {
   @volatile private var beforeCaptureHookForTesting: () => Unit                          = null
   @volatile private var copyLocalFileHookForTesting: (FileSystem, File, Path) => Unit    = null
   @volatile private var beforeSnapshotCommitHookForTesting: () => Unit                   = null
+  @volatile private var afterSnapshotCommitHookForTesting: () => Unit                    = null
   private val backupExecutor = Executors.newCachedThreadPool { r =>
     val t = new Thread(r, "openivm-state-sync")
     t.setDaemon(true)
@@ -419,6 +420,8 @@ object OpenIvmStateSync {
       if (!fs.rename(pendingCommit, committed))
         throw new java.io.IOException(s"openivm state-sync: cannot publish snapshot commit $committed")
       published = true
+      val afterCommitHook = afterSnapshotCommitHookForTesting
+      if (afterCommitHook != null) afterCommitHook()
       if (reuse) outcomes.foreach { case (path, outcome) =>
         val digest = java.security.MessageDigest
           .getInstance("SHA-256")
@@ -512,6 +515,9 @@ object OpenIvmStateSync {
 
   private[rocksdb] def setBeforeSnapshotCommitHookForTesting(hook: () => Unit): Unit =
     beforeSnapshotCommitHookForTesting = hook
+
+  private[rocksdb] def setAfterSnapshotCommitHookForTesting(hook: () => Unit): Unit =
+    afterSnapshotCommitHookForTesting = hook
 
   private[rocksdb] def setCopyLocalFileHookForTesting(hook: (FileSystem, File, Path) => Unit): Unit =
     copyLocalFileHookForTesting = hook
@@ -632,6 +638,7 @@ object OpenIvmStateSync {
     beforeCaptureHookForTesting = null
     copyLocalFileHookForTesting = null
     beforeSnapshotCommitHookForTesting = null
+    afterSnapshotCommitHookForTesting = null
     restoreStates.clear()
     backupStates.clear()
   }
