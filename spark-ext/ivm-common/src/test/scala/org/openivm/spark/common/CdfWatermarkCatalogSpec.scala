@@ -152,8 +152,9 @@ class CdfWatermarkCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
     }
 
     it("preserves watermark reads and lazy migration with multi-get off and on") {
-      val flag   = "spark.openivm.cdf.watermarks.multiGet.enabled"
-      val legacy = OpenIvmRocksDBRegistry.getOrOpen(spark, OpenIvmStatePaths.indexDbPath(spark), IndexDbColumnFamilies.All)
+      val flag = "spark.openivm.cdf.watermarks.multiGet.enabled"
+      val legacy =
+        OpenIvmRocksDBRegistry.getOrOpen(spark, OpenIvmStatePaths.indexDbPath(spark), IndexDbColumnFamilies.All)
       try {
         Seq(false, true).foreach { enabled =>
           spark.conf.set(flag, enabled.toString)
@@ -175,18 +176,19 @@ class CdfWatermarkCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
           CdfWatermarkCatalog.getAll(spark, view, sources) shouldBe Map(
             "modern" -> 7L,
             "legacy" -> 23L,
-            "other" -> 11L
+            "other"  -> 11L
           )
           val shard = OpenIvmRocksDBRegistry.getOrOpen(
             spark,
             OpenIvmStatePaths.perMvDbPath(spark, view),
             OpenIvmStatePaths.PerMvColumnFamilies
           )
-          shard.get(IndexDbColumnFamilies.CdfWatermarks, RocksDBCodec.utf8("legacy"))
+          shard
+            .get(IndexDbColumnFamilies.CdfWatermarks, RocksDBCodec.utf8("legacy"))
             .map(RocksDBCodec.decodeLongBE) shouldBe Some(23L)
           CdfWatermarkCatalog.getAll(spark, view, Seq.empty) shouldBe Map.empty
 
-          val gets = OpenIvmMetrics.counter("rocksdb.scope.mv.operation.get.count").getCount
+          val gets      = OpenIvmMetrics.counter("rocksdb.scope.mv.operation.get.count").getCount
           val multiGets = OpenIvmMetrics.counter("rocksdb.scope.mv.operation.multi_get.count").getCount
           CdfWatermarkCatalog.getAll(spark, view, Seq("modern", "legacy", "other")) shouldBe
             Map("modern" -> 7L, "legacy" -> 23L, "other" -> 11L)
@@ -199,10 +201,10 @@ class CdfWatermarkCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Mat
     }
 
     it("reads a consistent multi-get snapshot during concurrent watermark writes") {
-      val flag = "spark.openivm.cdf.watermarks.multiGet.enabled"
-      val view = "mv_multiget_concurrent"
+      val flag  = "spark.openivm.cdf.watermarks.multiGet.enabled"
+      val view  = "mv_multiget_concurrent"
       val start = new CountDownLatch(1)
-      val pool = Executors.newSingleThreadExecutor()
+      val pool  = Executors.newSingleThreadExecutor()
       spark.conf.set(flag, "true")
       CdfWatermarkCatalog.putAll(spark, view, Map("left" -> 0L, "right" -> 0L))
       try {

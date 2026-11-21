@@ -73,9 +73,12 @@ private[common] object RocksDbCdfWatermarkBackend extends CdfWatermarkBackend {
       distinct.flatMap(source => get(spark, viewName, source).map(source -> _)).toMap
     } else {
       val values = openMvDb(spark, viewName).multiGet(Cf, distinct.map(sourceKey))
-      distinct.zip(values).flatMap { case (source, encoded) =>
-        encoded.map(RocksDBCodec.decodeLongBE).orElse(get(spark, viewName, source)).map(source -> _)
-      }.toMap
+      distinct
+        .zip(values)
+        .flatMap { case (source, encoded) =>
+          encoded.map(RocksDBCodec.decodeLongBE).orElse(get(spark, viewName, source)).map(source -> _)
+        }
+        .toMap
     }
   }
 
