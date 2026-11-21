@@ -15,25 +15,26 @@ import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 import scala.util.control.NonFatal
 
 class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisite") with CdfMode {
-  private val mapper = new ObjectMapper()
-  private val runId = UUID.randomUUID().toString
+  private val mapper           = new ObjectMapper()
+  private val runId            = UUID.randomUUID().toString
   private lazy val evidenceDir = new File(s"target/cdf-txn-canary-$runId").getAbsoluteFile
-  private val appKey = "spark.databricks.delta.write.txnAppId"
-  private val versionKey = "spark.databricks.delta.write.txnVersion"
-  private val tagKey = "spark.databricks.delta.commitInfo.userMetadata"
+  private val appKey           = "spark.databricks.delta.write.txnAppId"
+  private val versionKey       = "spark.databricks.delta.write.txnVersion"
+  private val tagKey           = "spark.databricks.delta.commitInfo.userMetadata"
 
-  private def table(name: String): String = new File(evidenceDir, name).getAbsolutePath
-  private def target(path: String): String = s"delta.`$path`"
+  private def table(name: String): String                        = new File(evidenceDir, name).getAbsolutePath
+  private def target(path: String): String                       = s"delta.`$path`"
   private def log(session: SparkSession, path: String): DeltaLog = DeltaLog.forTable(session, path)
 
   private def active[A](session: SparkSession)(f: => A): A = {
     val previous = SparkSession.getActiveSession
     SparkSession.setActiveSession(session)
     try f
-    finally previous match {
-      case Some(value) => SparkSession.setActiveSession(value)
-      case None        => SparkSession.clearActiveSession()
-    }
+    finally
+      previous match {
+        case Some(value) => SparkSession.setActiveSession(value)
+        case None        => SparkSession.clearActiveSession()
+      }
   }
 
   private def setTxn(session: SparkSession, app: String, version: Long, tag: String): Unit = {
@@ -48,7 +49,7 @@ class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisi
   }
 
   private def assertRows(session: SparkSession, path: String, expected: String): Unit = {
-    val actual = session.read.format("delta").load(path).select("id", "total")
+    val actual            = session.read.format("delta").load(path).select("id", "total")
     val wanted: DataFrame = session.sql(expected)
     assert(actual.exceptAll(wanted).count() == 0L)
     assert(wanted.exceptAll(actual).count() == 0L)
@@ -65,8 +66,8 @@ class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisi
       plan: Option[DelayedPlan] = None
   ): Unit = {
     val delta = log(session, path)
-    val snap = delta.update()
-    val root = mapper.createObjectNode()
+    val snap  = delta.update()
+    val root  = mapper.createObjectNode()
     root.put("canary", label)
     root.put("result", result)
     root.put("spark", spark.version)
@@ -130,16 +131,25 @@ class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisi
   }
 
   private def merge(session: SparkSession, path: String, increment: Long): Unit = {
-    session.sql(
-      s"""MERGE INTO ${target(path)} AS d
+    session
+      .sql(
+        s"""MERGE INTO ${target(path)} AS d
          |USING (SELECT 1 AS id, CAST($increment AS BIGINT) AS change) AS s
          |ON d.id = s.id
          |WHEN MATCHED THEN UPDATE SET d.total = d.total + s.change
          |WHEN NOT MATCHED THEN INSERT (id, total) VALUES (s.id, s.change)""".stripMargin
-    ).collect()
+      )
+      .collect()
   }
 
-  private def assertCommit(session: SparkSession, path: String, version: Long, app: String, seq: Long, tag: String): Unit = {
+  private def assertCommit(
+      session: SparkSession,
+      path: String,
+      version: Long,
+      app: String,
+      seq: Long,
+      tag: String
+  ): Unit = {
     val actions = log(session, path).getChanges(version, failOnDataLoss = true).next()._2
     assert(actions.collect { case t: SetTransaction if t.appId == app => t.version }.toVector == Vector(seq))
     assert(actions.collect { case c: CommitInfo => c.userMetadata }.flatten.toVector == Vector(tag))
@@ -150,8 +160,8 @@ class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisi
       val path = table("merge")
       create(path)
       val session = SparkSessionAccess.cloneSession(spark)
-      val app = s"canary-merge-$runId"
-      val tag = "canary-c1-c3-v7"
+      val app     = s"canary-merge-$runId"
+      val tag     = "canary-c1-c3-v7"
       active(session) {
         val before = log(session, path).update().version
         setTxn(session, app, 7L, tag)
@@ -160,7 +170,12 @@ class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisi
         assert(committed == before + 1L)
         assertCommit(session, path, committed, app, 7L, tag)
         assertRows(session, path, "SELECT 1 AS id, CAST(15 AS BIGINT) AS total UNION ALL SELECT 2, CAST(20 AS BIGINT)")
-        val historyTag = session.sql(s"DESCRIBE HISTORY ${target(path)}").where(s"version = $committed").select("userMetadata").head().getString(0)
+        val historyTag = session
+          .sql(s"DESCRIBE HISTORY ${target(path)}")
+          .where(s"version = $committed")
+          .select("userMetadata")
+          .head()
+          .getString(0)
         assert(historyTag == tag)
         setTxn(session, app, 7L, "retry-must-not-commit")
         observe("C1-retry", session, path, app) { merge(session, path, 5L) }
@@ -181,9 +196,9 @@ class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisi
       val path = table("marker")
       create(path)
       val session = SparkSessionAccess.cloneSession(spark)
-      val app = s"canary-marker-$runId"
+      val app     = s"canary-marker-$runId"
       active(session) {
-        val delta = log(session, path)
+        val delta   = log(session, path)
         val initial = delta.update().version
         session.conf.set(tagKey, "canary-c10-marker")
         val first = delta.startTransaction(None, None)
@@ -205,11 +220,18 @@ class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisi
           winner.commit(Seq(SetTransaction(app, 2L, Some(System.currentTimeMillis()))), DeltaOperations.ManualUpdate)
         }
         session.conf.set(tagKey, "canary-c10-stale")
-        val failure = try {
-          stale.commit(Seq(SetTransaction(app, 3L, Some(System.currentTimeMillis()))), DeltaOperations.ManualUpdate)
-          None
-        } catch { case NonFatal(error) => Some(error) }
-        record("C10-overlap", session, path, app, failure.map(e => s"${e.getClass.getName}: ${e.getMessage}").getOrElse("unexpected-success"))
+        val failure =
+          try {
+            stale.commit(Seq(SetTransaction(app, 3L, Some(System.currentTimeMillis()))), DeltaOperations.ManualUpdate)
+            None
+          } catch { case NonFatal(error) => Some(error) }
+        record(
+          "C10-overlap",
+          session,
+          path,
+          app,
+          failure.map(e => s"${e.getClass.getName}: ${e.getMessage}").getOrElse("unexpected-success")
+        )
         assert(failure.exists(_.getClass.getName.contains("ConcurrentTransactionException")))
         assert(delta.update().version == initial + 2L)
         assert(delta.update().transactions.get(app).contains(2L))
@@ -221,8 +243,8 @@ class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisi
       val path = table("ordering")
       create(path)
       val advanced = SparkSessionAccess.cloneSession(spark)
-      val delayed = SparkSessionAccess.cloneSession(spark)
-      val app = s"canary-order-$runId"
+      val delayed  = SparkSessionAccess.cloneSession(spark)
+      val app      = s"canary-order-$runId"
       val plan = active(delayed) {
         val captured = new DelayedPlan(log(delayed, path).update().version, usedSeq = 10L, higherSeq = 12L)
         record("C2-pre-advance-plan", delayed, path, app, "planned", Some(captured))
@@ -246,7 +268,11 @@ class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisi
         assert(log(delayed, path).update().version == afterAdvance + 1L)
         assert(log(delayed, path).update().transactions.get(app).contains(plan.higherSeq))
         assertCommit(delayed, path, afterAdvance + 1L, app, plan.higherSeq, "canary-c2-planned-gap")
-        assertRows(delayed, path, "SELECT 1 AS id, CAST(1011 AS BIGINT) AS total UNION ALL SELECT 2, CAST(20 AS BIGINT)")
+        assertRows(
+          delayed,
+          path,
+          "SELECT 1 AS id, CAST(1011 AS BIGINT) AS total UNION ALL SELECT 2, CAST(20 AS BIGINT)"
+        )
       }
     }
   }
