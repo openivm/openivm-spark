@@ -135,9 +135,15 @@ final class OpenIvmCliWorker {
 
     private static void writeExecutableReceipt(Process process, Path receipt) {
         try {
+            if (!process.isAlive() || !process.info().startInstant().isPresent()) {
+                throw new IOException("native process identity unavailable");
+            }
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             try (InputStream input = new DigestInputStream(
                     Files.newInputStream(Paths.get("/proc", Long.toString(process.pid()), "exe")), digest)) {
+                if (!process.isAlive()) {
+                    throw new IOException("native process exited before executable was opened");
+                }
                 byte[] buffer = new byte[65536];
                 while (input.read(buffer) != -1) {}
             }

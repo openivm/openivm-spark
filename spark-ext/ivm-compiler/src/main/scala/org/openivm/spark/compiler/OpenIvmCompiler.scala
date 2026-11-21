@@ -311,6 +311,13 @@ class OpenIvmCompiler private (
         val result = runCli(script, tmpDir, recordExecutable = true)
         try {
           val executable = new String(Files.readAllBytes(tmpDir.resolve("cli-executable.sha256")), "UTF-8")
+          val processIdentity =
+            Files.readAllLines(tmpDir.resolve("cli-native.identity"), java.nio.charset.StandardCharsets.UTF_8)
+          if (
+            processIdentity.size() != 2 || processIdentity.get(0).isEmpty || processIdentity.get(1).isEmpty ||
+            !Files.exists(tmpDir.resolve("cli-native.ready")) || !Files.exists(tmpDir.resolve("cli-native.exited"))
+          )
+            throw new IllegalStateException("Native process receipt is incomplete")
           val configured = CacheOriginDiagnostic.fileSha256(Paths.get(cliPath))
           if (executable != configured)
             CacheOriginDiagnostic.observe(origin)(_.problem("native_executable_unverified"))
@@ -332,6 +339,8 @@ class OpenIvmCompiler private (
               CacheOriginDiagnostic.fileSha256(tmpDir.resolve("cli.stdout")),
               executable,
               CacheOriginDiagnostic.fileSha256(Paths.get(extensionPath)),
+              processIdentity.get(0),
+              processIdentity.get(1),
               rows
             )
           )

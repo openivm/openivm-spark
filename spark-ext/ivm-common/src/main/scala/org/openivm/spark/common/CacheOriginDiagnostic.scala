@@ -148,10 +148,15 @@ object CacheOriginDiagnostic extends Logging {
         stdoutHash: String,
         executableHash: String,
         extensionHash: String,
+        processId: String,
+        processStart: String,
         rows: Seq[(Int, String)]
     ): Unit =
       synchronized {
         val item = invocations.addObject()
+        item.put("invocation_id", UUID.randomUUID().toString)
+        item.put("native_pid", processId)
+        item.put("native_start_instant", processStart)
         item.put("input_sha256", inputHash)
         item.put("stdout_sha256", stdoutHash)
         item.put("executable_sha256", executableHash)
@@ -193,6 +198,8 @@ object CacheOriginDiagnostic extends Logging {
         fields.put("tier", tier)
         fields.put("cache_key", key)
         fields.put("compiled_sql_sha256", sha256(sql))
+        val ordered = fields.putArray("compiled_statement_sha256")
+        SparkRefreshRewriter.splitStatements(sql).map(_.trim).filter(_.nonEmpty).foreach(s => ordered.add(sha256(s)))
         fields.put("classification_code", code)
         fields.put("classification", classification)
         fields.put("cache_hit", hit)

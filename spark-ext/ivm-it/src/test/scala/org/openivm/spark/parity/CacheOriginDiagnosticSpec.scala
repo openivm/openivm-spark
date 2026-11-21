@@ -91,6 +91,9 @@ class CacheOriginDiagnosticSpec extends IvmParitySpecBase("cache-origin-diagnost
         miss.path("native_invocations").get(0).path("extension_file_sha256").asText() shouldBe
           "fc5cec69e8fee7fc555895d02743c013168904b10f9af702f9b716a64fc01388"
         miss.path("native_invocations").get(0).path("ordered_native_rows").size() should be > 0
+        miss.path("native_invocations").get(0).path("native_pid").asText().toLong should be > 0L
+        miss.path("native_invocations").get(0).path("native_start_instant").asText() should not be empty
+        miss.path("compiled_statement_sha256").size() should be > 0
         hit.path("native_invocations").size() shouldBe 0
         miss.path("rewritten_sha256").size() should be > 0
         assertMvCorrect(s"origin_mv_$s", s"SELECT id,v FROM origin_src_$s")
