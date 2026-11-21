@@ -103,8 +103,8 @@ EVERY`, no generic ALTER surface, no double-quoted identifiers.
   the Delta-lowered forms (`ReplaceData`, `WriteDelta`).
 - **Compile bridge** (`ivm-compiler/OpenIvmCompiler`): runs `PRAGMA
 compile_refresh` through the **DuckDB CLI** (`/opt/openivm/duckdb`) with the
-  bundled `openivm.duckdb_extension`. The DuckDB JDBC dep (`duckdb_jdbc`
-  v1.5.2.1) is only used for ABI matching — the compile path is CLI-driven.
+  bundled `openivm.duckdb_extension`. The compile path is CLI-driven and
+  the project does not depend on DuckDB JDBC.
 - **Refresh rewriter** (`ivm-common/SparkRefreshRewriter`): takes the
   multi-statement DuckDB-dialect program emitted by openivm and rewrites it to
   Spark-executable SQL (MERGE / UPDATE / INSERT OVERWRITE / etc.) keyed on the

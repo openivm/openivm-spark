@@ -155,7 +155,7 @@ The normal development and CI image is
 `ghcr.io/mdrakiburrahman/openivm-spark-devcontainer:<content-hash>`. The tag
 covers the devcontainer definition, npm lockfile, SBT build definitions, native
 pins, and target pins. `DUCKDB_REF` and `DUCKDB_COMMIT` in `pins.env`
-explicitly select DuckDB v1.5.2 for both the CLI and native extension; do not
-infer the deployed ABI from OpenIVM's upstream submodule or CI version. JDBC
-stays on 1.5.2.1. `NATIVE_BUILD_JOBS` bounds native build parallelism (default
-8); lower it on shared builders.
+explicitly select the DuckDB v2.0.0 ABI for the official CLI and native
+extension. The compiler dynamically loads the extension through the CLI; the
+project does not use DuckDB JDBC. `NATIVE_BUILD_JOBS` bounds native build
+parallelism (default 16); lower it on shared builders.
