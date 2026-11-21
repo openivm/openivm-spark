@@ -36,7 +36,8 @@ private[rocksdb] object OpenIvmCheckpointReuse {
   private def readCheckpoint(path: Path, identity: Identity): Option[Entry] = {
     val paths = Files.walk(path)
     try {
-      val files = paths.iterator().asScala.toVector.filter(_ != path)
+      val files = paths.iterator().asScala.filter(_ != path).take(maxStoreFiles * 2 + 1).toVector
+      if (files.size > maxStoreFiles * 2) return None
       if (files.exists(Files.isSymbolicLink(_))) throw new java.io.IOException("symbolic checkpoint entry")
       if (files.exists(file => !Files.isDirectory(file) && !Files.isRegularFile(file)))
         throw new java.io.IOException("non-regular checkpoint entry")

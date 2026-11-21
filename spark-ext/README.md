@@ -37,7 +37,8 @@ The experimental `spark.openivm.stateSync.checkpointReuse.enabled` setting defau
 to `false`. When enabled, eligible unchanged, live single-process stores can reuse
 verified in-memory checkpoint bytes; other stores use the normal native checkpoint.
 Each backup still publishes an independently restorable V2 generation. The cache
-is bounded to 128 MiB, 256 stores, 16 MiB and 1,024 files per store. Successful
+retains at most 128 MiB of file bytes across 256 stores, with at most 16 MiB
+and 1,024 files per store. Successful
 generation logs report `fresh`, `reuse`, or `fallback` per hashed store path;
 failed publication logs are reported separately.
 
