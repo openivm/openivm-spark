@@ -775,8 +775,19 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       )
       OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe true
       remote.exists() shouldBe false
-      recordProfile(spark, "telemetry-first-mutation")
-      val firstMutation = OpenIvmStateBarrier.currentMutationGeneration(spark)
+      // Use real captured files without waking the RocksDB maintenance thread between generation samples.
+      val marker = OpenIvmStatePaths.openIvmRoot(spark).resolve("telemetry-canary-state")
+      def mutate(value: String): Long = {
+        val precedingGeneration = OpenIvmStateBarrier.currentMutationGeneration(spark)
+        OpenIvmStateBarrier.withMutation(spark) {
+          Files.createDirectories(marker.getParent)
+          Files.write(marker, value.getBytes(StandardCharsets.UTF_8))
+        }
+        val generation = OpenIvmStateBarrier.currentMutationGeneration(spark)
+        generation shouldBe precedingGeneration + 1L
+        generation
+      }
+      val firstMutation = mutate("first")
       val evidence      = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
       OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => { evidence.add(value); () })
       def backup(id: String): Unit = {
@@ -792,9 +803,8 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         backup("telemetry-reuse")
         committedGenerations(spark, remote.toURI.toString) shouldBe Seq(firstCommit._1)
 
-        recordProfile(spark, "telemetry-second-mutation")
-        val secondMutation = OpenIvmStateBarrier.currentMutationGeneration(spark)
-        secondMutation should be > firstMutation
+        val secondMutation = mutate("second")
+        secondMutation shouldBe firstMutation + 1L
         OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => throw new java.io.IOException("injected"))
         intercept[java.io.IOException](backup("telemetry-failed"))
         committedGenerations(spark, remote.toURI.toString) shouldBe Seq(firstCommit._1)

@@ -8,7 +8,7 @@ import org.apache.spark.SparkContext
 import org.apache.spark.api.plugin.{DriverPlugin, ExecutorPlugin, PluginContext, SparkPlugin}
 import org.apache.spark.internal.Logging
 import org.openivm.spark.plugin.metrics.conf.OpenIvmMetricsConf
-import org.openivm.spark.telemetry.{BoundedTelemetryQueue, BoundedTelemetryRuntime}
+import org.openivm.spark.telemetry.{BoundedTelemetryQueue, BoundedTelemetryRuntime, TelemetryJobListener}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 /** SparkPlugin that exports OpenIVM metrics through Spark's native registry. */
@@ -45,6 +45,7 @@ object OpenIvmMetricsPlugin extends Logging {
 
 class OpenIvmMetricsDriverPlugin extends DriverPlugin with Logging {
   private var telemetryQueue: Option[BoundedTelemetryQueue] = None
+  private var jobListener: Option[(SparkContext, TelemetryJobListener)] = None
 
   override def init(sc: SparkContext, ctx: PluginContext): java.util.Map[String, String] = {
     val config = OpenIvmMetricsConf(ctx.conf)
@@ -53,6 +54,11 @@ class OpenIvmMetricsDriverPlugin extends DriverPlugin with Logging {
     try telemetryQueue = BoundedTelemetryRuntime.start(ctx.conf, sc.hadoopConfiguration)
     catch {
       case NonFatal(_) => logWarning("OpenIVM telemetry queue configuration failed; queue is disabled")
+    }
+    telemetryQueue.foreach { _ =>
+      val listener = new TelemetryJobListener()
+      sc.addSparkListener(listener)
+      jobListener = Some(sc -> listener)
     }
     new java.util.HashMap[String, String]
   }
@@ -64,6 +70,8 @@ class OpenIvmMetricsDriverPlugin extends DriverPlugin with Logging {
   }
 
   override def shutdown(): Unit = {
+    jobListener.foreach { case (sc, listener) => sc.removeSparkListener(listener) }
+    jobListener = None
     telemetryQueue.foreach { queue =>
       try {
         if (!BoundedTelemetryRuntime.stop(queue, 5000L))

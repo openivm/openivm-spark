@@ -42,7 +42,7 @@ final class RefreshProfile private (
   private val stepOrder     = new AtomicInteger(0)
   private val buffer        = scala.collection.mutable.ArrayBuffer.empty[RefreshProfileRow]
   private val phaseTimeline =
-    if (spark.sparkContext.getConf.getBoolean(BoundedTelemetryQueue.EnabledKey, false))
+    if (spark != null && spark.sparkContext.getConf.getBoolean(BoundedTelemetryQueue.EnabledKey, false))
       Some(new PhaseTimeline(refreshId, viewName, if (mode == RefreshProfile.Mode.Create) "create" else "refresh"))
     else None
   private var spanCompleted = false

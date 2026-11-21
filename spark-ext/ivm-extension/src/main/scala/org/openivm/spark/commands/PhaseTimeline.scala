@@ -51,6 +51,7 @@ private[commands] final class PhaseTimeline(
         "start_monotonic_ns" -> frame.startNs,
         "inclusive_ns" -> elapsed,
         "exclusive_ns" -> math.max(0L, elapsed - frame.childNs),
+        "exclusive_scope" -> "same_thread_instrumented_children",
         "outcome" -> outcome
       ))
     }

@@ -6885,6 +6885,10 @@ case class RefreshMaterializedViewCommand(
               val sqlBytes  = sql.length
               val qOrder    = qlogOrder.getAndIncrement()
               val ownership = if (fullDomainCdfMerge) None else actionOwnership(qOrder, "statement", lineage)
+              val traceAction =
+                if (spark.sparkContext.getConf.getBoolean(org.openivm.spark.telemetry.BoundedTelemetryQueue.EnabledKey, false))
+                  Some(s"$refreshId/$qOrder/0/statement")
+                else None
               profile.timeStep(
                 "execute_refresh_sql_stmt",
                 s"statement=${stmtIdx + 1};bytes=$sqlBytes;stmt_kind=$kind"
@@ -6898,8 +6902,16 @@ case class RefreshMaterializedViewCommand(
                         s"work_class=incremental_sql;segment=statement;action_id=$qOrder:0:statement;" +
                         s"$origin;credit_ns=0$lineage"
                     ) {
-                      val result = GeneratedActionOwnership.withBoundary(spark, ownership, "sql")(spark.sql(sql))
-                      val rows   = GeneratedActionOwnership.withBoundary(spark, ownership, "collect")(result.collect())
+                      val result = profile.timeObservedStep("spark_sql", s"query_log_order=$qOrder;attempt=0") {
+                        GeneratedActionOwnership.withTrace(spark, traceAction, "sql") {
+                          GeneratedActionOwnership.withBoundary(spark, ownership, "sql")(spark.sql(sql))
+                        }
+                      }
+                      val rows = profile.timeObservedStep("spark_collect", s"query_log_order=$qOrder;attempt=0") {
+                        GeneratedActionOwnership.withTrace(spark, traceAction, "collect") {
+                          GeneratedActionOwnership.withBoundary(spark, ownership, "collect")(result.collect())
+                        }
+                      }
                       result -> rows
                     }
                     recordPlanMetrics(df, kind)
