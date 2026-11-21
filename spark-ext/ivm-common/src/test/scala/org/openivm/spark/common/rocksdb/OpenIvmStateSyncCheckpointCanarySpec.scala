@@ -944,7 +944,9 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       } finally Files.delete(alias.toPath)
       OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe false
 
-      recordProfile(spark, "telemetry-overlap-mutation")
+      OpenIvmStateBarrier.withMutation(spark) {
+        Files.write(captured.toPath.resolve("tracked-mutation"), Array[Byte](1))
+      }
       val generation = OpenIvmStateBarrier.currentMutationGeneration(spark)
       OpenIvmStateSync.backupNow(spark)
       val first = commitDetails(spark, remote.toURI.toString)
