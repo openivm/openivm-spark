@@ -13,7 +13,7 @@ import org.openivm.spark.telemetry.{BoundedTelemetryQueue, BoundedTelemetryRunti
 import org.scalatest.concurrent.Eventually
 import org.scalatest.time.{Seconds, Span}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 class PluginCorrelationIntegrationSpec
     extends IvmParitySpecBase("plugin-correlation")
