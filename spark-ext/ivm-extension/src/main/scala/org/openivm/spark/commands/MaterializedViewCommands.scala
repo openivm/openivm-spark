@@ -6058,16 +6058,16 @@ case class RefreshMaterializedViewCommand(
               fresh
           }
         }
-        CacheOriginDiagnostic.observe(origin)(_.cache(
-          compileCacheHit,
-          compileCacheTier,
-          MvMetadata.compileCacheSqlKey(meta.sourceSchemaFingerprint, compileCacheTier),
-          compiled.refreshType.toString,
-          compiled.refreshTypeName,
-          compiled.sql,
-          cachePersisted
-        ))
       }
+      CacheOriginDiagnostic.observe(origin)(_.cache(
+        compileCacheHit,
+        compileCacheTier,
+        MvMetadata.compileCacheSqlKey(meta.sourceSchemaFingerprint, compileCacheTier),
+        compiled.refreshType.toString,
+        compiled.refreshTypeName,
+        compiled.sql,
+        cachePersisted
+      ))
       if (
         preparedSourceAdvance.nonEmpty &&
         (compiled.refreshType == RefreshTypeCode.FullRefresh ||
