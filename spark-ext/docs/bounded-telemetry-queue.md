@@ -68,6 +68,14 @@ the driver's monotonic clock. Job stage tracking is bounded and marks truncation
 in the job-start record. Queue drops can also break links. Checkpoint request
 records carry a parent operation ID when a lifecycle trace is active.
 
+When state synchronization is configured, refreshes also report the root
+barrier's read-lock wait and hold intervals. They overlap other phases and do
+not assert exclusive time. The compiler emits driver and helper phase durations
+with the refresh operation ID; the helper uses a separate clock domain and
+its events can be lost on forced termination. Malformed or unavailable helper
+reports increment `CompileTraceDiagnostics.failureCount` and produce a
+rate-limited, sanitized warning.
+
 Checkpoint safety code can inspect the destinations of all live workers,
 including timed-out drains, with `BoundedTelemetryRuntime.sinksDisjoint`.
 It must use `withSinkTopology` to serialize an epoch check and the guarded
