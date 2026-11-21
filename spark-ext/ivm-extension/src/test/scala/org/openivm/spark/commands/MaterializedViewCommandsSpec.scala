@@ -1358,6 +1358,80 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       }
     }
 
+    it("releases the MV lock during synchronous CREATE publication with and without export") {
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      Seq(false, true).foreach { export =>
+        val suffix = if (export) "traced" else "plain"
+        val source = s"sales_t1_lock_$suffix"
+        val view = s"mv_t1_lock_$suffix"
+        spark.sql(s"CREATE TABLE $source(id INT) USING DELTA").collect()
+        spark.sql(s"INSERT INTO $source VALUES (1)").collect()
+        val backupEntered = new CountDownLatch(1)
+        val releaseBackup = new CountDownLatch(1)
+        val publicationThread = new AtomicReference[Thread]()
+        val publicationEntered = new CountDownLatch(1)
+        val activeExport = new AtomicBoolean(false)
+        val telemetryRoot = new Path(new File(warehouseDir, s"telemetry-lock-$suffix").toURI)
+        val conf = Seq(FeatureGate.StateSyncAsyncEnabledKey -> "false") ++
+          (if (export) Seq(
+            FeatureGate.TelemetryUriKey -> telemetryRoot.toString,
+            FeatureGate.TelemetryCampaignIdKey -> "create-lock-parity",
+            FeatureGate.TelemetryCorrelationIdKey -> s"correlation-$suffix",
+            FeatureGate.TelemetryPhaseKey -> "full"
+          ) else Seq.empty)
+        withSparkConfs(conf: _*) {
+          OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(s"file:/state-sync-create-lock-$suffix"))
+          OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+            activeExport.set(OpenIvmExecutionSpan.hasActiveExport)
+            backupEntered.countDown()
+            if (!releaseBackup.await(60, TimeUnit.SECONDS))
+              throw new IllegalStateException("CREATE backup was not released")
+          }
+          val create = Future {
+            withSparkLocalProperties(
+              OpenIvmTelemetryContract.RequestIdProperty -> s"request-lock-$suffix",
+              OpenIvmTelemetryContract.DbtNodeIdProperty -> s"model.$view"
+            ) {
+              spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id FROM $source").collect()
+            }
+          }
+          try {
+            backupEntered.await(60, TimeUnit.SECONDS) shouldBe true
+            activeExport.get() shouldBe export
+            val mvLock = Future {
+              RefreshMutex.withLocks(Seq.empty, Seq(view)) { () }
+            }
+            Await.result(mvLock, 15.seconds)
+            val samePublication = Future {
+              publicationThread.set(Thread.currentThread())
+              withSparkLocalProperties(
+                OpenIvmTelemetryContract.RequestIdProperty -> s"request-lock-again-$suffix",
+                OpenIvmTelemetryContract.DbtNodeIdProperty -> s"model.$view"
+              ) {
+                spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS $view AS SELECT id FROM $source").collect()
+                publicationEntered.countDown()
+              }
+            }
+            val queueDeadline = System.nanoTime() + 30.seconds.toNanos
+            def publicationQueued: Boolean =
+              Option(publicationThread.get()).exists(CreatePublicationMutex.hasQueuedThread(view, _))
+            while (!publicationQueued && System.nanoTime() < queueDeadline) Thread.`yield`()
+            publicationQueued shouldBe true
+            publicationEntered.getCount shouldBe 1L
+            create.isCompleted shouldBe false
+            releaseBackup.countDown()
+            Await.result(create, 120.seconds)
+            Await.result(samePublication, 120.seconds)
+            publicationEntered.getCount shouldBe 0L
+          } finally {
+            releaseBackup.countDown()
+            OpenIvmStateSync.setBackupPassHookForTesting(null)
+            OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+          }
+        }
+      }
+    }
+
     it("returns from CREATE while the default asynchronous backup is blocked") {
       spark.sql("CREATE TABLE sales_t1_async (id INT) USING DELTA").collect()
       spark.sql("INSERT INTO sales_t1_async VALUES (1)").collect()
@@ -2178,6 +2252,43 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
   }
 
   describe("(5ac) already-applied source-version telemetry") {
+    it("validates an already-applied pinned advance with and without export") {
+      spark.sql("CREATE TABLE src_t5ac_parity(id INT) USING DELTA").collect()
+      spark.sql("INSERT INTO src_t5ac_parity VALUES (1)").collect()
+      val version = DeltaTableVersion.requireLatest(spark, "src_t5ac_parity")
+      spark.sql(
+        s"CREATE MATERIALIZED VIEW mv_t5ac_parity AS SELECT id FROM src_t5ac_parity VERSION AS OF $version"
+      ).collect()
+      Seq(false, true).foreach { export =>
+        val suffix = if (export) "traced" else "plain"
+        val telemetryRoot = new Path(new File(warehouseDir, s"telemetry-advance-parity-$suffix").toURI)
+        val conf = if (export) Seq(
+          FeatureGate.TelemetryUriKey -> telemetryRoot.toString,
+          FeatureGate.TelemetryCampaignIdKey -> "advance-parity",
+          FeatureGate.TelemetryCorrelationIdKey -> s"advance-$suffix",
+          FeatureGate.TelemetryPhaseKey -> "source_refresh_staging"
+        ) else Seq.empty
+        withSparkConfs(conf: _*) {
+          withSparkLocalProperties(
+            OpenIvmTelemetryContract.RequestIdProperty -> s"advance-parity-$suffix",
+            OpenIvmTelemetryContract.DbtNodeIdProperty -> "model.mv_t5ac_parity"
+          ) {
+            val failure = intercept[Exception] {
+              CommandConcurrencyInjection.withForcedPreApplyVersionCaptureFailure {
+                spark.sql(
+                  s"ALTER MATERIALIZED VIEW mv_t5ac_parity ADVANCE SOURCE VERSIONS " +
+                    s"(src_t5ac_parity = $version)"
+                ).collect()
+              }
+            }
+            Iterator.iterate[Throwable](failure)(_.getCause).takeWhile(_ != null)
+              .exists(error => Option(error.getMessage).exists(_.contains("cannot capture the pre-apply MV version"))) shouldBe true
+          }
+        }
+      }
+      assertBagEqual("mv_t5ac_parity", "SELECT id FROM src_t5ac_parity")
+    }
+
     it("records complete classification, pin, version, delta, and timing fields before publishing") {
       val telemetryRoot = new Path(new File(warehouseDir, "telemetry-t5ac").toURI)
       withSparkConfs(

@@ -120,7 +120,13 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
           snapshotGenerationId = Some("snapshot-1"),
           acknowledgedSnapshotGenerationId = Some("snapshot-1"),
           requestStartMonotonicNs = -35L,
-          requestStartUtc = "2026-01-01T00:00:00Z"
+          requestStartUtc = "2026-01-01T00:00:00Z",
+          requestedMutationGeneration = Some(2L),
+          capturedMutationGeneration = Some(3L),
+          publishedMutationGeneration = Some(3L),
+          coalesced = true,
+          coverageProven = true,
+          outcome = Some("published_covered_generation")
         )
         val phase = OpenIvmExecutionSpan.StateSyncPhaseEvidence(
           operation = "spark.backup.commit",
@@ -148,7 +154,10 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
           published = true,
           snapshotGenerationId = Some("snapshot-1"),
           requestIds = Seq("state-sync-request-1"),
-          parentRequestIds = Seq("refresh-request-1")
+          parentRequestIds = Seq("refresh-request-1"),
+          requestedMutationGeneration = Some(2L),
+          capturedMutationGeneration = Some(3L),
+          publishedMutationGeneration = Some(3L)
         )
         span.recordStateSyncEvidence(Seq(request), Seq(publication))
         span.complete("refresh_done", "driver-refresh")
@@ -170,9 +179,17 @@ class OpenIvmExecutionSpanSpec extends AnyFunSpec with Matchers with BeforeAndAf
       request.path("request_start_utc").asText() shouldBe "2026-01-01T00:00:00Z"
       request.path("clock_domain_id").asText() shouldBe MonotonicClockDomain.id
       request.path("acknowledged_snapshot_generation_id").asText() shouldBe "snapshot-1"
-      request.path("requested_mutation_generation").isNull shouldBe true
+      request.path("requested_mutation_generation").asLong() shouldBe 2L
+      request.path("captured_mutation_generation").asLong() shouldBe 3L
+      request.path("published_mutation_generation").asLong() shouldBe 3L
+      request.path("coalesced").asBoolean() shouldBe true
+      request.path("coverage_proven").asBoolean() shouldBe true
+      request.path("outcome").asText() shouldBe "published_covered_generation"
       val publication = stateSync.path("publications").get(0)
       publication.path("scope").asText() shouldBe "run"
+      publication.path("requested_mutation_generation").asLong() shouldBe 2L
+      publication.path("captured_mutation_generation").asLong() shouldBe 3L
+      publication.path("published_mutation_generation").asLong() shouldBe 3L
       publication.path("snapshot_generation_id").asText() shouldBe "snapshot-1"
       publication.path("start_monotonic_ns").asLong() shouldBe -20L
       publication.path("clock_domain_id").asText() shouldBe request.path("clock_domain_id").asText()

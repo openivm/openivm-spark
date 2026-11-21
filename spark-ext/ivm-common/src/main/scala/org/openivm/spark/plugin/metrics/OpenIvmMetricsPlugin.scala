@@ -8,6 +8,7 @@ import org.apache.spark.SparkContext
 import org.apache.spark.api.plugin.{DriverPlugin, ExecutorPlugin, PluginContext, SparkPlugin}
 import org.apache.spark.internal.Logging
 import org.openivm.spark.plugin.metrics.conf.OpenIvmMetricsConf
+import org.openivm.spark.telemetry.{BoundedTelemetryQueue, BoundedTelemetryRuntime}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 /** SparkPlugin that exports OpenIVM metrics through Spark's native registry. */
@@ -43,15 +44,36 @@ object OpenIvmMetricsPlugin extends Logging {
 }
 
 class OpenIvmMetricsDriverPlugin extends DriverPlugin with Logging {
+  private var telemetryQueue: Option[BoundedTelemetryQueue] = None
+
   override def init(sc: SparkContext, ctx: PluginContext): java.util.Map[String, String] = {
     val config = OpenIvmMetricsConf(ctx.conf)
     OpenIvmMetrics.configure(config.enabled)
     if (!config.enabled) logInfo("OpenIVM metrics are not enabled")
+    try telemetryQueue = BoundedTelemetryRuntime.start(ctx.conf, sc.hadoopConfiguration)
+    catch {
+      case NonFatal(_) => logWarning("OpenIVM telemetry queue configuration failed; queue is disabled")
+    }
     new java.util.HashMap[String, String]
   }
 
-  override def registerMetrics(appId: String, ctx: PluginContext): Unit =
+  override def registerMetrics(appId: String, ctx: PluginContext): Unit = {
+    if (!BoundedTelemetryRuntime.registerMetrics(ctx.metricRegistry))
+      logWarning("some OpenIVM telemetry queue metrics could not be registered")
     if (OpenIvmMetrics.enabled) OpenIvmMetricsPlugin.registerMetrics(ctx)
+  }
+
+  override def shutdown(): Unit = {
+    telemetryQueue.foreach { queue =>
+      try {
+        if (!BoundedTelemetryRuntime.stop(queue, 5000L))
+          logWarning("OpenIVM telemetry queue did not drain before shutdown")
+      } catch {
+        case NonFatal(_) => logWarning("OpenIVM telemetry queue shutdown failed")
+      }
+    }
+    telemetryQueue = None
+  }
 }
 
 class OpenIvmMetricsExecutorPlugin extends ExecutorPlugin with Logging {

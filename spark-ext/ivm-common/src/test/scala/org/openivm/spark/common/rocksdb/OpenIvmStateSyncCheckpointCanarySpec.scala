@@ -9,7 +9,7 @@ import org.openivm.spark.common.{
   RefreshProfileCatalog,
   RefreshProfileRow
 }
-import org.openivm.spark.telemetry.OpenIvmExecutionSpan
+import org.openivm.spark.telemetry.{BoundedTelemetryQueue, BoundedTelemetryRuntime, OpenIvmExecutionSpan}
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -660,7 +660,10 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       val spark = newSpark(
         "checkpoint-cancelled-candidate-waiter",
         remote,
-        Seq(FeatureGate.StatePathKey -> stateRoot.getAbsolutePath)
+        Seq(
+          FeatureGate.StatePathKey -> stateRoot.getAbsolutePath,
+          FeatureGate.ProfileRefreshKey -> "true"
+        )
       )
       OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe true
       val marker = new File(stateRoot, "_openivm/triggers/cancelled-waiter/retained/marker")
@@ -680,6 +683,8 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         finally setRequestId(spark, null)
       }
 
+      val evidence = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
+      OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => { evidence.add(value); () })
       var activeRequest: Future[Unit] = null
       var waiterThread: Thread        = null
       try {
@@ -719,7 +724,15 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         waiterThread.isAlive shouldBe false
         waiterFailure.get() shouldBe a[InterruptedException]
         waiterInterrupted.get() shouldBe true
-        receipts.asScala.exists(_.requestId == "cancelled-candidate-waiter") shouldBe false
+        val cancelled = receipts.asScala.find(_.requestId == "cancelled-candidate-waiter").get
+        cancelled.outcome shouldBe "waiter_cancelled"
+        cancelled.acknowledged shouldBe false
+        val cancelledEvidence = evidence.asScala.flatMap(_.requests).find(_.outcome.contains("waiter_cancelled")).get
+        cancelledEvidence.status shouldBe "cancelled"
+        cancelledEvidence.coalesced shouldBe false
+        cancelledEvidence.capturedMutationGeneration shouldBe None
+        cancelledEvidence.publishedMutationGeneration shouldBe None
+        cancelledEvidence.acknowledgedSnapshotGenerationId shouldBe None
 
         releaseCapture.countDown()
         Await.result(activeRequest, 60.seconds)
@@ -732,7 +745,6 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         activeReceipt.archiveSha256 shouldBe Some(activeCommit._2)
         activeReceipt.archiveBytes shouldBe Some(activeCommit._3)
         commitDetailsFor(spark, remote.toURI.toString, activeReceipt.publicationGeneration.get) shouldBe activeCommit
-        receipts.asScala.exists(_.requestId == "cancelled-candidate-waiter") shouldBe false
       } finally {
         releaseCapture.countDown()
         OpenIvmStateSync.setBeforeCaptureHookForTesting(null)
@@ -744,70 +756,340 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
           try Await.ready(activeRequest, 60.seconds)
           catch { case _: Throwable => () }
         awaitBackupIdle()
+        OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(null)
       }
     }
 
-    it("publishes fresh traced checkpoints for unchanged telemetry-enabled requests") {
-      val fixtureRoot  = newDir("telemetry-fresh-publication")
+    it("reuses committed coverage with a disjoint sink, and reports capture and commit failures honestly") {
+      val fixtureRoot  = newDir("telemetry-coverage")
       val remote       = new File(fixtureRoot, "remote")
       val stateRoot    = new File(fixtureRoot, "state")
-      val telemetryDir = new File(fixtureRoot, "telemetry")
-      remote.mkdirs()
-      stateRoot.mkdirs()
-      telemetryDir.mkdirs()
+      val telemetryDir = new File(fixtureRoot, "telemetry/not-yet-created")
       val spark = newSpark(
-        "checkpoint-telemetry-fresh-publication",
+        "checkpoint-telemetry-coverage",
         remote,
         Seq(
           FeatureGate.StatePathKey           -> stateRoot.getAbsolutePath,
           FeatureGate.OneLakeTelemetryDirKey -> telemetryDir.toURI.toString
         )
       )
-      OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe false
-      recordProfile(spark, s"telemetry-fresh-${UUID.randomUUID()}")
-      val mutationGeneration = OpenIvmStateBarrier.currentMutationGeneration(spark)
-      val evidence           = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
+      OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe true
+      remote.exists() shouldBe false
+      recordProfile(spark, "telemetry-first-mutation")
+      val firstMutation = OpenIvmStateBarrier.currentMutationGeneration(spark)
+      val evidence      = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
       OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => { evidence.add(value); () })
+      def backup(id: String): Unit = {
+        setRequestId(spark, id)
+        OpenIvmStateSync.backupNow(spark)
+      }
       try {
-        setRequestId(spark, "telemetry-fresh-first")
-        OpenIvmStateSync.backupNow(spark)
+        backup("telemetry-first")
         val firstCommit = commitDetails(spark, remote.toURI.toString)
+        remote.isDirectory shouldBe true
+        // Exercise an explicit trailing-slash spelling as well as the now-existing directory.
+        spark.conf.set(FeatureGate.StateSyncUriKey, remote.toURI.toString)
+        backup("telemetry-reuse")
+        committedGenerations(spark, remote.toURI.toString) shouldBe Seq(firstCommit._1)
 
-        setRequestId(spark, "telemetry-fresh-second")
-        OpenIvmStateSync.backupNow(spark)
+        recordProfile(spark, "telemetry-second-mutation")
+        val secondMutation = OpenIvmStateBarrier.currentMutationGeneration(spark)
+        secondMutation should be > firstMutation
+        OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => throw new java.io.IOException("injected"))
+        intercept[java.io.IOException](backup("telemetry-failed"))
+        committedGenerations(spark, remote.toURI.toString) shouldBe Seq(firstCommit._1)
+        OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(null)
+        OpenIvmStateSync.setAfterCandidatePublicationHookForTesting(() => throw new InterruptedException("post-commit"))
+        backup("telemetry-retry")
+        Thread.interrupted() shouldBe true
         val secondCommit = commitDetails(spark, remote.toURI.toString)
-        OpenIvmStateBarrier.currentMutationGeneration(spark) shouldBe mutationGeneration
-        secondCommit._1 should not be firstCommit._1
-        committedGenerations(spark, remote.toURI.toString).toSet shouldBe Set(firstCommit._1, secondCommit._1)
-        Seq(firstCommit, secondCommit).foreach { commit =>
-          commit._2 shouldBe commit._4
-          commitDetailsFor(spark, remote.toURI.toString, commit._1) shouldBe commit
-        }
+        committedGenerations(spark, remote.toURI.toString) shouldBe Seq(firstCommit._1, secondCommit._1)
 
         val publications = evidence.asScala.toVector.flatMap(_.publications)
-        publications should have length 2
-        publications.map(_.snapshotGenerationId) shouldBe Seq(Some(firstCommit._1), Some(secondCommit._1))
-        publications.foreach { publication =>
-          publication.status shouldBe "success"
-          publication.captured shouldBe true
-          publication.published shouldBe true
-          publication.phases.find(_.operation == "spark.backup.capture").map(_.status) shouldBe Some("success")
-          publication.phases.find(_.operation == "spark.backup.commit").map(_.status) shouldBe Some("success")
-        }
+        publications.map(_.status) shouldBe Seq("success", "failed", "success")
+        publications.map(_.snapshotGenerationId) shouldBe Seq(Some(firstCommit._1), None, Some(secondCommit._1))
+        publications.map(_.requestedMutationGeneration) shouldBe Seq(Some(firstMutation), Some(secondMutation), Some(secondMutation))
+        publications.map(_.capturedMutationGeneration) shouldBe publications.map(_.requestedMutationGeneration)
+        publications.map(_.publishedMutationGeneration) shouldBe Seq(Some(firstMutation), None, Some(secondMutation))
+        publications(1).phases.find(_.operation == "spark.backup.commit").map(_.status) shouldBe Some("failed")
+
         val requests = evidence.asScala.toVector.flatMap(_.requests)
-        requests should have length 2
-        requests.map(_.acknowledgedSnapshotGenerationId) shouldBe publications.map(_.snapshotGenerationId)
-        receipts.asScala.exists(receipt => receipt.acknowledged && receipt.reused) shouldBe false
+        requests.map(_.outcome.get) shouldBe Seq(
+          "published_covered_generation", "reused_committed_coverage", "publication_failed", "published_covered_generation"
+        )
+        requests.map(_.acknowledgedSnapshotGenerationId) shouldBe Seq(
+          Some(firstCommit._1), Some(firstCommit._1), None, Some(secondCommit._1)
+        )
+        requests(1).publicationId shouldBe publications.head.publicationId
+        requests(1).reused shouldBe true
+        requests(1).capturedMutationGeneration shouldBe None
+        requests(1).publishedMutationGeneration shouldBe Some(firstMutation)
+        requests(2).status shouldBe "failed"
+        requests(2).capturedMutationGeneration shouldBe Some(secondMutation)
+        requests.map(_.requestId).distinct.size shouldBe 4
 
         val telemetryFiles = Files.walk(telemetryDir.toPath)
-        val hasReceipt =
-          try telemetryFiles.iterator().asScala.exists(_.getFileName.toString.endsWith(".jsonl"))
-          finally telemetryFiles.close()
-        hasReceipt shouldBe true
+        try telemetryFiles.iterator().asScala.exists(_.getFileName.toString.endsWith(".jsonl")) shouldBe true
+        finally telemetryFiles.close()
       } finally {
+        Thread.interrupted()
         setRequestId(spark, null)
+        OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(null)
+        OpenIvmStateSync.setAfterCandidatePublicationHookForTesting(null)
         OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(null)
       }
+    }
+
+    it("binds concurrent traced waiters to the one real coalesced publication covering both generations") {
+      implicit val executionContext: scala.concurrent.ExecutionContext = scala.concurrent.ExecutionContext.global
+      val fixture = newDir("traced-coalescing")
+      val remote = new File(fixture, "remote")
+      val state = new File(fixture, "state")
+      val spark = newSpark("traced-coalescing", remote, Seq(FeatureGate.StatePathKey -> state.getAbsolutePath))
+      val evidence = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
+      val firstCopy = new CountDownLatch(1)
+      val releaseCopy = new CountDownLatch(1)
+      val blocked = new AtomicBoolean(false)
+      OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => { evidence.add(value); () })
+      OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting(_ => {
+        if (blocked.compareAndSet(false, true)) {
+          firstCopy.countDown()
+          releaseCopy.await(30, TimeUnit.SECONDS) shouldBe true
+        }
+      })
+      val pending = scala.collection.mutable.ArrayBuffer.empty[Future[Unit]]
+      def request(parent: String): Unit = {
+        pending += Future {
+          OpenIvmExecutionSpan.start("canary.profile_only", "refresh", requestId = Some(parent))
+          try OpenIvmStateSync.backupNow(spark)
+          finally OpenIvmExecutionSpan.finishActive("done", Thread.currentThread().getName)
+        }
+        ()
+      }
+      try {
+        recordProfile(spark, "first")
+        val initial = OpenIvmStateSync.synchronousRequestCountForTesting(spark)
+        request("initial")
+        firstCopy.await(30, TimeUnit.SECONDS) shouldBe true
+        recordProfile(spark, "second")
+        val second = OpenIvmStateBarrier.currentMutationGeneration(spark)
+        request("second")
+        awaitSynchronousRequestCount(spark, initial + 2)
+        recordProfile(spark, "third")
+        val third = OpenIvmStateBarrier.currentMutationGeneration(spark)
+        third should be > second
+        request("third")
+        awaitSynchronousRequestCount(spark, initial + 3)
+        releaseCopy.countDown()
+        pending.foreach(future => Await.result(future, 60.seconds))
+
+        val records = evidence.asScala.toVector
+        val publications = records.flatMap(_.publications)
+        publications.size shouldBe 2
+        val coalesced = publications.find(_.requestedRequests == 2).get
+        coalesced.requestedMutationGeneration shouldBe Some(third)
+        coalesced.capturedMutationGeneration shouldBe Some(third)
+        coalesced.publishedMutationGeneration shouldBe Some(third)
+        val requests = records.flatMap(_.requests).filter(_.coalesced)
+        requests.map(_.requestId).toSet shouldBe coalesced.requestIds.toSet
+        requests.map(_.parentRequestId.get).toSet shouldBe Set("second", "third")
+        requests.map(_.requestedMutationGeneration.get).toSet shouldBe Set(second, third)
+        requests.foreach { waiter =>
+          waiter.reused shouldBe false
+          waiter.coverageProven shouldBe true
+          waiter.publicationId shouldBe coalesced.publicationId
+          waiter.acknowledgedSnapshotGenerationId shouldBe coalesced.snapshotGenerationId
+        }
+        committedGenerations(spark, remote.toURI.toString).size shouldBe 2
+      } finally {
+        releaseCopy.countDown()
+        pending.foreach(future => Await.ready(future, 60.seconds))
+        OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting(null)
+        OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(null)
+      }
+    }
+
+    it("captures afresh for telemetry inside state and rejects ambiguous or aliased sinks") {
+      val fixtureRoot = newDir("telemetry-overlap")
+      val remote      = new File(fixtureRoot, "remote")
+      val stateRoot   = new File(fixtureRoot, "state")
+      val captured    = new File(stateRoot, "_openivm")
+      val alias       = new File(fixtureRoot, "state-alias")
+      captured.mkdirs()
+      val spark = newSpark(
+        "checkpoint-telemetry-overlap",
+        remote,
+        Seq(
+          FeatureGate.StatePathKey           -> stateRoot.getAbsolutePath,
+          FeatureGate.OneLakeTelemetryDirKey -> new File(captured, "receipts").toURI.toString
+        )
+      )
+      val root = captured.toPath.toRealPath()
+      val conf = spark.sessionState.newHadoopConf()
+      OpenIvmStateBarrier.telemetrySinkDisjoint("Files/ambiguous", conf, root) shouldBe false
+      OpenIvmStateBarrier.telemetrySinkDisjoint(fixtureRoot.toURI.toString, conf, root) shouldBe false
+      Files.createSymbolicLink(alias.toPath, root)
+      try {
+        OpenIvmStateBarrier.telemetrySinkDisjoint(new File(alias, "future/receipts").toURI.toString, conf, root) shouldBe false
+      } finally Files.delete(alias.toPath)
+      OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe false
+
+      recordProfile(spark, "telemetry-overlap-mutation")
+      val generation = OpenIvmStateBarrier.currentMutationGeneration(spark)
+      OpenIvmStateSync.backupNow(spark)
+      val first = commitDetails(spark, remote.toURI.toString)
+      OpenIvmStateSync.backupNow(spark)
+      val second = commitDetails(spark, remote.toURI.toString)
+      OpenIvmStateBarrier.currentMutationGeneration(spark) shouldBe generation
+      first._1 should not be second._1
+      receipts.asScala.toVector.map(_.outcome) shouldBe Seq.fill(2)("published_fresh_fallback")
+      val archive = new File(remote, s".openivm-state-sync/snapshots/${second._1}/snapshot.zip")
+      val zip     = new java.util.zip.ZipFile(archive)
+      try zip.entries().asScala.exists(_.getName.endsWith(".jsonl")) shouldBe true
+      finally zip.close()
+    }
+
+    it("accounts for independent queue writes without a span, profile, or synchronous sink") {
+      Seq("disabled", "disjoint", "overlap", "unknown", "missing", "dual-unknown").foreach { arm =>
+        val fixture = newDir(s"queue-sink-$arm")
+        val remote = new File(fixture, "remote")
+        val state = new File(fixture, "state")
+        val sink = if (arm == "disjoint") new File(fixture, "sink") else new File(state, "_openivm/queue")
+        val destinations = arm match {
+          case "unknown" => Seq(BoundedTelemetryQueue.UriKey -> "file:relative/queue")
+          case "missing" => Seq.empty
+          case "dual-unknown" =>
+            Seq(
+              BoundedTelemetryQueue.LocalUriKey -> new File(fixture, "sink").toURI.toString,
+              BoundedTelemetryQueue.OneLakeUriKey -> "abfss://workspace@onelake.example/Files/telemetry",
+              "spark.hadoop.fs.abfss.impl" -> classOf[org.apache.hadoop.fs.LocalFileSystem].getName
+            )
+          case _ => Seq(BoundedTelemetryQueue.UriKey -> sink.toURI.toString)
+        }
+        val spark = newSpark(
+          s"checkpoint-queue-$arm",
+          remote,
+          Seq(
+            FeatureGate.StatePathKey -> state.getAbsolutePath,
+            BoundedTelemetryQueue.EnabledKey -> (arm != "disabled").toString
+          ) ++ destinations
+        )
+        val reusable = arm == "disabled" || arm == "disjoint"
+        try {
+          // SQL runtime settings cannot turn off a driver worker already configured by SparkConf.
+          spark.conf.set(BoundedTelemetryQueue.EnabledKey, "false")
+          OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe reusable
+          OpenIvmExecutionSpan.stateSyncCaptureEnabled(spark, None) shouldBe (arm != "disabled")
+          // An explicit tracked mutation keeps RocksDB's registration-triggered maintenance out of this queue test.
+          val marker = OpenIvmStatePaths.openIvmRoot(spark).resolve("queue-canary-state")
+          OpenIvmStateBarrier.withMutation(spark) {
+            Files.createDirectories(marker.getParent)
+            Files.write(marker, arm.getBytes(StandardCharsets.UTF_8))
+          }
+          val generation = OpenIvmStateBarrier.currentMutationGeneration(spark)
+          OpenIvmStateSync.backupNow(spark)
+          val first = commitDetails(spark, remote.toURI.toString)
+          withClue(s"$arm after initial capture: ") {
+            OpenIvmStateBarrier.currentMutationGeneration(spark) shouldBe generation
+          }
+          if (arm == "overlap" || arm == "disjoint") {
+            val sc = spark.sparkContext
+            val queue = BoundedTelemetryQueue.configured(sc.getConf, sc.hadoopConfiguration).get
+            try queue.offer("""{"checkpoint_queue_canary":true}""") shouldBe true
+            finally queue.shutdown(5000L) shouldBe true
+            queue.health.published shouldBe 1L
+          }
+          OpenIvmStateSync.backupNow(spark)
+          val second = commitDetails(spark, remote.toURI.toString)
+          withClue(s"$arm after queue activity: ") {
+            OpenIvmStateBarrier.currentMutationGeneration(spark) shouldBe generation
+            val commits = committedGenerations(spark, remote.toURI.toString)
+            if (reusable) commits shouldBe Seq(first._1)
+            else commits shouldBe Seq(first._1, second._1)
+          }
+          if (arm == "overlap") {
+            val archive = new File(remote, s".openivm-state-sync/snapshots/${second._1}/snapshot.zip")
+            val zip = new java.util.zip.ZipFile(archive)
+            try {
+              Option(zip.getEntry("queue-canary-state")) should not be empty
+              zip.entries().asScala.exists(entry =>
+                entry.getName.startsWith("queue/") && entry.getName.endsWith(".jsonl")
+              ) shouldBe true
+            } finally zip.close()
+          }
+        } finally stopSpark(spark)
+      }
+    }
+
+    it("exports actual publish and reuse evidence in queue-only mode without changing the checkpoint path") {
+      val fixture = newDir("queue-only-evidence")
+      val remote = new File(fixture, "remote")
+      val state = new File(fixture, "state")
+      val sink = new File(fixture, "sink")
+      val spark = newSpark(
+        "checkpoint-queue-only-evidence",
+        remote,
+        Seq(
+          FeatureGate.StatePathKey -> state.getAbsolutePath,
+          BoundedTelemetryQueue.EnabledKey -> "true",
+          BoundedTelemetryQueue.UriKey -> sink.toURI.toString
+        )
+      )
+      val sc = spark.sparkContext
+      val queue = BoundedTelemetryRuntime.start(sc.getConf, sc.hadoopConfiguration).get
+      try {
+        OpenIvmExecutionSpan.captureCurrent() shouldBe None
+        FeatureGate.telemetryUri(spark) shouldBe None
+        FeatureGate.oneLakeTelemetryDir(spark) shouldBe None
+        FeatureGate.profileRefreshEnabled(spark) shouldBe false
+        recordProfile(spark, "queue-only-evidence")
+        OpenIvmStateSync.backupNow(spark)
+        OpenIvmStateSync.backupNow(spark)
+      } finally BoundedTelemetryRuntime.stop(queue, 5000L) shouldBe true
+
+      val generations = committedGenerations(spark, remote.toURI.toString)
+      generations should have size 1
+      val generation = generations.head
+      val json = new com.fasterxml.jackson.databind.ObjectMapper()
+      val files = Files.list(sink.toPath)
+      val evidence = try files.iterator().asScala
+        .filter(_.getFileName.toString.endsWith(".jsonl"))
+        .map(path => json.readTree(path.toFile).path("state_sync"))
+        .toVector
+      finally files.close()
+      val requests = evidence.flatMap(_.path("requests").elements().asScala)
+      requests should have size 2
+      requests.map(_.path("outcome").asText()).toSet shouldBe Set("published_covered_generation", "reused_committed_coverage")
+      requests.map(_.path("acknowledged_snapshot_generation_id").asText()).distinct shouldBe Seq(generation)
+      val publications = evidence.flatMap(_.path("publications").elements().asScala)
+      publications.map(_.path("snapshot_generation_id").asText()) shouldBe Seq(generation)
+      publications.head.path("published_mutation_generation").isIntegralNumber shouldBe true
+    }
+
+    it("invalidates cached coverage when a runtime queue writes and exits between checkpoint requests") {
+      val fixture = newDir("queue-topology")
+      val remote = new File(fixture, "remote")
+      val state = new File(fixture, "state")
+      val spark = newSpark("checkpoint-queue-topology", remote, Seq(FeatureGate.StatePathKey -> state.getAbsolutePath))
+      recordProfile(spark, "queue-topology")
+      OpenIvmStateSync.backupNow(spark)
+      val first = commitDetails(spark, remote.toURI.toString)
+      val sc = spark.sparkContext
+      val config = sc.getConf
+        .set(BoundedTelemetryQueue.EnabledKey, "true")
+        .set(BoundedTelemetryQueue.UriKey, new File(state, "_openivm/queue").toURI.toString)
+      val queue = BoundedTelemetryRuntime.start(config, sc.hadoopConfiguration).get
+      try queue.offer("""{"checkpoint_queue_epoch_canary":true}""") shouldBe true
+      finally BoundedTelemetryRuntime.stop(queue, 5000L) shouldBe true
+      queue.health.published shouldBe 1L
+
+      OpenIvmStateSync.backupNow(spark)
+      val second = commitDetails(spark, remote.toURI.toString)
+      second._1 should not be first._1
+      val archive = new File(remote, s".openivm-state-sync/snapshots/${second._1}/snapshot.zip")
+      val zip = new java.util.zip.ZipFile(archive)
+      try zip.entries().asScala.exists(entry => entry.getName.startsWith("queue/") && entry.getName.endsWith(".jsonl")) shouldBe true
+      finally zip.close()
     }
 
     it("isolates cached coverage when distinct state roots share one publication destination") {

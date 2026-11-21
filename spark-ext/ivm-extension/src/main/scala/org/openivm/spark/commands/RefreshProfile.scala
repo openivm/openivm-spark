@@ -4,7 +4,7 @@ import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, MonotonicClockDomain, RefreshProfileCatalog, RefreshProfileRow}
 import org.openivm.spark.common.rocksdb.OpenIvmRocksDBTelemetry
 import org.openivm.spark.insights.{OpenIvmInsightJson, OpenIvmInsightsBroker, OpenIvmInsightsContract}
-import org.openivm.spark.telemetry.OpenIvmExecutionSpan
+import org.openivm.spark.telemetry.{BoundedTelemetryQueue, OpenIvmExecutionSpan}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
@@ -41,6 +41,10 @@ final class RefreshProfile private (
 
   private val stepOrder     = new AtomicInteger(0)
   private val buffer        = scala.collection.mutable.ArrayBuffer.empty[RefreshProfileRow]
+  private val phaseTimeline =
+    if (spark.sparkContext.getConf.getBoolean(BoundedTelemetryQueue.EnabledKey, false))
+      Some(new PhaseTimeline(refreshId, viewName, if (mode == RefreshProfile.Mode.Create) "create" else "refresh"))
+    else None
   private var spanCompleted = false
   private var spanOutcome   = "failed_before_end"
   private var spanEndNanos  = 0L
@@ -59,11 +63,11 @@ final class RefreshProfile private (
     val needsTiming =
       active || OpenIvmMetrics.enabled || OpenIvmExecutionSpan.needsProfileStepTiming(stepName) ||
         OpenIvmInsightsBroker.hasActiveCapture(spark)
-    if (!needsTiming) return body
+    if (!needsTiming && phaseTimeline.isEmpty) return body
     val t0        = System.nanoTime()
     var succeeded = false
     try {
-      val result = body
+      val result = phaseTimeline.fold(body)(_.time(stepName, detail)(body))
       succeeded = true
       result
     } finally {
@@ -86,12 +90,12 @@ final class RefreshProfile private (
   def timeObservedStep[A](stepName: String, detail: String = "")(body: => A): A = {
     val needsTiming =
       active || OpenIvmMetrics.enabled || OpenIvmInsightsBroker.hasActiveCapture(spark)
-    if (!needsTiming) return body
+    if (!needsTiming && phaseTimeline.isEmpty) return body
     val startedEpochMs = System.currentTimeMillis()
     val startedNanos   = System.nanoTime()
     var succeeded      = false
     try {
-      val result = body
+      val result = phaseTimeline.fold(body)(_.time(stepName, detail)(body))
       succeeded = true
       result
     } finally {

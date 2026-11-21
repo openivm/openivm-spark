@@ -1,10 +1,12 @@
 package org.openivm.spark.common.rocksdb
 
-import org.apache.hadoop.fs.Path
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, LocalFileSystem, Path, RawLocalFileSystem}
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, OpenIvmStatePaths}
+import org.openivm.spark.telemetry.{BoundedTelemetryQueue, BoundedTelemetryRuntime}
 
-import java.nio.file.{Files, Path => NioPath, Paths}
+import java.nio.file.{Files, LinkOption, Path => NioPath, Paths}
 import java.util.concurrent.{
   Callable,
   ConcurrentHashMap,
@@ -22,6 +24,7 @@ private[openivm] object OpenIvmStateBarrier {
     val lock: ReentrantReadWriteLock   = new ReentrantReadWriteLock(true)
     val mutationGeneration: AtomicLong = new AtomicLong(0L)
     @volatile var trackingEnabled      = false
+    @volatile var untrackedSinkObserved = false
     private val mutationMonitor        = new Object
     private var activeMutations        = 0
 
@@ -219,8 +222,8 @@ private[openivm] object OpenIvmStateBarrier {
           case Some(path) => disjoint(stateRoot, path)
           case None       => remoteHasNonLocalScheme(remoteUri)
         }
-        val telemetryIsUncaptured = FeatureGate.telemetryUri(spark).isEmpty &&
-          FeatureGate.oneLakeTelemetryDir(spark).isEmpty
+        observeTelemetrySinks(spark, stateRoot)
+        val telemetryIsUncaptured = !forRoot(stateRoot).untrackedSinkObserved
         FeatureGate.statePath(spark).isDefined &&
         disjoint(stateRoot, warehouse) &&
         remoteDisjoint &&
@@ -228,6 +231,71 @@ private[openivm] object OpenIvmStateBarrier {
       } catch {
         case NonFatal(_) => false
       }
+
+  // An overlapping/unknown sink may still write after the originating request finishes (or its
+  // configuration changes). Once observed, do not reuse cached coverage for this live root.
+  private[rocksdb] def markUntrackedSink(stateRoot: NioPath): Unit =
+    forRoot(stateRoot).untrackedSinkObserved = true
+
+  private[rocksdb] def hasUntrackedSink(stateRoot: NioPath): Boolean =
+    forRoot(stateRoot).untrackedSinkObserved
+
+  private[rocksdb] def observeTelemetrySinks(spark: SparkSession, stateRoot: NioPath): Unit = {
+    val disjoint = try {
+      val sinks = Seq(FeatureGate.telemetryUri(spark), FeatureGate.oneLakeTelemetryDir(spark)).flatten
+      val spanSinksDisjoint = sinks.isEmpty || {
+        val conf = spark.sessionState.newHadoopConf()
+        sinks.forall(telemetrySinkDisjoint(_, conf, stateRoot))
+      }
+      spanSinksDisjoint && queueSinkDisjoint(spark, stateRoot)
+    } catch { case NonFatal(_) => false }
+    if (!disjoint) markUntrackedSink(stateRoot)
+    observeRuntimeTelemetrySinks(stateRoot)
+  }
+
+  private[rocksdb] def observeRuntimeTelemetrySinks(stateRoot: NioPath): Unit =
+    if (!BoundedTelemetryRuntime.sinksDisjoint((uri, conf) => telemetrySinkDisjoint(uri, conf, stateRoot)))
+      markUntrackedSink(stateRoot)
+
+  private def queueSinkDisjoint(spark: SparkSession, stateRoot: NioPath): Boolean = {
+    // The plugin reads driver SparkConf and driver Hadoop configuration, not the SQL session overrides.
+    val sc = spark.sparkContext
+    BoundedTelemetryQueue.configuredDestinationUris(sc.getConf)
+      .forall(telemetrySinkDisjoint(_, sc.hadoopConfiguration, stateRoot))
+  }
+
+  private[spark] def telemetrySinkDisjoint(value: String, conf: Configuration, stateRoot: NioPath): Boolean =
+    try {
+      val path = new Path(value)
+      val uri = path.toUri
+      // Do not guess what a relative/default-FS path or a custom filesystem maps to.
+      if (!path.isAbsolute || uri.getScheme == null || uri.getFragment != null || uri.getQuery != null) false
+      else {
+        val scheme = uri.getScheme.toLowerCase(java.util.Locale.ROOT)
+        val impl = FileSystem.getFileSystemClass(scheme, conf)
+        scheme match {
+          case "file" if impl == classOf[LocalFileSystem] || impl == classOf[RawLocalFileSystem] =>
+            if (uri.getAuthority != null) false
+            else {
+              val lexical = Paths.get(uri).toAbsolutePath.normalize()
+              // Resolve existing ancestor symlinks even when the output directory does not yet exist.
+              def resolve(path: NioPath): NioPath =
+                if (Files.exists(path, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(path)) path.toRealPath()
+                else if (Files.notExists(path, LinkOption.NOFOLLOW_LINKS) && path.getParent != null)
+                  resolve(path.getParent).resolve(path.getFileName)
+                else throw new java.io.IOException("cannot resolve telemetry sink path")
+              disjoint(stateRoot, lexical) && disjoint(stateRoot, resolve(lexical))
+            }
+          case "abfs" =>
+            uri.getAuthority != null && impl.getName == "org.apache.hadoop.fs.azurebfs.AzureBlobFileSystem"
+          case "abfss" =>
+            uri.getAuthority != null && impl.getName == "org.apache.hadoop.fs.azurebfs.SecureAzureBlobFileSystem"
+          case "hdfs" =>
+            uri.getAuthority != null && impl.getName == "org.apache.hadoop.hdfs.DistributedFileSystem"
+          case _ => false
+        }
+      }
+    } catch { case NonFatal(_) => false }
 
   private def localPath(value: String): NioPath = {
     val uri  = new Path(value).toUri

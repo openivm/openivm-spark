@@ -366,6 +366,11 @@ private[spark] object CreatePublicationMutex {
   private val locks: java.util.Map[String, Guard] =
     Collections.synchronizedMap(new java.util.HashMap[String, Guard]())
 
+  private[commands] def hasQueuedThread(mvKey: String, thread: Thread): Boolean = {
+    val key = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
+    Option(locks.get(key)).exists(_.lock.hasQueuedThread(thread))
+  }
+
   def withLock[A](mvKey: String)(body: => A)(afterRelease: => Unit): A = {
     val key      = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
     val existing = locks.get(key)
@@ -2921,15 +2926,14 @@ case class CreateMaterializedViewCommand(
     var createFinalizationAttempted = false
     var createInsightClassification =
       Option.empty[OpenIvmMaterializedViewInsightEvents.Classification]
-    val finalizeUnderLock = OpenIvmExecutionSpan.hasActiveExport
 
-    def finalizeCreate(deferExecutionSpanEmission: Boolean = false): Unit =
+    def finalizeCreate(): Unit =
       if (!createFinalizationAttempted) {
         createFinalizationAttempted = true
         val totalMs = (System.nanoTime() - createT0) / 1000000L
         profile.appendStep("create_mv_total", s"view=${sqlIdent(name)}", totalMs)
         profile.completeSpan(createOutcome, Thread.currentThread().getName)
-        profile.flush(deferExecutionSpanEmission = deferExecutionSpanEmission)
+        profile.flush()
         sqlLog.flush()
       }
 
@@ -2962,41 +2966,29 @@ case class CreateMaterializedViewCommand(
       }
       val lockWaitT0 = System.nanoTime()
       val outcome = RefreshMutex.withLocks(createUpstreamReadKeys, Seq(commandName)) {
-        try {
-          val threadName = Thread.currentThread().getName
-          val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
-          profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
-          val outcome = org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
-            OpenIvmMetrics.CreateInflight.incrementAndGet()
-            try {
-              CommandConcurrencyInjection.maybePauseBeforeCreate()
-              DriverHeavyOperationAdmission.withPermit(spark, "create") {
-                runCreate(
-                  isolated,
-                  profile,
-                  sqlLog,
-                  createUpstreamReadKeys.toSet,
-                  classification => createInsightClassification = Some(classification)
-                )
-              }
-            } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
-          }
-          // An existing view is only looked up; there is no state change to publish.
-          if (finalizeUnderLock) {
-            if (outcome != "create_already_exists" || OpenIvmStateSync.guardedSqlEnabled(spark))
-              OpenIvmStateSync.backupForCommand(spark)
-            createOutcome = outcome
-          }
-          outcome
-        } finally {
-          if (finalizeUnderLock) finalizeCreate(deferExecutionSpanEmission = true)
+        val threadName = Thread.currentThread().getName
+        val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
+        profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
+        org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
+          OpenIvmMetrics.CreateInflight.incrementAndGet()
+          try {
+            CommandConcurrencyInjection.maybePauseBeforeCreate()
+            DriverHeavyOperationAdmission.withPermit(spark, "create") {
+              runCreate(
+                isolated,
+                profile,
+                sqlLog,
+                createUpstreamReadKeys.toSet,
+                classification => createInsightClassification = Some(classification)
+              )
+            }
+          } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
         }
       }
-      if (!finalizeUnderLock) {
-        if (outcome != "create_already_exists" || OpenIvmStateSync.guardedSqlEnabled(spark))
-          OpenIvmStateSync.backupForCommand(spark)
-        createOutcome = outcome
-      }
+      // An existing view is only looked up; there is no state change to publish.
+      if (outcome != "create_already_exists" || OpenIvmStateSync.guardedSqlEnabled(spark))
+        OpenIvmStateSync.backupForCommand(spark)
+      createOutcome = outcome
       if (outcome == "create_executed")
         createInsightClassification.foreach { classification =>
           OpenIvmMaterializedViewInsightEvents.createCompleted(
@@ -4956,14 +4948,6 @@ case class RefreshMaterializedViewCommand(
             "requested_source_versions",
             sourceVersions
           )
-        if (advance.changeBatches.isEmpty && !OpenIvmExecutionSpan.hasActiveExport) {
-          logInfo(
-            s"[openivm-mv] advance_source_versions view='${sqlIdent(name)}' outcome='already_applied' " +
-              s"versions='${advance.repin.targetVersions.toSeq.sorted.mkString(",")}'"
-          )
-          emitEnd("source_versions_already_applied", meta.refreshTypeName, 0)
-          return Seq.empty
-        }
       }
       OpenIvmExecutionSpan.recordActiveRefreshClassification(
         compileRefreshType = Some(compileRefreshType),

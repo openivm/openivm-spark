@@ -2,10 +2,12 @@ package org.openivm.spark.telemetry
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.internal.Logging
+import org.openivm.spark.common.rocksdb.OpenIvmStateBarrier
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, MonotonicClockDomain, TimeTravelPinReason, TimeTravelPinStatus}
 import org.slf4j.{MDC => Slf4jMdc}
 
+import java.nio.file.Path
 import java.time.Instant
 import java.util.{LinkedHashMap, UUID}
 import java.util.concurrent.TimeUnit
@@ -36,13 +38,17 @@ final class OpenIvmExecutionSpan private[telemetry] (
     private[spark] val startedAtNanos: Long,
     private val enabled: Boolean,
     private val configuredExport: Option[ConfiguredTelemetryExport],
-    private val oneLakeSink: Option[SpanSink] = None
+    private val oneLakeSink: Option[SpanSink] = None,
+    private val sinkDisjoint: Option[Path => Boolean] = None
 ) {
 
   private[spark] def stateSyncEvidenceEnabled: Boolean = enabled
 
   private[spark] def stateSyncPublicationSinkConfigured: Boolean =
     enabled && (configuredExport.nonEmpty || oneLakeSink.nonEmpty)
+
+  private[spark] def stateSyncSinksDisjoint(root: Path): Boolean =
+    !stateSyncPublicationSinkConfigured || sinkDisjoint.exists(_(root))
 
   private val lock                         = new Object
   private var stateSyncRequests            = Vector.empty[OpenIvmExecutionSpan.StateSyncRequestEvidence]
@@ -609,7 +615,14 @@ object OpenIvmExecutionSpan extends Logging {
       snapshotGenerationId: Option[String],
       acknowledgedSnapshotGenerationId: Option[String],
       requestStartMonotonicNs: Long = 0L,
-      requestStartUtc: String = ""
+      requestStartUtc: String = "",
+      requestedMutationGeneration: Option[Long] = None,
+      capturedMutationGeneration: Option[Long] = None,
+      publishedMutationGeneration: Option[Long] = None,
+      reused: Boolean = false,
+      coalesced: Boolean = false,
+      coverageProven: Boolean = false,
+      outcome: Option[String] = None
   )
 
   private[spark] final case class StateSyncPhaseEvidence(
@@ -641,7 +654,10 @@ object OpenIvmExecutionSpan extends Logging {
       requestIds: Seq[String] = Seq.empty,
       parentRequestIds: Seq[String] = Seq.empty,
       droppedRequestIds: Long = 0L,
-      droppedParentRequestIds: Long = 0L
+      droppedParentRequestIds: Long = 0L,
+      requestedMutationGeneration: Option[Long] = None,
+      capturedMutationGeneration: Option[Long] = None,
+      publishedMutationGeneration: Option[Long] = None
   )
 
   private[spark] final case class StateSyncEvidence(
@@ -662,7 +678,8 @@ object OpenIvmExecutionSpan extends Logging {
   ): Boolean =
     try
       active.exists(_.enabled) || FeatureGate.telemetryUri(spark).nonEmpty ||
-        FeatureGate.oneLakeTelemetryDir(spark).nonEmpty || FeatureGate.profileRefreshEnabled(spark)
+        FeatureGate.oneLakeTelemetryDir(spark).nonEmpty || FeatureGate.profileRefreshEnabled(spark) ||
+        spark.sparkContext.getConf.getOption(BoundedTelemetryQueue.EnabledKey).exists(_.trim.equalsIgnoreCase("true"))
     catch {
       case NonFatal(error) =>
         logWarning(
@@ -734,9 +751,13 @@ object OpenIvmExecutionSpan extends Logging {
       item.put("published", java.lang.Boolean.valueOf(request.published))
       item.put("snapshot_generation_id", request.snapshotGenerationId.orNull)
       item.put("acknowledged_snapshot_generation_id", request.acknowledgedSnapshotGenerationId.orNull)
-      item.put("requested_mutation_generation", null)
-      item.put("captured_mutation_generation", null)
-      item.put("published_mutation_generation", null)
+      item.put("requested_mutation_generation", request.requestedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
+      item.put("captured_mutation_generation", request.capturedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
+      item.put("published_mutation_generation", request.publishedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
+      item.put("reused", java.lang.Boolean.valueOf(request.reused))
+      item.put("coalesced", java.lang.Boolean.valueOf(request.coalesced))
+      item.put("coverage_proven", java.lang.Boolean.valueOf(request.coverageProven))
+      request.outcome.foreach(item.put("outcome", _))
       requests.add(item)
     }
     stateSync.put("requests", requests)
@@ -773,9 +794,9 @@ object OpenIvmExecutionSpan extends Logging {
       item.put("captured", java.lang.Boolean.valueOf(publication.captured))
       item.put("published", java.lang.Boolean.valueOf(publication.published))
       item.put("snapshot_generation_id", publication.snapshotGenerationId.orNull)
-      item.put("requested_mutation_generation", null)
-      item.put("captured_mutation_generation", null)
-      item.put("published_mutation_generation", null)
+      item.put("requested_mutation_generation", publication.requestedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
+      item.put("captured_mutation_generation", publication.capturedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
+      item.put("published_mutation_generation", publication.publishedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
       val counts = new LinkedHashMap[String, AnyRef]()
       publication.counts.toSeq.sortBy(_._1).foreach { case (name, value) =>
         counts.put(name, value.map(count => java.lang.Long.valueOf(math.max(0L, count))).orNull)
@@ -1042,6 +1063,12 @@ object OpenIvmExecutionSpan extends Logging {
     Option(current.get()).filter(_.matchesCommand(materializedView, operation)).foreach { existing =>
       return existing
     }
+    val oneLakeDir = FeatureGate.oneLakeTelemetryDir(spark)
+    val sinkDirs = Seq(FeatureGate.telemetryUri(spark), oneLakeDir).flatten
+    val sinkDisjoint = if (sinkDirs.isEmpty) None else {
+      val conf = spark.sessionState.newHadoopConf()
+      Some((root: Path) => sinkDirs.forall(OpenIvmStateBarrier.telemetrySinkDisjoint(_, conf, root)))
+    }
     correlationIdsFromSpark(spark) match {
       case (requestId, dbtNodeId) =>
         startInternal(
@@ -1056,9 +1083,8 @@ object OpenIvmExecutionSpan extends Logging {
             requestId,
             dbtNodeId
           ),
-          oneLakeSink = FeatureGate
-            .oneLakeTelemetryDir(spark)
-            .map(dir => OneLakeSpanSink.forDir(dir, spark.sessionState.newHadoopConf()))
+          oneLakeSink = oneLakeDir.map(dir => OneLakeSpanSink.forDir(dir, spark.sessionState.newHadoopConf())),
+          sinkDisjoint = sinkDisjoint
         )
     }
   }
@@ -1103,7 +1129,8 @@ object OpenIvmExecutionSpan extends Logging {
       requestId: Option[String],
       dbtNodeId: Option[String],
       configuredExport: Option[ConfiguredTelemetryExport],
-      oneLakeSink: Option[SpanSink] = None
+      oneLakeSink: Option[SpanSink] = None,
+      sinkDisjoint: Option[Path => Boolean] = None
   ): OpenIvmExecutionSpan = {
     Option(current.get()).filter(_.matchesCommand(materializedView, operation)).foreach { existing =>
       return existing
@@ -1121,7 +1148,8 @@ object OpenIvmExecutionSpan extends Logging {
       startedAtNanos = nowNanos,
       enabled = true,
       configuredExport = configuredExport,
-      oneLakeSink = oneLakeSink
+      oneLakeSink = oneLakeSink,
+      sinkDisjoint = sinkDisjoint
     )
     consumePending(span, nowNanos)
     current.set(span)
@@ -1563,8 +1591,10 @@ object OpenIvmExecutionSpan extends Logging {
     Json.writeValueAsString(fields)
   }
 
-  private def logSpan(payload: String): Unit =
+  private def logSpan(payload: String): Unit = {
     logInfo(LogPrefix + payload)
+    BoundedTelemetryRuntime.offer(payload)
+  }
 
   /** Stable-marker ERROR for a span-mirror delivery failure observed at the
     * emit call site. Greppable on `[openivm-telemetry-sink]`; the model itself
