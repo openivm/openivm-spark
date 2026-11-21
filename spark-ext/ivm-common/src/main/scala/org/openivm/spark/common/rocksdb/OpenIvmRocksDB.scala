@@ -946,10 +946,10 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   private[rocksdb] def withCheckpointIdentity[A](body: OpenIvmCheckpointReuse.Identity => A): Option[A] =
     withWriteLock {
       if (closed || conf.multiProcess || dbHandle == null) None
-      else {
+      else OpenIvmCheckpointReuse.readIdentity {
         val directoryKey = Files.readAttributes(dbDir, classOf[BasicFileAttributes]).fileKey()
         val identityPath = dbDir.resolve("IDENTITY")
-        val currentPath  = dbDir.resolve("CURRENT")
+        val currentPath = dbDir.resolve("CURRENT")
         val identityKey =
           if (Files.isRegularFile(identityPath) && !Files.isSymbolicLink(identityPath))
             Files.readAttributes(identityPath, classOf[BasicFileAttributes]).fileKey()
@@ -961,7 +961,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
         if (directoryKey == null || identityKey == null || currentKey == null) None
         else {
           val identityDigest = OpenIvmSnapshotArchive.sha256(identityPath.toFile)
-          val manifests      = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
+          val manifests = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
           val sidecars =
             try
               manifests.iterator().asScala.toVector.sortBy(_.getFileName.toString).map { manifest =>
@@ -971,21 +971,19 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
               }
             finally manifests.close()
           Some(
-            body(
-              OpenIvmCheckpointReuse.Identity(
-                dbHandle,
-                directoryKey,
-                identityKey,
-                currentKey,
-                identityDigest,
-                dbHandle.getLatestSequenceNumber,
-                columnFamilyHandles.keySet,
-                sidecars
-              )
+            OpenIvmCheckpointReuse.Identity(
+              dbHandle,
+              directoryKey,
+              identityKey,
+              currentKey,
+              identityDigest,
+              dbHandle.getLatestSequenceNumber,
+              columnFamilyHandles.keySet,
+              sidecars
             )
           )
         }
-      }
+      }.map(body)
     }
 
   /** The write/session mutex protects both lifetime and cross-family coherence.

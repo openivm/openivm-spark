@@ -56,13 +56,16 @@ class OpenIvmCheckpointReuseSpec extends AnyFunSpec with Matchers {
         lost.outcome shouldBe "fresh"
         lost.retain.foreach(_())
 
+        val previousSequence = db.withCheckpointIdentity(_.sequence).get
         db.close()
         val paths = Files.walk(live)
         try paths.iterator().asScala.toVector.sortBy(_.getNameCount).reverse.foreach(Files.delete(_))
         finally paths.close()
         db = new OpenIvmRocksDB(live.toString, OpenIvmRocksDBConf.default, Seq("meta"))
         db.load()
+        write("initial")
         write("replacement")
+        db.withCheckpointIdentity(_.sequence).get shouldBe previousSequence
         capture("replacement").outcome shouldBe "fresh"
         restore("replacement", "replacement")
       } finally {

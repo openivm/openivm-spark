@@ -34,6 +34,15 @@ private[rocksdb] object OpenIvmCheckpointReuse {
 
   private def hash(bytes: Array[Byte]): Vector[Byte] = MessageDigest.getInstance("SHA-256").digest(bytes).toVector
 
+  def readIdentity[A](read: => Option[A]): Option[A] =
+    try read
+    catch {
+      case interrupted: java.io.InterruptedIOException => throw interrupted
+      case error: java.io.IOException =>
+        log.warn("openivm state-sync: checkpoint identity unavailable; capturing natively", error)
+        None
+    }
+
   private def remove(db: OpenIvmRocksDB): Unit =
     cache.remove(db).foreach(entry => retainedBytes -= entry.bytes)
 
@@ -120,9 +129,11 @@ private[rocksdb] object OpenIvmCheckpointReuse {
       previous match {
         case Some(entry) if entry.identity == identity && copy(entry, destination) =>
           synchronized {
-            remove(db)
-            cache.put(db, entry)
-            retainedBytes += entry.bytes
+            if (cache.get(db).exists(_ eq entry)) {
+              remove(db)
+              cache.put(db, entry)
+              retainedBytes += entry.bytes
+            }
           }
           Capture("reuse")
         case _ =>
