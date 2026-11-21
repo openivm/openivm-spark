@@ -13,6 +13,7 @@ import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, UnresolvedWith}
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.{
+  CacheOriginDiagnostic,
   DeltaShape,
   ForeignKeyRelation,
   MemoryMainRefs,
@@ -23,6 +24,7 @@ import org.openivm.spark.common.{
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import scala.jdk.CollectionConverters._
+import scala.util.control.NonFatal
 
 /** Output of `openivm_compile_with_facts(view_name, facts_json)`. */
 final case class CompiledRefresh(
@@ -163,7 +165,9 @@ class OpenIvmCompiler private (
     * @throws NotImplementedError     if a source schema column has an unsupported Spark type.
     * @throws IllegalStateException   if called after [[close]].
     */
-  def compile(req: CompileRequest): CompiledRefresh = {
+  def compile(req: CompileRequest): CompiledRefresh = compile(req, None)
+
+  def compile(req: CompileRequest, origin: Option[CacheOriginDiagnostic.Recorder]): CompiledRefresh = {
     if (closed) throw new IllegalStateException("OpenIvmCompiler has been closed")
 
     // Spark/Delta snapshot pins (`… VERSION AS OF <v>`) are a storage concern
@@ -229,7 +233,7 @@ class OpenIvmCompiler private (
     try {
       val script = buildScript(req, tableDdls, tmpDir, normalizedViewSql)
       val (stdout, stderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
-        runCli(script, tmpDir)
+        runObservedCli(script, tmpDir, origin)
       }
       lastStdout = stdout
       lastStderr = stderr
@@ -250,7 +254,7 @@ class OpenIvmCompiler private (
             resultDir = Files.createTempDirectory(tmpDir, "scalar_retry_")
             val retry = buildScript(req, tableDdls, resultDir, rewritten, preserveScalarMarkers = true)
             val (retryStdout, retryStderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
-              runCli(retry, resultDir)
+              runObservedCli(retry, resultDir, origin)
             }
             resultStdout = retryStdout
             lastStdout = retryStdout
@@ -294,6 +298,48 @@ class OpenIvmCompiler private (
       OpenIvmMetrics.CompilerInflight.decrementAndGet()
       if (!retainControl) deleteDirRecursively(tmpDir)
     }
+  }
+
+  private def runObservedCli(
+      script: String,
+      tmpDir: Path,
+      origin: Option[CacheOriginDiagnostic.Recorder]
+  ): (String, String) = origin match {
+    case None => runCli(script, tmpDir)
+    case Some(_) =>
+      try {
+        val result = runCli(script, tmpDir, recordExecutable = true)
+        try {
+          val executable = new String(Files.readAllBytes(tmpDir.resolve("cli-executable.sha256")), "UTF-8")
+          val configured = CacheOriginDiagnostic.fileSha256(Paths.get(cliPath))
+          if (executable != configured)
+            CacheOriginDiagnostic.observe(origin)(_.problem("native_executable_unverified"))
+          val mapper = new com.fasterxml.jackson.databind.ObjectMapper()
+          val rows = result._1.linesIterator.filter(_.contains("\"refresh_type\"")).map { line =>
+            val row = mapper.readTree(line)
+            if (!row.has("stmt_order") || !row.get("stmt_order").isIntegralNumber || !row.has("sql"))
+              throw new IllegalStateException("Native compiler result lacks ordered SQL")
+            row.get("stmt_order").asInt() -> CacheOriginDiagnostic.sha256(row.get("sql").asText())
+          }.toVector
+          if (rows.isEmpty || rows.map(_._1) != rows.indices)
+            CacheOriginDiagnostic.observe(origin)(_.problem("native_statement_order_invalid"))
+          CacheOriginDiagnostic.observe(origin)(_.native(
+            CacheOriginDiagnostic.sha256(script),
+            CacheOriginDiagnostic.fileSha256(tmpDir.resolve("cli.stdout")),
+            executable,
+            CacheOriginDiagnostic.fileSha256(Paths.get(extensionPath)),
+            rows
+          ))
+        } catch {
+          case NonFatal(e) =>
+            CacheOriginDiagnostic.observe(origin)(_.problem(s"native_receipt_unavailable:${e.getClass.getName}"))
+        }
+        result
+      } catch {
+        case NonFatal(e) =>
+          CacheOriginDiagnostic.observe(origin)(_.problem(s"native_invocation_failed:${e.getClass.getName}"))
+          throw e
+      }
   }
 
   /** Marks the compiler as closed.  Subsequent calls to [[compile]] throw
@@ -680,7 +726,10 @@ class OpenIvmCompiler private (
     * process inherits read-only input and pipes, never writable capture files.
     * A stuck pipe reader is confined to the helper JVM, not the Spark driver.
     */
-  private[compiler] def runCli(script: String, tmpDir: Path): (String, String) = {
+  private[compiler] def runCli(script: String, tmpDir: Path): (String, String) =
+    runCli(script, tmpDir, recordExecutable = false)
+
+  private def runCli(script: String, tmpDir: Path, recordExecutable: Boolean): (String, String) = {
     val stdinPath  = tmpDir.resolve("cli.sql")
     val stdoutPath = tmpDir.resolve("cli.stdout")
     val stderrPath = tmpDir.resolve("cli.stderr")
@@ -704,7 +753,8 @@ class OpenIvmCompiler private (
       stdoutPath.toString,
       stderrPath.toString,
       errorPath.toString,
-      nativeLibraryPath.getOrElse("")
+      nativeLibraryPath.getOrElse(""),
+      if (recordExecutable) tmpDir.resolve("cli-executable.sha256").toString else ""
     )
       .redirectInput(stdinPath.toFile)
       .redirectOutput(ProcessBuilder.Redirect.DISCARD)

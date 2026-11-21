@@ -7,6 +7,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.security.DigestInputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -79,19 +82,23 @@ final class OpenIvmCliWorker {
             if (lifecycle.cancellationRequested()) {
                 return PROCESS_TIMEOUT;
             }
-            readers = Executors.newFixedThreadPool(2, task -> {
+            readers = Executors.newFixedThreadPool(args.length > 6 && !args[6].isEmpty() ? 3 : 2, task -> {
                 Thread thread = new Thread(task, "openivm-cli-reader");
                 thread.setDaemon(true);
                 return thread;
             });
             Future<?> stdout = readers.submit(() -> copy(process.getInputStream(), Paths.get(args[2])));
             Future<?> stderr = readers.submit(() -> copy(process.getErrorStream(), Paths.get(args[3])));
+            if (args.length > 6 && !args[6].isEmpty()) {
+                readers.submit(() -> writeExecutableReceipt(process, Paths.get(args[6])));
+            }
             long processDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(PROCESS_TIMEOUT_SECONDS);
             while (process.isAlive()) {
                 long remaining = processDeadline - System.nanoTime();
                 if (lifecycle.cancellationRequested() || remaining <= 0L) {
                     return PROCESS_TIMEOUT;
                 }
+
                 process.waitFor(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(50)), TimeUnit.NANOSECONDS);
             }
             lifecycle.acknowledgeExit();
@@ -123,6 +130,29 @@ final class OpenIvmCliWorker {
                 }
             }
             lifecycle.acknowledgeExit();
+        }
+    }
+
+    private static void writeExecutableReceipt(Process process, Path receipt) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (InputStream input = new DigestInputStream(
+                    Files.newInputStream(Paths.get("/proc", Long.toString(process.pid()), "exe")), digest)) {
+                byte[] buffer = new byte[65536];
+                while (input.read(buffer) != -1) {}
+            }
+            StringBuilder result = new StringBuilder();
+            for (byte value : digest.digest()) {
+                result.append(String.format("%02x", value & 0xff));
+            }
+            Files.write(receipt, result.toString().getBytes(StandardCharsets.UTF_8));
+        } catch (IOException | NoSuchAlgorithmException failure) {
+            try {
+                Files.write(receipt, ("unavailable:" + failure.getClass().getName())
+                        .getBytes(StandardCharsets.UTF_8));
+            } catch (IOException ignored) {
+                System.err.println("Could not write cache-origin executable receipt: " + ignored);
+            }
         }
     }
 

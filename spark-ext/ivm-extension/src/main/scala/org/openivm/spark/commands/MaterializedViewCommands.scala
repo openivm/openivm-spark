@@ -4153,6 +4153,7 @@ case class RefreshMaterializedViewCommand(
     // count-monoid aggregates.
     val viewMeta = metaName(name)
     OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
+    val origin = CacheOriginDiagnostic.start(spark, viewMeta)
     val lockT0           = System.nanoTime()
     var commandCompleted = false
     try {
@@ -4198,7 +4199,8 @@ case class RefreshMaterializedViewCommand(
           try {
             DriverHeavyOperationAdmission.withPermit(spark, "refresh") {
               org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
-                runUnderLock(cloned, lockAcqMs)
+                try runUnderLock(cloned, lockAcqMs, origin)
+                finally CacheOriginDiagnostic.observe(origin)(_.verifyIdentity(deltaPhysicalIdentity(cloned, sqlIdent(name))))
               }
             }
           } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
@@ -4220,6 +4222,10 @@ case class RefreshMaterializedViewCommand(
       }
       commandCompleted = true
       rows
+    } catch {
+      case t: Throwable =>
+        CacheOriginDiagnostic.observe(origin)(_.problem(s"command_error:${t.getClass.getName}"))
+        throw t
     } finally {
       // runUnderLock has many early returns and failure paths. Always detach
       // its telemetry collector from the reusable driver thread.
@@ -4227,7 +4233,10 @@ case class RefreshMaterializedViewCommand(
       try RefreshProfile.flushActive(failedOutcome)
       finally {
         try RefreshSqlLog.finishActive(failedOutcome)
-        finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+        finally {
+          try OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+          finally CacheOriginDiagnostic.observe(origin)(_.finish(commandCompleted))
+        }
       }
     }
   }
@@ -4575,7 +4584,11 @@ case class RefreshMaterializedViewCommand(
     recovered
   }
 
-  private def runUnderLock(spark: SparkSession, lockAcqMs: Long): Seq[Row] = {
+  private def runUnderLock(
+      spark: SparkSession,
+      lockAcqMs: Long,
+      origin: Option[CacheOriginDiagnostic.Recorder]
+  ): Seq[Row] = {
     import MvCommandHelper._
     import org.openivm.spark.compiler.LptsSparkDialect
 
@@ -4689,6 +4702,7 @@ case class RefreshMaterializedViewCommand(
     val threadName = Thread.currentThread().getName
     val profile    = RefreshProfile.start(spark, viewMeta, RefreshProfile.Mode.Refresh)
     val refreshId  = profile.refreshId
+    CacheOriginDiagnostic.observe(origin)(_.profile(refreshId))
     val sqlLog     = RefreshSqlLog.start(spark, refreshId, viewMeta, RefreshSqlLog.ModeRefresh)
     // A query-log-only monotonic counter. Independent of the perf
     // `stmtCounter` so source-delta registrations, count-monoid cleanup,
@@ -4752,6 +4766,13 @@ case class RefreshMaterializedViewCommand(
           )
         }
       val meta = recoverInterruptedSourceVersionAdvance(spark, loadedMeta)
+      CacheOriginDiagnostic.observe(origin) { recorder =>
+        deltaPhysicalIdentity(spark, sqlIdent(name)) match {
+          case Some((path, id)) =>
+            recorder.bind(id, CacheOriginDiagnostic.sha256(path), CacheOriginDiagnostic.sha256(meta.querySql), meta.sourceSchemaFingerprint)
+          case None => recorder.problem("target_identity_unreadable")
+        }
+      }
       val compileRefreshType = meta.properties
         .get(MvMetadata.CompileRefreshTypeKey)
         .map(_.trim)
@@ -5996,6 +6017,7 @@ case class RefreshMaterializedViewCommand(
           )
         } else None
       val compileCacheHit = cachedCompiled.isDefined
+      var cachePersisted = false
       OpenIvmMetrics.recordCompileCache(compileCacheHit)
       val compiled = profile.timeStep(
         "generate_refresh_sql.compile",
@@ -6010,7 +6032,7 @@ case class RefreshMaterializedViewCommand(
           cachedCompiled match {
             case Some(program) => program
             case None =>
-              val fresh = compiler.compile(compileRequest)
+              val fresh = compiler.compile(compileRequest, origin)
               if (compileCacheEnabled && fresh.sql.nonEmpty) {
                 val backfilled = refreshProperties ++
                   MvMetadata.compiledProperties(
@@ -6024,6 +6046,7 @@ case class RefreshMaterializedViewCommand(
                 try {
                   MvCatalog.updateProperties(spark, name, backfilled)
                   refreshProperties = backfilled
+                  cachePersisted = true
                 } catch {
                   case NonFatal(t) =>
                     logWarning(
@@ -6031,6 +6054,15 @@ case class RefreshMaterializedViewCommand(
                         s"${t.getClass.getName}: ${t.getMessage}"
                     )
                 }
+                CacheOriginDiagnostic.observe(origin)(_.cache(
+                  compileCacheHit,
+                  compileCacheTier,
+                  MvMetadata.compileCacheSqlKey(meta.sourceSchemaFingerprint, compileCacheTier),
+                  compiled.refreshType.toString,
+                  compiled.refreshTypeName,
+                  compiled.sql,
+                  cachePersisted
+                ))
               }
               fresh
           }
@@ -6485,6 +6517,7 @@ case class RefreshMaterializedViewCommand(
                   )
                 )
               } else rewrittenBase
+          CacheOriginDiagnostic.observe(origin)(_.rewritten(rewritten.statements))
             } else rewrittenBase
 
           var preserveViewDeltaOnFailure = false
@@ -6568,6 +6601,7 @@ case class RefreshMaterializedViewCommand(
                   try {
                     val df = spark.sql(sql)
                     val r  = df.collect()
+                    CacheOriginDiagnostic.observe(origin)(_.executed(stmtIdx, sql, succeeded = true))
                     recordPlanMetrics(df, kind)
                     val ms = (System.nanoTime() - t0) / 1000000L
                     sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms)
@@ -6586,6 +6620,7 @@ case class RefreshMaterializedViewCommand(
                     r
                   } catch {
                     case t: Throwable =>
+                      CacheOriginDiagnostic.observe(origin)(_.executed(stmtIdx, sql, succeeded = false))
                       val ms = (System.nanoTime() - t0) / 1000000L
                       sqlLog.record("rewritten_stmt", qOrder, 0, kind, sql, ms, succeeded = false)
                       throw t
