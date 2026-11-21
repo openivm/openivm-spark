@@ -1,4 +1,4 @@
-name: temporary digest qualification
+name: temporary assembly recovery
 on:
   workflow_dispatch:
 
@@ -7,9 +7,9 @@ permissions:
   packages: read
 
 jobs:
-  qualify:
+  assembly:
     runs-on: [self-hosted, openivm-spark-azure]
-    timeout-minutes: 350
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -22,7 +22,6 @@ jobs:
     env:
       NX_DAEMON: 'false'
       NX_NO_CLOUD: 'true'
-      OPENIVM_TEST_FORKS: '4'
       OPENIVM_NATIVE_DIR: /opt/openivm
     steps:
       - name: Checkout exact keeper
@@ -30,54 +29,27 @@ jobs:
         with:
           ref: d40c352727f12b992e2f38b44c8cb100a444135e
           fetch-depth: 0
-      - name: Attest native runtime
+      - name: Install locked tooling
+        run: npm ci --prefer-offline --no-audit --no-fund
+      - name: Build exact-source assembly
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = d40c352727f12b992e2f38b44c8cb100a444135e
-          source spark-ext/dev/pins.env
-          sha256sum /opt/openivm/duckdb /opt/openivm/openivm.duckdb_extension
-          /opt/openivm/duckdb --version
-          actual="$(/opt/openivm/duckdb -unsigned -noheader -csv -c "LOAD '/opt/openivm/openivm.duckdb_extension'; SELECT extension_version FROM duckdb_extensions() WHERE extension_name='openivm' AND loaded;")"
-          [[ "$actual" =~ ^[0-9a-f]{7,40}$ && "$OPENIVM_COMMIT" == "$actual"* ]]
-          echo "Native extension source: $actual"
-          ldd /opt/openivm/duckdb
-          ldd /opt/openivm/openivm.duckdb_extension
-      - name: Install locked tooling
-        run: npm ci --prefer-offline --no-audit --no-fund
-      - name: Focused Spark and checkpoint regressions
-        run: >-
-          npx --no-install nx run spark-ext:test --configuration=${{ matrix.target }} --
-          'ivmCommon/testOnly org.openivm.spark.common.SparkRefreshRewriterSpec org.openivm.spark.common.rocksdb.OpenIvmStateSyncCheckpointCanarySpec org.openivm.spark.common.rocksdb.OpenIvmCheckpointReuseSpec'
-          'ivmCompiler/testOnly org.openivm.spark.compiler.OpenIvmCompilerSpec org.openivm.spark.compiler.CompilerRuntimeProbeSpec'
-          'ivmExtension/testOnly org.openivm.spark.commands.MaterializedViewCommandsSpec org.openivm.spark.commands.BundledCompilerAssetsSpec'
-          'ivmIt/testOnly org.openivm.spark.parity.AggregateHavingSpec org.openivm.spark.parity.AggregateHavingCdfSpec org.openivm.spark.parity.AggregateHavingJoinSpec org.openivm.spark.parity.AggregateHavingJoinCdfSpec'
-      - name: Build assembly
-        run: npx --no-install nx run spark-ext:assembly --configuration=${{ matrix.target }}
-      - name: Attest assembly resources
-        shell: bash
-        run: |
-          set -euo pipefail
+          npx --no-install nx run spark-ext:assembly --configuration=${{ matrix.target }}
           mapfile -t jars < <(find spark-ext/ivm-extension/target -name '*assembly*.jar' -type f)
           test "${#jars[@]}" -eq 1
-          jar="${jars[0]}"
-          sha256sum "$jar"
+          sha256sum "${jars[0]}"
           for file in duckdb openivm.duckdb_extension; do
             expected="$(sha256sum "/opt/openivm/$file" | cut -d' ' -f1)"
-            actual="$(unzip -p "$jar" "openivm-native/$file" | sha256sum | cut -d' ' -f1)"
+            actual="$(unzip -p "${jars[0]}" "openivm-native/$file" | sha256sum | cut -d' ' -f1)"
             test "$actual" = "$expected"
             echo "$file $actual"
           done
-          if unzip -Z1 "$jar" | grep -E '(^|/)org/duckdb/' >/dev/null; then
-            echo 'Unexpected DuckDB JDBC classes in assembly' >&2
-            exit 1
-          fi
-          echo 'DuckDB JDBC classes absent'
-      - name: Upload failure logs
-        if: failure()
+      - name: Preserve assembly
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: qualification-${{ matrix.target }}-${{ github.run_id }}
-          path: .logs/
-          if-no-files-found: ignore
-          include-hidden-files: true
+          name: keeper-${{ matrix.target }}-${{ github.run_id }}
+          path: spark-ext/ivm-extension/target/**/*assembly*.jar
+          if-no-files-found: error
+          retention-days: 7
