@@ -186,7 +186,7 @@ class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisi
         val delta = log(session, path)
         val initial = delta.update().version
         session.conf.set(tagKey, "canary-c10-marker")
-        val first = delta.startTransaction()
+        val first = delta.startTransaction(None, None)
         assert(first.txnVersion(app) == -1L)
         observe("C10-marker", session, path, app) {
           first.commit(Seq(SetTransaction(app, 1L, Some(System.currentTimeMillis()))), DeltaOperations.ManualUpdate)
@@ -196,9 +196,9 @@ class CdfTxnPrerequisiteCanarySpec extends IvmParitySpecBase("cdf-txn-prerequisi
         val markerActions = delta.getChanges(initial + 1L, failOnDataLoss = true).next()._2
         assert(!markerActions.exists(a => a.isInstanceOf[AddFile] || a.isInstanceOf[RemoveFile]))
         assertRows(session, path, "SELECT 1 AS id, CAST(10 AS BIGINT) AS total UNION ALL SELECT 2, CAST(20 AS BIGINT)")
-        val stale = delta.startTransaction()
+        val stale = delta.startTransaction(None, None)
         assert(stale.txnVersion(app) == 1L)
-        val winner = delta.startTransaction()
+        val winner = delta.startTransaction(None, None)
         assert(winner.txnVersion(app) == 1L)
         session.conf.set(tagKey, "canary-c10-winner")
         observe("C10-winner", session, path, app) {
