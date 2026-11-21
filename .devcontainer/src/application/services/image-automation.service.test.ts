@@ -199,10 +199,14 @@ function scratchRoot(withBuildFiles = false): string {
     writeFileSync(
       join(root, 'spark-ext/dev/pins.env'),
       [
+        `DUCKDB_CLI_SHA256=${'a'.repeat(64)}`,
+        'DUCKDB_CLI_VERSION=v2.0.0',
         'DUCKDB_COMMIT=commit',
         'DUCKDB_REF=ref',
+        'EXTENSION_CI_TOOLS_COMMIT=commit',
         'LPTS_BRANCH=main',
         'LPTS_COMMIT=commit',
+        'LPTS_DUCKLAKE_COMMIT=commit',
         'LPTS_REPO=https://example.invalid/lpts',
         'NATIVE_BUILD_JOBS=1',
         'OPENIVM_BRANCH=main',
@@ -210,6 +214,8 @@ function scratchRoot(withBuildFiles = false): string {
         'OPENIVM_REPO=https://example.invalid/openivm',
         'SBT_VERSION=1.9.7',
         'UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu',
+        'VCPKG_COMMIT=commit',
+        'VCPKG_REPO=https://example.invalid/vcpkg',
       ].join('\n'),
       'utf8',
     );

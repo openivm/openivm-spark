@@ -6,11 +6,6 @@ object Dependencies {
   val sparkV = target.sparkVersion
   val deltaV = target.deltaVersion
   val antlrV = target.antlrVersion
-  // DuckDB JDBC pinned to track openivm's bundled DuckDB v1.5.x.
-  // The .duckdb_extension binary is built from openivm@OPENIVM_COMMIT inside
-  // the spark-ext Docker image.  The compiler module uses the CLI at
-  // /opt/openivm/duckdb (same ABI version as the extension) rather than JDBC.
-  val duckdbV = "1.5.2.1"
   val scalaTV = "3.2.18"
 
   val sparkCore = "org.apache.spark" %% "spark-core"         % sparkV   % Provided
@@ -18,7 +13,6 @@ object Dependencies {
   val sparkHive = "org.apache.spark" %% "spark-hive"         % sparkV   % Provided
   val sparkCat  = "org.apache.spark" %% "spark-catalyst"     % sparkV   % Provided
   val delta     = "io.delta"         %% target.deltaArtifact % deltaV   % Provided
-  val duckdb    = "org.duckdb"        % "duckdb_jdbc"        % duckdbV
   val rocksdb   = "org.rocksdb"       % "rocksdbjni"         % target.rocksDbVersion
   val antlr     = "org.antlr"         % "antlr4-runtime"     % antlrV
   val slf4j     = "org.slf4j"         % "slf4j-api"          % "2.0.12" % Provided
