@@ -6054,19 +6054,19 @@ case class RefreshMaterializedViewCommand(
                         s"${t.getClass.getName}: ${t.getMessage}"
                     )
                 }
-                CacheOriginDiagnostic.observe(origin)(_.cache(
-                  compileCacheHit,
-                  compileCacheTier,
-                  MvMetadata.compileCacheSqlKey(meta.sourceSchemaFingerprint, compileCacheTier),
-                  compiled.refreshType.toString,
-                  compiled.refreshTypeName,
-                  compiled.sql,
-                  cachePersisted
-                ))
               }
               fresh
           }
         }
+        CacheOriginDiagnostic.observe(origin)(_.cache(
+          compileCacheHit,
+          compileCacheTier,
+          MvMetadata.compileCacheSqlKey(meta.sourceSchemaFingerprint, compileCacheTier),
+          compiled.refreshType.toString,
+          compiled.refreshTypeName,
+          compiled.sql,
+          cachePersisted
+        ))
       }
       if (
         preparedSourceAdvance.nonEmpty &&
@@ -6517,8 +6517,8 @@ case class RefreshMaterializedViewCommand(
                   )
                 )
               } else rewrittenBase
-          CacheOriginDiagnostic.observe(origin)(_.rewritten(rewritten.statements))
             } else rewrittenBase
+          CacheOriginDiagnostic.observe(origin)(_.rewritten(rewritten.statements))
 
           var preserveViewDeltaOnFailure = false
           def deletePathIfExists(pathStr: String): Unit =
