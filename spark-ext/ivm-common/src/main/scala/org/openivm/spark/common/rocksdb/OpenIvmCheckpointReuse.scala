@@ -13,6 +13,9 @@ private[rocksdb] object OpenIvmCheckpointReuse {
   final case class Identity(
       handle: RocksDB,
       directoryKey: Object,
+      identityFileKey: Object,
+      currentFileKey: Object,
+      identityDigest: String,
       sequence: Long,
       columnFamilies: Set[String],
       manifests: Vector[(String, String)]
@@ -20,6 +23,7 @@ private[rocksdb] object OpenIvmCheckpointReuse {
 
   private final case class FileCopy(name: String, bytes: Array[Byte], digest: Vector[Byte])
   private final case class Entry(identity: Identity, files: Vector[FileCopy], bytes: Long)
+  final case class Capture(outcome: String, retain: Option[() => Unit] = None)
   private val log           = LoggerFactory.getLogger(getClass)
   private val maxBytes      = 128L * 1024L * 1024L
   private val maxEntries    = 256
@@ -57,13 +61,17 @@ private[rocksdb] object OpenIvmCheckpointReuse {
   }
 
   private def retain(db: OpenIvmRocksDB, path: Path, identity: Identity): Unit = {
-    remove(db)
     try {
       readCheckpoint(path, identity).foreach { entry =>
-        while (cache.nonEmpty && (cache.size >= maxEntries || retainedBytes + entry.bytes > maxBytes))
-          remove(cache.head._1)
-        cache.put(db, entry)
-        retainedBytes += entry.bytes
+        synchronized {
+          remove(db)
+          if (!db.isClosed) {
+            while (cache.nonEmpty && (cache.size >= maxEntries || retainedBytes + entry.bytes > maxBytes))
+              remove(cache.head._1)
+            cache.put(db, entry)
+            retainedBytes += entry.bytes
+          }
+        }
       }
     } catch {
       case interrupted: java.io.InterruptedIOException => throw interrupted
@@ -79,38 +87,55 @@ private[rocksdb] object OpenIvmCheckpointReuse {
       }
     ) false
     else {
-      Files.createDirectories(destination)
-      entry.files.foreach { file =>
-        OpenIvmSnapshotArchive.checkInterrupted()
-        val target = destination.resolve(file.name)
-        Files.createDirectories(target.getParent)
-        Files.write(target, file.bytes)
+      try {
+        Files.createDirectories(destination)
+        entry.files.foreach { file =>
+          OpenIvmSnapshotArchive.checkInterrupted()
+          val target = destination.resolve(file.name)
+          Files.createDirectories(target.getParent)
+          Files.write(target, file.bytes)
+        }
+        true
+      } catch {
+        case interrupted: java.io.InterruptedIOException => throw interrupted
+        case error: java.io.IOException =>
+          log.warn("openivm state-sync: cached checkpoint copy failed; capturing natively", error)
+          if (Files.exists(destination)) {
+            val paths = Files.walk(destination)
+            try paths.iterator().asScala.toVector.sortBy(_.getNameCount).reverse.foreach(Files.delete(_))
+            catch {
+              case cleanup: java.io.IOException =>
+                error.addSuppressed(cleanup)
+                throw error
+            } finally paths.close()
+          }
+          false
       }
-      true
     }
   }
 
-  def checkpoint(db: OpenIvmRocksDB, destination: Path): String =
+  def checkpoint(db: OpenIvmRocksDB, destination: Path): Capture =
     db.withCheckpointIdentity { identity =>
-      synchronized {
-        val previous = cache.get(db)
-        previous match {
-          case Some(entry) if entry.identity == identity && copy(entry, destination) =>
+      val previous = synchronized { cache.get(db) }
+      previous match {
+        case Some(entry) if entry.identity == identity && copy(entry, destination) =>
+          synchronized {
             remove(db)
             cache.put(db, entry)
             retainedBytes += entry.bytes
-            "reuse"
-          case _ =>
-            val outcome = if (previous.isDefined) "fallback" else "fresh"
-            db.checkpointTo(destination)
-            retain(db, destination, identity)
-            outcome
-        }
+          }
+          Capture("reuse")
+        case _ =>
+          val outcome = if (previous.isDefined) "fallback" else "fresh"
+          db.checkpointTo(destination)
+          Capture(outcome, Some(() => retain(db, destination, identity)))
       }
     }.getOrElse {
       db.checkpointTo(destination)
-      "fallback"
+      Capture("fallback")
     }
+
+  def evict(db: OpenIvmRocksDB): Unit = synchronized { remove(db) }
 
   private[rocksdb] def clearForTesting(): Unit = synchronized {
     cache.clear()

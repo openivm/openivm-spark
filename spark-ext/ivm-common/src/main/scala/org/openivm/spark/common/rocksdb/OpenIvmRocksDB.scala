@@ -948,8 +948,19 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       if (closed || conf.multiProcess || dbHandle == null) None
       else {
         val directoryKey = Files.readAttributes(dbDir, classOf[BasicFileAttributes]).fileKey()
-        if (directoryKey == null) None
+        val identityPath = dbDir.resolve("IDENTITY")
+        val currentPath = dbDir.resolve("CURRENT")
+        val identityKey =
+          if (Files.isRegularFile(identityPath) && !Files.isSymbolicLink(identityPath))
+            Files.readAttributes(identityPath, classOf[BasicFileAttributes]).fileKey()
+          else null
+        val currentKey =
+          if (Files.isRegularFile(currentPath) && !Files.isSymbolicLink(currentPath))
+            Files.readAttributes(currentPath, classOf[BasicFileAttributes]).fileKey()
+          else null
+        if (directoryKey == null || identityKey == null || currentKey == null) None
         else {
+          val identityDigest = OpenIvmSnapshotArchive.sha256(identityPath.toFile)
           val manifests = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
           val sidecars =
             try
@@ -964,6 +975,9 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
               OpenIvmCheckpointReuse.Identity(
                 dbHandle,
                 directoryKey,
+                identityKey,
+                currentKey,
+                identityDigest,
                 dbHandle.getLatestSequenceNumber,
                 columnFamilyHandles.keySet,
                 sidecars
@@ -1146,6 +1160,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   def close(): Unit = withWriteLock {
     if (closed) return
     closed = true
+    OpenIvmCheckpointReuse.evict(this)
 
     if (dbHandle != null) {
       closeInternal()

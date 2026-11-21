@@ -360,7 +360,7 @@ object OpenIvmStateSync {
     val archive   = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
     val capture   = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
     val reuse     = FeatureGate.stateSyncCheckpointReuseEnabled(spark)
-    val outcomes  = scala.collection.mutable.ArrayBuffer.empty[(String, String)]
+    val outcomes  = scala.collection.mutable.ArrayBuffer.empty[(String, OpenIvmCheckpointReuse.Capture)]
     var published = false
     try {
       val captureHook = beforeCaptureHookForTesting
@@ -425,8 +425,9 @@ object OpenIvmStateSync {
           .digest(path.getBytes(StandardCharsets.UTF_8))
           .map(byte => f"${byte & 0xff}%02x")
           .mkString
-        log.info(s"openivm state-sync: checkpoint generation=$generation store=$digest outcome=$outcome")
+        log.info(s"openivm state-sync: checkpoint generation=$generation store=$digest outcome=${outcome.outcome}")
       }
+      if (reuse) outcomes.foreach(_._2.retain.foreach(_()))
       log.info(
         s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
       )
