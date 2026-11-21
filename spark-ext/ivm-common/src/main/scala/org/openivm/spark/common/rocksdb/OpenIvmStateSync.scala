@@ -637,7 +637,18 @@ object OpenIvmStateSync {
 
   private def stateSyncUri(spark: SparkSession): Option[String] = {
     val hook = stateSyncUriHookForTesting
-    if (hook == null) FeatureGate.stateSyncUri(spark) else hook(spark)
+    val configured = if (hook == null) FeatureGate.stateSyncUri(spark) else hook(spark)
+    configured.map { value =>
+      val path = new Path(value)
+      if (backupPassHookForTesting != null) path.toString
+      else {
+        val fs = path.getFileSystem(spark.sessionState.newHadoopConf())
+        val qualified = fs.makeQualified(path).toUri.normalize()
+        if ("file".equalsIgnoreCase(qualified.getScheme))
+          new Path(new File(qualified).getCanonicalFile.toURI).toString
+        else new Path(qualified).toString
+      }
+    }
   }
 
   private[rocksdb] def guardedUri(spark: SparkSession): Option[String] =
@@ -1204,8 +1215,8 @@ object OpenIvmStateSync {
         if (!fs.rename(pendingCommit, committed))
           throw new java.io.IOException(s"openivm state-sync: cannot publish snapshot commit $committed")
         trace.markPublished()
-        onCommitted()
       }
+      onCommitted()
       log.info(
         s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
       )
@@ -1456,6 +1467,9 @@ object OpenIvmStateSync {
       .flatMap(uri => Option(backupStates.get(effectiveStateSyncKey(spark, uri))))
       .map(_.passLock.getQueueLength)
       .getOrElse(0)
+
+  private[rocksdb] def destinationQueueLengthForTesting(spark: SparkSession): Int =
+    stateSyncUri(spark).map(uri => destinationLock(uri).getQueueLength).getOrElse(0)
 
   private[rocksdb] def synchronousRequestCountForTesting(spark: SparkSession): Long =
     stateSyncUri(spark)

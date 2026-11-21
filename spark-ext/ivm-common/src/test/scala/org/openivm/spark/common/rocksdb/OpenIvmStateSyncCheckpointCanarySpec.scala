@@ -21,7 +21,7 @@ import java.security.MessageDigest
 import java.sql.Timestamp
 import java.util.UUID
 import java.util.concurrent.{CountDownLatch, CopyOnWriteArrayList, TimeUnit}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 
 import scala.concurrent.{Await, Future}
 import scala.concurrent.duration._
@@ -163,25 +163,71 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
   private def setRequestId(spark: SparkSession, requestId: String): Unit =
     spark.sparkContext.setLocalProperty("openivm.request_id", requestId)
 
-  private def commitDetails(spark: SparkSession, uri: String): (String, String, Long, String) = {
+  private def committedGenerations(spark: SparkSession, uri: String): Seq[String] = {
     val remoteRoot = new Path(uri)
     val fs         = remoteRoot.getFileSystem(spark.sessionState.newHadoopConf())
     val commits    = new Path(new Path(remoteRoot, ".openivm-state-sync"), "commits")
-    val latest = fs
-      .listStatus(commits)
+    fs.listStatus(commits)
       .filter(status => status.isFile && status.getPath.getName.endsWith(".commit"))
-      .sortBy(_.getPath.getName)
-      .last
-    val input = fs.open(latest.getPath)
+      .map(_.getPath.getName.stripSuffix(".commit"))
+      .sorted
+      .toSeq
+  }
+
+  private def commitDetailsFor(spark: SparkSession, uri: String, generation: String): (String, String, Long, String) = {
+    val remoteRoot = new Path(uri)
+    val fs         = remoteRoot.getFileSystem(spark.sessionState.newHadoopConf())
+    val commits    = new Path(new Path(remoteRoot, ".openivm-state-sync"), "commits")
+    val commit     = new Path(commits, s"$generation.commit")
+    fs.exists(commit) shouldBe true
+    val input = fs.open(commit)
     val text =
       try Source.fromInputStream(input, "UTF-8").mkString
       finally input.close()
     val lines = text.split("\\n", -1)
     lines.length shouldBe 5
-    val generation = lines(1)
+    lines(1) shouldBe generation
     val archive =
       new Path(new Path(new Path(new Path(remoteRoot, ".openivm-state-sync"), "snapshots"), generation), "snapshot.zip")
     (generation, lines(3), lines(2).toLong, sha256(fs, archive))
+  }
+
+  private def commitDetails(spark: SparkSession, uri: String): (String, String, Long, String) =
+    commitDetailsFor(spark, uri, committedGenerations(spark, uri).last)
+
+  private def awaitSynchronousRequestCount(spark: SparkSession, expected: Long): Unit = {
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+    while (OpenIvmStateSync.synchronousRequestCountForTesting(spark) != expected && System.nanoTime() < deadline)
+      Thread.sleep(10L)
+    OpenIvmStateSync.synchronousRequestCountForTesting(spark) shouldBe expected
+  }
+
+  private def awaitDestinationQueue(spark: SparkSession): Unit = {
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+    while (OpenIvmStateSync.destinationQueueLengthForTesting(spark) < 1 && System.nanoTime() < deadline)
+      Thread.sleep(10L)
+    OpenIvmStateSync.destinationQueueLengthForTesting(spark) should be >= 1
+  }
+
+  private def awaitBackupIdle(): Unit = {
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60)
+    while (!OpenIvmStateSync.allBackupStatesIdleForTesting && System.nanoTime() < deadline) Thread.sleep(10L)
+    OpenIvmStateSync.allBackupStatesIdleForTesting shouldBe true
+  }
+
+  private def awaitNewCommit(
+      spark: SparkSession,
+      uri: String,
+      previousGeneration: String
+  ): (String, String, Long, String) = {
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+    var latest   = committedGenerations(spark, uri).lastOption
+    while (latest.contains(previousGeneration) && System.nanoTime() < deadline) {
+      Thread.sleep(10L)
+      latest = committedGenerations(spark, uri).lastOption
+    }
+    latest.filter(_ != previousGeneration) should not be empty
+    commitDetailsFor(spark, uri, latest.get)
   }
 
   private def sha256(fs: org.apache.hadoop.fs.FileSystem, path: Path): String = {
@@ -505,6 +551,198 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       )
     }
 
+    it("holds a committed candidate across queued async commits and rejects its pruned generation") {
+      implicit val executionContext: scala.concurrent.ExecutionContext = scala.concurrent.ExecutionContext.global
+      val fixtureRoot                                                  = newDir("candidate-publication-lock")
+      val remote                                                       = new File(fixtureRoot, "remote")
+      val stateRoot                                                    = new File(fixtureRoot, "state")
+      remote.mkdirs()
+      stateRoot.mkdirs()
+      val spark = newSpark(
+        "checkpoint-candidate-publication-lock",
+        remote,
+        Seq(
+          FeatureGate.StatePathKey -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncRetainGenerationsKey -> "2"
+        )
+      )
+      OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe true
+      val marker = new File(stateRoot, "_openivm/triggers/candidate-lock/retained/marker")
+      marker.getParentFile.mkdirs()
+      Files.write(marker.toPath, Array[Byte](1, 3, 5, 7))
+      recordProfile(spark, s"candidate-lock-${UUID.randomUUID()}")
+
+      val candidatePublished = new CountDownLatch(1)
+      val releaseCandidate   = new CountDownLatch(1)
+      val asyncCaptureStarted = new CountDownLatch(1)
+      val watchAsyncCapture = new AtomicBoolean(false)
+      OpenIvmStateSync.setBeforeCaptureHookForTesting(() => {
+        if (watchAsyncCapture.get()) asyncCaptureStarted.countDown()
+      })
+      OpenIvmStateSync.setAfterCandidatePublicationHookForTesting(() => {
+        candidatePublished.countDown()
+        releaseCandidate.await(30, TimeUnit.SECONDS) shouldBe true
+      })
+      def request(requestId: String): Future[Unit] = Future {
+        setRequestId(spark, requestId)
+        try OpenIvmStateSync.backupNow(spark)
+        finally setRequestId(spark, null)
+      }
+
+      var candidateRequest: Future[Unit] = null
+      try {
+        val requestsBefore = OpenIvmStateSync.synchronousRequestCountForTesting(spark)
+        candidateRequest = request("candidate-publication-lock")
+        awaitSynchronousRequestCount(spark, requestsBefore + 1)
+        candidatePublished.await(30, TimeUnit.SECONDS) shouldBe true
+
+        val candidateCommit = commitDetails(spark, remote.toURI.toString)
+        committedGenerations(spark, remote.toURI.toString) shouldBe Seq(candidateCommit._1)
+        watchAsyncCapture.set(true)
+        OpenIvmStateSync.backupAsync(spark)
+        awaitDestinationQueue(spark)
+        asyncCaptureStarted.getCount shouldBe 1L
+        committedGenerations(spark, remote.toURI.toString) shouldBe Seq(candidateCommit._1)
+
+        releaseCandidate.countDown()
+        Await.result(candidateRequest, 60.seconds)
+        asyncCaptureStarted.await(30, TimeUnit.SECONDS) shouldBe true
+        val candidateReceipt = receipts.asScala.find(_.requestId == "candidate-publication-lock").get
+        candidateReceipt.acknowledged shouldBe true
+        candidateReceipt.published shouldBe true
+        candidateReceipt.reused shouldBe false
+        candidateReceipt.publicationGeneration shouldBe Some(candidateCommit._1)
+        candidateReceipt.archiveSha256 shouldBe Some(candidateCommit._2)
+        candidateReceipt.archiveBytes shouldBe Some(candidateCommit._3)
+        commitDetailsFor(spark, remote.toURI.toString, candidateCommit._1) shouldBe candidateCommit
+
+        val firstAsyncCommit = awaitNewCommit(spark, remote.toURI.toString, candidateCommit._1)
+        awaitBackupIdle()
+        committedGenerations(spark, remote.toURI.toString).toSet shouldBe Set(candidateCommit._1, firstAsyncCommit._1)
+        OpenIvmStateSync.backupAsync(spark)
+        val secondAsyncCommit = awaitNewCommit(spark, remote.toURI.toString, firstAsyncCommit._1)
+        awaitBackupIdle()
+        secondAsyncCommit._1 should not be firstAsyncCommit._1
+        committedGenerations(spark, remote.toURI.toString) shouldBe Seq(firstAsyncCommit._1, secondAsyncCommit._1)
+        committedGenerations(spark, remote.toURI.toString) should not contain candidateCommit._1
+
+        Await.result(request("sync-after-candidate-pruned"), 60.seconds)
+        val syncReceipt = receipts.asScala.find(_.requestId == "sync-after-candidate-pruned").get
+        val syncCommit  = commitDetails(spark, remote.toURI.toString)
+        syncReceipt.acknowledged shouldBe true
+        syncReceipt.published shouldBe true
+        syncReceipt.reused shouldBe false
+        syncReceipt.coverageProven shouldBe true
+        syncReceipt.publicationGeneration shouldBe Some(syncCommit._1)
+        syncReceipt.publicationGeneration should not be candidateReceipt.publicationGeneration
+        syncReceipt.archiveSha256 shouldBe Some(syncCommit._2)
+        syncReceipt.archiveBytes shouldBe Some(syncCommit._3)
+        commitDetailsFor(spark, remote.toURI.toString, syncReceipt.publicationGeneration.get) shouldBe syncCommit
+      } finally {
+        releaseCandidate.countDown()
+        OpenIvmStateSync.setAfterCandidatePublicationHookForTesting(null)
+        OpenIvmStateSync.setBeforeCaptureHookForTesting(null)
+        if (candidateRequest != null)
+          try Await.ready(candidateRequest, 60.seconds)
+          catch { case _: Throwable => () }
+        awaitBackupIdle()
+      }
+    }
+
+    it("cancels a queued candidate waiter without acknowledging it after the active commit") {
+      implicit val executionContext: scala.concurrent.ExecutionContext = scala.concurrent.ExecutionContext.global
+      val fixtureRoot                                                  = newDir("cancelled-candidate-waiter")
+      val remote                                                       = new File(fixtureRoot, "remote")
+      val stateRoot                                                    = new File(fixtureRoot, "state")
+      remote.mkdirs()
+      stateRoot.mkdirs()
+      val spark = newSpark(
+        "checkpoint-cancelled-candidate-waiter",
+        remote,
+        Seq(FeatureGate.StatePathKey -> stateRoot.getAbsolutePath)
+      )
+      OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe true
+      val marker = new File(stateRoot, "_openivm/triggers/cancelled-waiter/retained/marker")
+      marker.getParentFile.mkdirs()
+      Files.write(marker.toPath, Array[Byte](2, 4, 6, 8))
+      recordProfile(spark, s"cancelled-waiter-${UUID.randomUUID()}")
+
+      val captureStarted = new CountDownLatch(1)
+      val releaseCapture = new CountDownLatch(1)
+      OpenIvmStateSync.setBeforeCaptureHookForTesting(() => {
+        captureStarted.countDown()
+        releaseCapture.await(30, TimeUnit.SECONDS) shouldBe true
+      })
+      def request(requestId: String): Future[Unit] = Future {
+        setRequestId(spark, requestId)
+        try OpenIvmStateSync.backupNow(spark)
+        finally setRequestId(spark, null)
+      }
+
+      var activeRequest: Future[Unit] = null
+      var waiterThread: Thread         = null
+      try {
+        val requestsBefore = OpenIvmStateSync.synchronousRequestCountForTesting(spark)
+        activeRequest = request("active-candidate-capture")
+        awaitSynchronousRequestCount(spark, requestsBefore + 1)
+        captureStarted.await(30, TimeUnit.SECONDS) shouldBe true
+
+        val waiterFailure     = new AtomicReference[Throwable]()
+        val waiterInterrupted = new AtomicBoolean(false)
+        val waiterStarted     = new CountDownLatch(1)
+        waiterThread = new Thread(new Runnable {
+          override def run(): Unit = {
+            waiterStarted.countDown()
+            setRequestId(spark, "cancelled-candidate-waiter")
+            try {
+              OpenIvmStateSync.backupNow(spark)
+              waiterFailure.set(new AssertionError("cancelled waiter unexpectedly returned successfully"))
+            } catch {
+              case error: Throwable => waiterFailure.set(error)
+            } finally {
+              waiterInterrupted.set(Thread.currentThread().isInterrupted)
+              setRequestId(spark, null)
+            }
+          }
+        }, "checkpoint-cancelled-candidate-waiter")
+        waiterThread.start()
+        waiterStarted.await(10, TimeUnit.SECONDS) shouldBe true
+        awaitSynchronousRequestCount(spark, requestsBefore + 2)
+        awaitDestinationQueue(spark)
+        waiterThread.isAlive shouldBe true
+        waiterThread.interrupt()
+        waiterThread.join(TimeUnit.SECONDS.toMillis(10))
+        waiterThread.isAlive shouldBe false
+        waiterFailure.get() shouldBe a[InterruptedException]
+        waiterInterrupted.get() shouldBe true
+        receipts.asScala.exists(_.requestId == "cancelled-candidate-waiter") shouldBe false
+
+        releaseCapture.countDown()
+        Await.result(activeRequest, 60.seconds)
+        val activeReceipt = receipts.asScala.find(_.requestId == "active-candidate-capture").get
+        val activeCommit  = commitDetails(spark, remote.toURI.toString)
+        activeReceipt.acknowledged shouldBe true
+        activeReceipt.published shouldBe true
+        activeReceipt.reused shouldBe false
+        activeReceipt.publicationGeneration shouldBe Some(activeCommit._1)
+        activeReceipt.archiveSha256 shouldBe Some(activeCommit._2)
+        activeReceipt.archiveBytes shouldBe Some(activeCommit._3)
+        commitDetailsFor(spark, remote.toURI.toString, activeReceipt.publicationGeneration.get) shouldBe activeCommit
+        receipts.asScala.exists(_.requestId == "cancelled-candidate-waiter") shouldBe false
+      } finally {
+        releaseCapture.countDown()
+        OpenIvmStateSync.setBeforeCaptureHookForTesting(null)
+        if (waiterThread != null && waiterThread.isAlive) {
+          waiterThread.interrupt()
+          waiterThread.join(TimeUnit.SECONDS.toMillis(10))
+        }
+        if (activeRequest != null)
+          try Await.ready(activeRequest, 60.seconds)
+          catch { case _: Throwable => () }
+        awaitBackupIdle()
+      }
+    }
+
     it("isolates cached coverage when distinct state roots share one publication destination") {
       val fixtureRoot = newDir("shared-destination")
       val remote      = new File(fixtureRoot, "remote")
@@ -547,7 +785,10 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       val b = newSpark(
         "checkpoint-root-b",
         remote,
-        Seq(FeatureGate.StatePathKey -> stateB.getAbsolutePath)
+        Seq(
+          FeatureGate.StatePathKey -> stateB.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remote.getAbsolutePath
+        )
       )
       RefreshProfileCatalog.ensureTables(b)
       RefreshProfileCatalog.record(
