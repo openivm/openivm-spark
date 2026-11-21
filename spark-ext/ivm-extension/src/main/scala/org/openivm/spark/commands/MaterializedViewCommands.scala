@@ -5486,8 +5486,9 @@ case class RefreshMaterializedViewCommand(
             val verdict =
               if (cdfRebaselineReasons.contains(source)) BatchVerdict.Replace
               else
-                try DeltaCommitClassifier.classify(spark, source, startVersion)
-                catch { case _: Throwable => BatchVerdict.Replace }
+                try profile.timeObservedStep("cdf_commit_classify", s"source=$source") {
+                  DeltaCommitClassifier.classify(spark, source, startVersion)
+                } catch { case _: Throwable => BatchVerdict.Replace }
             source -> verdict
           }
 

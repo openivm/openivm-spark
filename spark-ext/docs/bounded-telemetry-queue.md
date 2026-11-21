@@ -15,6 +15,7 @@ it from a driver `SparkConf` and Hadoop `Configuration`:
 When enabled, specify either the legacy URI alone, or one or both explicit
 URIs; mixing them is rejected. Setting both explicit URIs mirrors each
 accepted record to both destinations.
+
 - `spark.openivm.telemetry.queue.capacity`: maximum queued records (default 1024).
 - `spark.openivm.telemetry.queue.maxChars`: maximum UTF-16 characters per record
   (default 262144). Both limits must be positive.
@@ -53,6 +54,19 @@ absent on filesystem failure, and a failed manifest cannot report its own failur
 must not treat this best-effort mirror as an audit log. Counters have no labels;
 span payloads themselves can contain identifiers and require appropriate
 access controls. No errors or destination URIs are emitted as metric labels.
+
+When enabled, lifecycle phase records include UTC start time, monotonic start,
+inclusive and exclusive nanoseconds, refresh ID, optional request ID and a
+parent phase ID. Exclusive time subtracts only directly nested instrumented
+phases on the same thread; it does not subtract uninstrumented or asynchronous
+work. This is not a complete exclusive-query-time accounting.
+
+Generated SQL and collect boundaries carry an explicit Spark local property.
+The driver listener records job-to-stage links, stage attempts and Spark SQL
+execution IDs. Stage timestamps come from Spark's wall-clock event times, not
+the driver's monotonic clock. Job stage tracking is bounded and marks truncation
+in the job-start record. Queue drops can also break links. Checkpoint request
+records carry a parent operation ID when a lifecycle trace is active.
 
 Checkpoint safety code can inspect the destinations of all live workers,
 including timed-out drains, with `BoundedTelemetryRuntime.sinksDisjoint`.

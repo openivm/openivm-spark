@@ -562,6 +562,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
 }
 
 object OpenIvmExecutionSpan extends Logging {
+  val TraceOperationIdProperty = "openivm.telemetry.refresh_id"
 
   private def renderLockAcquisitions(
       acquisitions: Seq[LockAcquisitionTelemetry]
@@ -598,7 +599,8 @@ object OpenIvmExecutionSpan extends Logging {
       modelUniqueId: Option[String],
       materializedView: Option[String],
       commandOperation: Option[String],
-      phase: Option[String]
+      phase: Option[String],
+      operationId: Option[String] = None
   )
 
   private[spark] final case class StateSyncRequestEvidence(
@@ -622,7 +624,8 @@ object OpenIvmExecutionSpan extends Logging {
       reused: Boolean = false,
       coalesced: Boolean = false,
       coverageProven: Boolean = false,
-      outcome: Option[String] = None
+      outcome: Option[String] = None,
+      parentOperationId: Option[String] = None
   )
 
   private[spark] final case class StateSyncPhaseEvidence(
@@ -738,6 +741,7 @@ object OpenIvmExecutionSpan extends Logging {
       val item = new LinkedHashMap[String, AnyRef]()
       item.put("request_id", request.requestId)
       request.parentRequestId.foreach(item.put("parent_request_id", _))
+      request.parentOperationId.foreach(item.put("parent_operation_id", _))
       item.put("publication_id", request.publicationId)
       item.put("clock_domain_id", MonotonicClockDomain.id)
       item.put("request_start_monotonic_ns", java.lang.Long.valueOf(request.requestStartMonotonicNs))
@@ -1187,7 +1191,8 @@ object OpenIvmExecutionSpan extends Logging {
       modelUniqueId = modelUniqueId,
       materializedView = None,
       commandOperation = None,
-      phase = configured(FeatureGate.TelemetryPhaseKey)
+      phase = configured(FeatureGate.TelemetryPhaseKey),
+      operationId = Option(spark.sparkContext.getLocalProperty(TraceOperationIdProperty))
     )
     activeContext.fold(fallback) { parent =>
       parent.copy(
@@ -1195,7 +1200,8 @@ object OpenIvmExecutionSpan extends Logging {
         correlationId = parent.correlationId.orElse(fallback.correlationId),
         campaignId = parent.campaignId.orElse(fallback.campaignId),
         modelUniqueId = parent.modelUniqueId.orElse(fallback.modelUniqueId),
-        phase = parent.phase.orElse(fallback.phase)
+        phase = parent.phase.orElse(fallback.phase),
+        operationId = parent.operationId.orElse(fallback.operationId)
       )
     }
   }

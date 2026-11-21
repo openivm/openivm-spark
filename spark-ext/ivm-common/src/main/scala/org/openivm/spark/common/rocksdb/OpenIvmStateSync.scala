@@ -640,6 +640,7 @@ object OpenIvmStateSync {
         OpenIvmExecutionSpan.StateSyncRequestEvidence(
           requestId = request.requestId,
           parentRequestId = request.parent.requestId,
+          parentOperationId = request.parent.operationId,
           publicationId = publicationId,
           effectiveMode = request.mode,
           scope = if (request.parent.modelUniqueId.nonEmpty) "model" else "run",
@@ -777,6 +778,7 @@ object OpenIvmStateSync {
     candidate.evidence :+= OpenIvmExecutionSpan.StateSyncRequestEvidence(
       requestId = request.requestId,
       parentRequestId = request.parent.requestId,
+      parentOperationId = request.parent.operationId,
       publicationId = admission.map(_.publicationId).orElse(coveredBy.map(_.publicationId)).getOrElse(""),
       effectiveMode = request.mode,
       scope = if (request.parent.modelUniqueId.nonEmpty) "model" else "run",

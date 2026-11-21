@@ -43,12 +43,29 @@ final class RefreshProfile private (
   private val buffer        = scala.collection.mutable.ArrayBuffer.empty[RefreshProfileRow]
   private val phaseTimeline =
     if (spark != null && spark.sparkContext.getConf.getBoolean(BoundedTelemetryQueue.EnabledKey, false))
-      Some(new PhaseTimeline(refreshId, viewName, if (mode == RefreshProfile.Mode.Create) "create" else "refresh"))
+      Some(new PhaseTimeline(
+        refreshId,
+        viewName,
+        if (mode == RefreshProfile.Mode.Create) "create" else "refresh",
+        requestId = OpenIvmInsightsBroker.currentRequestId(spark)
+      ))
+    else None
+  private val previousTraceOperationId =
+    if (phaseTimeline.nonEmpty)
+      Option(spark.sparkContext.getLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty))
     else None
   private var spanCompleted = false
   private var spanOutcome   = "failed_before_end"
   private var spanEndNanos  = 0L
   private var finished      = false
+
+  private[commands] def activateTraceContext(): Unit =
+    phaseTimeline.foreach(_ => spark.sparkContext.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, refreshId))
+
+  private[commands] def clearTraceContext(): Unit =
+    phaseTimeline.foreach(_ =>
+      spark.sparkContext.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, previousTraceOperationId.orNull)
+    )
 
   /** True when this profile is wired to a real RocksDB sink. False instances
     * pay zero allocation per step.
@@ -306,7 +323,10 @@ object RefreshProfile {
   private[commands] val clockDomainId = MonotonicClockDomain.id
 
   private[commands] def clearActive(profile: RefreshProfile, clearExecutionSpan: Boolean = true): Unit = {
-    if (current.get() eq profile) current.remove()
+    if (current.get() eq profile) {
+      profile.clearTraceContext()
+      current.remove()
+    }
     if (clearExecutionSpan) OpenIvmExecutionSpan.clearCurrent(profile.executionSpan)
   }
 
@@ -392,6 +412,7 @@ object RefreshProfile {
       System.nanoTime(),
       executionSpan
     )
+    profile.activateTraceContext()
     current.set(profile)
     profile
   }

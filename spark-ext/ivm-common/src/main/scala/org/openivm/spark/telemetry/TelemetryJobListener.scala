@@ -45,9 +45,10 @@ private[spark] final class TelemetryJobListener(emit: String => Unit = BoundedTe
       sqlExecutionId: Option[String]
   ): Unit = {
       val stages = stageIds.toVector.distinct
-      val admitted = if (jobs.size >= MaxJobs) Vector.empty[Int]
+      val admittedJob = jobs.size < MaxJobs
+      val admitted = if (!admittedJob) Vector.empty[Int]
       else stages.take(math.min(MaxStagesPerJob, MaxStageReferences - referenceCount))
-      if (admitted.nonEmpty) {
+      if (admittedJob) {
         jobs.put(jobId, admitted)
         admitted.foreach { stage =>
           stageReferences.update(stage, stageReferences.getOrElse(stage, 0) + 1)
@@ -63,7 +64,7 @@ private[spark] final class TelemetryJobListener(emit: String => Unit = BoundedTe
         "action_context" -> action,
         "spark_sql_execution_id" -> sqlExecutionId,
         "stage_ids" -> admitted,
-        "stage_tracking_truncated" -> (admitted.size != stages.size)
+        "stage_tracking_truncated" -> (!admittedJob || admitted.size != stages.size)
       ))
   }
 

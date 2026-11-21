@@ -1053,9 +1053,13 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         FeatureGate.oneLakeTelemetryDir(spark) shouldBe None
         FeatureGate.profileRefreshEnabled(spark) shouldBe false
         recordProfile(spark, "queue-only-evidence")
+        sc.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, "refresh-evidence")
         OpenIvmStateSync.backupNow(spark)
         OpenIvmStateSync.backupNow(spark)
-      } finally BoundedTelemetryRuntime.stop(queue, 5000L) shouldBe true
+      } finally {
+        sc.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, null)
+        BoundedTelemetryRuntime.stop(queue, 5000L) shouldBe true
+      }
 
       val generations = committedGenerations(spark, remote.toURI.toString)
       generations should have size 1
@@ -1069,6 +1073,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       finally files.close()
       val requests = evidence.flatMap(_.path("requests").elements().asScala)
       requests should have size 2
+      requests.map(_.path("parent_operation_id").asText()).distinct shouldBe Seq("refresh-evidence")
       requests.map(_.path("outcome").asText()).toSet shouldBe Set("published_covered_generation", "reused_committed_coverage")
       requests.map(_.path("acknowledged_snapshot_generation_id").asText()).distinct shouldBe Seq(generation)
       val publications = evidence.flatMap(_.path("publications").elements().asScala)

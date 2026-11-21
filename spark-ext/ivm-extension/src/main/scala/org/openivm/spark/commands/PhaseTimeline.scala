@@ -13,7 +13,8 @@ private[commands] final class PhaseTimeline(
     operation: String,
     emit: String => Unit = BoundedTelemetryRuntime.offer,
     nanoTime: () => Long = () => System.nanoTime(),
-    epochMillis: () => Long = () => System.currentTimeMillis()
+    epochMillis: () => Long = () => System.currentTimeMillis(),
+    requestId: Option[String] = None
 ) {
   private val sequence = new AtomicLong()
   private val stack = new ThreadLocal[List[Frame]]()
@@ -39,6 +40,7 @@ private[commands] final class PhaseTimeline(
       emit(OpenIvmInsightJson.obj(
         "event_type" -> "phase",
         "refresh_id" -> refreshId,
+        "request_id" -> requestId,
         "materialized_view" -> viewName,
         "operation" -> operation,
         "phase" -> phase,
