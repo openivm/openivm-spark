@@ -5426,28 +5426,45 @@ case class RefreshMaterializedViewCommand(
             source -> verdict
           }
 
-      if (
-        FeatureGate.noopFastExitEnabled(spark) &&
+      val canConsumeCdfWithoutWrite =
         stateLag.isEmpty &&
-        meta.refreshType != RefreshTypeCode.FullRefresh &&
-        cdfChangeBatches.size == changeBatches.size &&
-        cdfChangeBatches.nonEmpty &&
-        cdfBatchVerdicts.values.forall(_ == BatchVerdict.Noop)
-      ) {
-        // All-noop CDF batch: gate on pinned identity, then consume (frozen +
-        // noop) as a clean commit. A rebind throws before any consume.
+          meta.refreshType != RefreshTypeCode.FullRefresh &&
+          cdfChangeBatches.size == changeBatches.size &&
+          cdfChangeBatches.nonEmpty
+      val noWriteOutcome =
+        if (
+          canConsumeCdfWithoutWrite && FeatureGate.noopFastExitEnabled(spark) &&
+          cdfBatchVerdicts.values.forall(_ == BatchVerdict.Noop)
+        ) Some("noop_fast_exit")
+        else if (
+          canConsumeCdfWithoutWrite && FeatureGate.publicCdfNoWriteEnabled(spark) &&
+          meta.refreshType == RefreshTypeCode.SimpleProjection && meta.sourceTables.size == 1 &&
+          preparedSourceAdvance.isEmpty && sourceVersionAdvance.isEmpty && refreshPinnedIdentities.isEmpty &&
+          !SparkTimeTravelSql.hasSnapshotPin(meta.querySql) && cdfRebaselineReasons.isEmpty &&
+          cdfChangeBatches.size == 1 && cdfChangeBatches.head.hasBaseline &&
+          meta.sourceTables.head == cdfChangeBatches.head.baseTable &&
+          cdfBatchVerdicts.get(cdfChangeBatches.head.baseTable).exists { verdict =>
+            profile.timeStep("public_cdf_no_write_proof", s"verdict=$verdict") {
+              PublicCdfNoWrite.provesCancellation(spark, meta, cdfChangeBatches.head, verdict)
+            }
+          }
+        ) Some("public_cdf_no_write")
+        else None
+
+      if (noWriteOutcome.nonEmpty) {
+        val outcome = noWriteOutcome.get
         enforcePinnedSourceIdentityGate(meta)
         consumeFrozenSourceDeltas()
         propagation.markConsumed(spark, viewNameStr, changeBatches)
         logInfo(
           s"[openivm-mv] refresh view='${sqlIdent(name)}' refresh_type='${meta.refreshTypeName}' " +
-            "outcome='noop_fast_exit'"
+            s"outcome='$outcome'"
         )
         profile.appendObservedSkip(
           "execute_refresh_sql_attempt",
-          "work_class=refresh_sql_skipped;reason=noop_fast_exit;origin_class=unknown;credit_ns=0"
+          s"work_class=refresh_sql_skipped;reason=$outcome;origin_class=unknown;credit_ns=0"
         )
-        emitEnd("noop_fast_exit", meta.refreshTypeName, changeBatches.size)
+        emitEnd(outcome, meta.refreshTypeName, changeBatches.size)
         return Seq.empty
       }
 
