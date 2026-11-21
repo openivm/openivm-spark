@@ -946,44 +946,47 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   private[rocksdb] def withCheckpointIdentity[A](body: OpenIvmCheckpointReuse.Identity => A): Option[A] =
     withWriteLock {
       if (closed || conf.multiProcess || dbHandle == null) None
-      else OpenIvmCheckpointReuse.readIdentity {
-        val directoryKey = Files.readAttributes(dbDir, classOf[BasicFileAttributes]).fileKey()
-        val identityPath = dbDir.resolve("IDENTITY")
-        val currentPath = dbDir.resolve("CURRENT")
-        val identityKey =
-          if (Files.isRegularFile(identityPath) && !Files.isSymbolicLink(identityPath))
-            Files.readAttributes(identityPath, classOf[BasicFileAttributes]).fileKey()
-          else null
-        val currentKey =
-          if (Files.isRegularFile(currentPath) && !Files.isSymbolicLink(currentPath))
-            Files.readAttributes(currentPath, classOf[BasicFileAttributes]).fileKey()
-          else null
-        if (directoryKey == null || identityKey == null || currentKey == null) None
-        else {
-          val identityDigest = OpenIvmSnapshotArchive.sha256(identityPath.toFile)
-          val manifests = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
-          val sidecars =
-            try
-              manifests.iterator().asScala.toVector.sortBy(_.getFileName.toString).map { manifest =>
-                if (Files.isSymbolicLink(manifest) || !Files.isRegularFile(manifest))
-                  throw new java.io.IOException(s"Invalid OpenIVM transaction manifest: $manifest")
-                manifest.getFileName.toString -> OpenIvmSnapshotArchive.sha256(manifest.toFile)
-              }
-            finally manifests.close()
-          Some(
-            OpenIvmCheckpointReuse.Identity(
-              dbHandle,
-              directoryKey,
-              identityKey,
-              currentKey,
-              identityDigest,
-              dbHandle.getLatestSequenceNumber,
-              columnFamilyHandles.keySet,
-              sidecars
-            )
-          )
-        }
-      }.map(body)
+      else
+        OpenIvmCheckpointReuse
+          .readIdentity {
+            val directoryKey = Files.readAttributes(dbDir, classOf[BasicFileAttributes]).fileKey()
+            val identityPath = dbDir.resolve("IDENTITY")
+            val currentPath  = dbDir.resolve("CURRENT")
+            val identityKey =
+              if (Files.isRegularFile(identityPath) && !Files.isSymbolicLink(identityPath))
+                Files.readAttributes(identityPath, classOf[BasicFileAttributes]).fileKey()
+              else null
+            val currentKey =
+              if (Files.isRegularFile(currentPath) && !Files.isSymbolicLink(currentPath))
+                Files.readAttributes(currentPath, classOf[BasicFileAttributes]).fileKey()
+              else null
+            if (directoryKey == null || identityKey == null || currentKey == null) None
+            else {
+              val identityDigest = OpenIvmSnapshotArchive.sha256(identityPath.toFile)
+              val manifests      = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
+              val sidecars =
+                try
+                  manifests.iterator().asScala.toVector.sortBy(_.getFileName.toString).map { manifest =>
+                    if (Files.isSymbolicLink(manifest) || !Files.isRegularFile(manifest))
+                      throw new java.io.IOException(s"Invalid OpenIVM transaction manifest: $manifest")
+                    manifest.getFileName.toString -> OpenIvmSnapshotArchive.sha256(manifest.toFile)
+                  }
+                finally manifests.close()
+              Some(
+                OpenIvmCheckpointReuse.Identity(
+                  dbHandle,
+                  directoryKey,
+                  identityKey,
+                  currentKey,
+                  identityDigest,
+                  dbHandle.getLatestSequenceNumber,
+                  columnFamilyHandles.keySet,
+                  sidecars
+                )
+              )
+            }
+          }
+          .map(body)
     }
 
   /** The write/session mutex protects both lifetime and cross-family coherence.
