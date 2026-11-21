@@ -213,7 +213,9 @@ object CacheOriginDiagnostic extends Logging {
               case Some((sameSignature, operation, true))
                   if sameSignature == signature && completed.contains(operation) =>
                 fields.put("origin_operation_id", operation)
-              case _ => problems.add("matching_miss_provenance_missing")
+              case _ =>
+                origins.remove(originKey)
+                problems.add("matching_miss_provenance_missing")
             }
           } else {
             origins.put(originKey, (signature, operationId, false))

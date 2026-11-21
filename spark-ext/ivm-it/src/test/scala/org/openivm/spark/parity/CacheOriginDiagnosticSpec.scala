@@ -110,13 +110,36 @@ class CacheOriginDiagnosticSpec extends IvmParitySpecBase("cache-origin-diagnost
       replacement.has("origin_operation_id") shouldBe false
 
       val metadata = MvCatalog.lookup(spark, TableIdentifier("origin_mv_b")).get
+      val changedBytes = metadata.properties.map {
+        case (key, value) if key.startsWith("_ivm_compile_cache:") && key.endsWith(":sql") =>
+          key -> (value + "\n")
+        case entry => entry
+      }
+      MvCatalog.updateProperties(spark, metadata.name, changedBytes)
+      sql("INSERT INTO origin_src_b VALUES (4,40)").collect()
+      refreshAs("origin_mv_b", "tampered-b", "dbt:b")
+      val tampered = record("tampered-b")
+      tampered.path("command_status").asText() shouldBe "success"
+      tampered.path("cache_hit").asBoolean() shouldBe true
+      tampered.has("origin_operation_id") shouldBe false
+      tampered.path("observation_status").asText() shouldBe "incomplete"
+      assertMvCorrect("origin_mv_b", "SELECT id,v FROM origin_src_b")
+
+      MvCatalog.updateProperties(spark, metadata.name, metadata.properties)
+      sql("INSERT INTO origin_src_b VALUES (5,50)").collect()
+      refreshAs("origin_mv_b", "restored-b", "dbt:b")
+      val restored = record("restored-b")
+      restored.path("cache_hit").asBoolean() shouldBe true
+      restored.has("origin_operation_id") shouldBe false
+      assertMvCorrect("origin_mv_b", "SELECT id,v FROM origin_src_b")
+
       val poisoned = metadata.properties.map {
         case (key, value) if key.startsWith("_ivm_compile_cache:") && key.endsWith(":sql") =>
           key -> value.replace("openivm_delta_origin_src_b", "openivm_delta_origin_missing")
         case entry => entry
       }
       MvCatalog.updateProperties(spark, metadata.name, poisoned)
-      sql("INSERT INTO origin_src_b VALUES (4,40)").collect()
+      sql("INSERT INTO origin_src_b VALUES (6,60)").collect()
       intercept[Exception](refreshAs("origin_mv_b", "failure-b", "dbt:b"))
       val failed = record("failure-b")
       failed.path("command_status").asText() shouldBe "error"
@@ -140,9 +163,18 @@ class CacheOriginDiagnosticSpec extends IvmParitySpecBase("cache-origin-diagnost
       missing.path("observation_status").asText() shouldBe "incomplete"
       assertMvCorrect("origin_mv_c", "SELECT id,v FROM origin_src_c")
       val evidence = mapper.createArrayNode()
-      Seq("miss-a", "miss-b", "hit-a", "hit-b", "replacement-a", "failure-b", "hit-without-origin-c").foreach {
-        request =>
-          evidence.add(record(request))
+      Seq(
+        "miss-a",
+        "miss-b",
+        "hit-a",
+        "hit-b",
+        "replacement-a",
+        "tampered-b",
+        "restored-b",
+        "failure-b",
+        "hit-without-origin-c"
+      ).foreach { request =>
+        evidence.add(record(request))
       }
       Files.write(
         Paths.get("target", "cache-origin-synthetic-observations.json"),
