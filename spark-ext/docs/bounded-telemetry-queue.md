@@ -76,6 +76,14 @@ its events can be lost on forced termination. Malformed or unavailable helper
 reports increment `CompileTraceDiagnostics.failureCount` and produce a
 rate-limited, sanitized warning.
 
+The same queue flag enables `openivm_gc` plan, cleanup and orphan-sweep
+records with monotonic inclusive durations, UTC start times, reference and
+tombstone counts, deletion counts, and a refresh operation ID when present.
+The sweep runs asynchronously and carries its parent ID explicitly; these
+intervals overlap lifecycle phases and do not provide exclusive time. The
+counts describe the collector's existing behavior, not a safety guarantee
+about cross-process deletion.
+
 Checkpoint safety code can inspect the destinations of all live workers,
 including timed-out drains, with `BoundedTelemetryRuntime.sinksDisjoint`.
 It must use `withSinkTopology` to serialize an epoch check and the guarded
