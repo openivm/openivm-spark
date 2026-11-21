@@ -21,8 +21,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: devcontainer-image
-  cancel-in-progress: true
+  group: devcontainer-image-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

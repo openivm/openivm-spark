@@ -2994,6 +2994,15 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         "SELECT * FROM t WHERE (event_time) >= (TIMESTAMP '2026-01-01')"
     }
 
+    it("preserves timestamp-like text inside quoted identifiers and comments") {
+      val sql =
+        "SELECT `x WHERE ((openivm_timestamp) >= (TIMESTAMP '2026-01-01'))` FROM t " +
+          "/* nested /* comment */ WHERE ((openivm_timestamp) >= (TIMESTAMP '2026-01-01')) */"
+      SparkRefreshRewriter.stripTimestampPredicate(sql) shouldBe sql
+      val predicate = "((`d`.`openivm_timestamp`) >= (TIMESTAMP '2026-01-01'))"
+      SparkRefreshRewriter.stripTimestampPredicate(s"$sql WHERE $predicate") shouldBe sql
+    }
+
     it("does NOT hang on a long identifier before a timestamp predicate (ReDoS guard)") {
       val huge          = "a" * 500000 + " SELECT * FROM t WHERE openivm_timestamp >= '2024-01-01'::TIMESTAMP"
       val deadlineNanos = System.nanoTime() + 5000000000L

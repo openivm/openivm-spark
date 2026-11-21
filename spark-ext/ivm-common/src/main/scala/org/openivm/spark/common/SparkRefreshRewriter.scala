@@ -2387,13 +2387,57 @@ object SparkRefreshRewriter {
     // Case 3: leading `[(]openivm_timestamp OP '...'::TIMESTAMP[)] AND `
     val leadingAnd = ("(?i)" + tsPred + "\\s+AND\\s+").r
 
-    leadingAnd.replaceAllIn(
-      trailingAnd.replaceAllIn(
-        standalone.replaceAllIn(whereLeadingAnd.replaceAllIn(sql, " WHERE "), ""),
-        ""
-      ),
-      ""
-    )
+    def replaceCodeMatches(input: String, pattern: scala.util.matching.Regex, replacement: String): String = {
+      if (pattern.findFirstIn(input).isEmpty) return input
+      val protectedChars = Array.fill(input.length)(false)
+      var i              = 0
+      while (i < input.length) {
+        val start = i
+        val c     = input.charAt(i)
+        if (c == '\'' || c == '"' || c == '`') {
+          i += 1
+          var closed = false
+          while (i < input.length && !closed) {
+            if (input.charAt(i) == c && i + 1 < input.length && input.charAt(i + 1) == c) i += 2
+            else if (input.charAt(i) == c) {
+              i += 1
+              closed = true
+            } else i += 1
+          }
+          java.util.Arrays.fill(protectedChars, start + 1, i, true)
+        } else if (c == '-' && i + 1 < input.length && input.charAt(i + 1) == '-') {
+          i += 2
+          while (i < input.length && input.charAt(i) != '\n') i += 1
+          java.util.Arrays.fill(protectedChars, start, i, true)
+        } else if (c == '/' && i + 1 < input.length && input.charAt(i + 1) == '*') {
+          i += 2
+          var depth = 1
+          while (i + 1 < input.length && depth > 0) {
+            if (input.charAt(i) == '/' && input.charAt(i + 1) == '*') {
+              depth += 1
+              i += 2
+            } else if (input.charAt(i) == '*' && input.charAt(i + 1) == '/') {
+              depth -= 1
+              i += 2
+            } else i += 1
+          }
+          if (depth > 0) i = input.length
+          java.util.Arrays.fill(protectedChars, start, i, true)
+        } else i += 1
+      }
+      pattern.replaceAllIn(
+        input,
+        m =>
+          java.util.regex.Matcher.quoteReplacement(
+            if (protectedChars(m.start)) m.matched else replacement
+          )
+      )
+    }
+
+    val leading  = replaceCodeMatches(sql, whereLeadingAnd, " WHERE ")
+    val single   = replaceCodeMatches(leading, standalone, "")
+    val trailing = replaceCodeMatches(single, trailingAnd, "")
+    replaceCodeMatches(trailing, leadingAnd, "")
   }
 
   /** Rewrite an additional data-bearing INSERT into the already-materialized
