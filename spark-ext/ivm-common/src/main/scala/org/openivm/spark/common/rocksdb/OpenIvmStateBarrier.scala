@@ -5,6 +5,7 @@ import org.apache.hadoop.fs.{FileSystem, LocalFileSystem, Path, RawLocalFileSyst
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, OpenIvmStatePaths}
 import org.openivm.spark.telemetry.{BoundedTelemetryQueue, BoundedTelemetryRuntime}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.nio.file.{Files, LinkOption, Path => NioPath, Paths}
 import java.util.concurrent.{
@@ -198,9 +199,13 @@ private[openivm] object OpenIvmStateBarrier {
     val parallel = spark.conf.get(ParallelCaptureKey, "false").toBoolean &&
       !OpenIvmRocksDBConf.fromSpark(spark).multiProcess && jobs.size > 1 &&
       jobs.map(_._1).distinct.size == jobs.size && jobs.forall(job => forDbPath(job._1) eq state)
-    if (!parallel) jobs.indices.foreach(capture)
-    else {
-      val count       = math.min(jobs.size, math.min(4, Runtime.getRuntime.availableProcessors()))
+    if (!parallel) {
+      OpenIvmMetrics.increment("state_sync.capture.serial")
+      jobs.indices.foreach(capture)
+    } else {
+      val count = math.min(jobs.size, math.min(4, Runtime.getRuntime.availableProcessors()))
+      OpenIvmMetrics.increment("state_sync.capture.worker_pool")
+      OpenIvmMetrics.updateHistogram("state_sync.capture.worker_pool.width", count.toLong)
       val pool        = Executors.newFixedThreadPool(count)
       val completion  = new ExecutorCompletionService[Unit](pool)
       val next        = new AtomicInteger(0)

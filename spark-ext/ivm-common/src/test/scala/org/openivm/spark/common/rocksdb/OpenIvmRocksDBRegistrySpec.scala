@@ -1448,11 +1448,18 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       publications.head.phases.map(_.operation) should contain allOf (
         "spark.backup.barrier_wait",
         "spark.backup.capture",
+        "spark.backup.capture.databases",
         "spark.backup.pack_hash",
         "spark.backup.upload",
         "spark.backup.commit",
         "spark.backup.prune"
       )
+      val capture   = publications.head.phases.find(_.operation == "spark.backup.capture").get
+      val databases = publications.head.phases.find(_.operation == "spark.backup.capture.databases").get
+      databases.status shouldBe "success"
+      databases.startUtc should not be empty
+      databases.startMonotonicNs should be >= capture.startMonotonicNs
+      (databases.startMonotonicNs + databases.durationNs) should be <= (capture.startMonotonicNs + capture.durationNs)
       publications.head.phases.find(_.operation == "spark.backup.commit").map(_.status) shouldBe Some("success")
       publications(1).status shouldBe "failed"
       publications(1).captured shouldBe true

@@ -166,6 +166,10 @@ handles retain their existing locks, and the publisher joins all workers before
 packing or releasing the barrier, including after errors. Multi-process mode
 continues to capture serially. Publication, acknowledgement and restore are unchanged.
 
+The metrics plugin exposes `openivm.state_sync.capture.serial` and
+`openivm.state_sync.capture.worker_pool` counts, worker-pool width, and
+`openivm.state_sync.capture.databases` timing for the database-capture portion.
+
 `spark.openivm.cdf.preflight.parallelSources.enabled=true` enables an experimental,
 default-off source-availability preflight using at most two workers per refresh.
 It checks independent source ranges before applying refresh SQL; unavailable or

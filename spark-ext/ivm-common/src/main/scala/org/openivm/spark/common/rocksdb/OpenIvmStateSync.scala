@@ -5,6 +5,7 @@ import org.apache.spark.SparkContext
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.FeatureGate
 import org.openivm.spark.telemetry.{BoundedTelemetryRuntime, OpenIvmExecutionSpan}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.slf4j.LoggerFactory
 
 import java.io.File
@@ -1393,13 +1394,17 @@ object OpenIvmStateSync {
               .map(_.getParentFile.toPath)
               .distinct
               .sortBy(_.toString)
-            val captures = OpenIvmStateBarrier.captureDatabases(
-              spark,
-              databases.iterator.map { db =>
-                db.toFile.getCanonicalPath -> capture.toPath.resolve(localBase.relativize(db))
-              }.toVector,
-              reuse
-            )
+            val captures = trace.measure("spark.backup.capture.databases", "durability") {
+              OpenIvmMetrics.time("state_sync.capture.databases") {
+                OpenIvmStateBarrier.captureDatabases(
+                  spark,
+                  databases.iterator.map { db =>
+                    db.toFile.getCanonicalPath -> capture.toPath.resolve(localBase.relativize(db))
+                  }.toVector,
+                  reuse
+                )
+              }
+            }
             if (reuse) outcomes = databases.map(_.toString).zip(captures).toVector
             files.filterNot(file => databases.exists(file.toPath.startsWith)).foreach { file =>
               OpenIvmSnapshotArchive.checkInterrupted()

@@ -13,6 +13,7 @@ import org.openivm.spark.common.{
   RefreshProfileCatalog,
   RefreshProfileRow
 }
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -627,6 +628,8 @@ class OpenIvmStateSyncMatched200Spec extends AnyFunSpec with BeforeAndAfterEach 
     it("proves per-waiter generation coverage across 200 native shards") {
       val arm = sys.env.getOrElse("OPENIVM_CHECKPOINT_MATCH_ARM", "A1")
       arm should (startWith("A") or startWith("B"))
+      val initialParallel   = OpenIvmMetrics.counter("state_sync.capture.worker_pool").getCount
+      val initialSerial     = OpenIvmMetrics.counter("state_sync.capture.serial").getCount
       val checkpointEnabled = arm.startsWith("B")
       val fixture           = newDir(s"arm-$arm-per-waiter")
       val stateRoot         = new File(fixture, "state")
@@ -1016,6 +1019,23 @@ class OpenIvmStateSyncMatched200Spec extends AnyFunSpec with BeforeAndAfterEach 
       )
       new File(repoRoot, s".logs/checkpoint-matched-200-per-waiter/arm-$arm.json").isFile shouldBe true
       baselineProfileId.nonEmpty shouldBe true
+      val parallel  = OpenIvmMetrics.counter("state_sync.capture.worker_pool").getCount - initialParallel
+      val serial    = OpenIvmMetrics.counter("state_sync.capture.serial").getCount - initialSerial
+      val requested = sys.env.getOrElse("OPENIVM_CHECKPOINT_MATCH_PARALLEL_CAPTURE", "false").toBoolean
+      if (requested) parallel should be > 0L
+      else {
+        parallel shouldBe 0L
+        serial should be > 0L
+      }
+      val modeEvidence = new File(repoRoot, s".logs/checkpoint-matched-200-per-waiter/capture-mode-$arm.json")
+      val timer        = OpenIvmMetrics.timer("state_sync.capture.databases")
+      val samples      = timer.getSnapshot.getValues.mkString("[", ",", "]")
+      timer.getCount should be > 0L
+      Files.write(
+        modeEvidence.toPath,
+        s"""{"parallel_requested":$requested,"worker_pool_invocations":$parallel,"serial_invocations":$serial,"capture_timer_count":${timer.getCount},"capture_samples_ns":$samples,"available_processors":${Runtime.getRuntime
+            .availableProcessors()}}""".getBytes(StandardCharsets.UTF_8)
+      )
     }
   }
 
