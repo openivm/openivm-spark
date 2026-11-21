@@ -940,33 +940,34 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
         Files.copy(manifest, target.resolve(manifest.getFileName))
       }
 
-      private[rocksdb] def withCheckpointIdentity[A](body: OpenIvmCheckpointReuse.Identity => A): Option[A] =
-        withWriteLock {
-          if (closed || conf.multiProcess || dbHandle == null) None
-          else {
-            val directoryKey = Files.readAttributes(dbDir, classOf[BasicFileAttributes]).fileKey()
-            if (directoryKey == null) None
-            else {
-              val manifests = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
-              val sidecars = try
-                manifests.iterator().asScala.toVector.sortBy(_.getFileName.toString).map { manifest =>
-                  if (Files.isSymbolicLink(manifest) || !Files.isRegularFile(manifest))
-                    throw new java.io.IOException(s"Invalid OpenIVM transaction manifest: $manifest")
-                  manifest.getFileName.toString -> OpenIvmSnapshotArchive.sha256(manifest.toFile)
-                }
-              finally manifests.close()
-              Some(body(OpenIvmCheckpointReuse.Identity(
-                dbHandle,
-                directoryKey,
-                dbHandle.getLatestSequenceNumber,
-                columnFamilyHandles.keySet,
-                sidecars
-              )))
-            }
-          }
-        }
     finally manifests.close()
   }
+
+  private[rocksdb] def withCheckpointIdentity[A](body: OpenIvmCheckpointReuse.Identity => A): Option[A] =
+    withWriteLock {
+      if (closed || conf.multiProcess || dbHandle == null) None
+      else {
+        val directoryKey = Files.readAttributes(dbDir, classOf[BasicFileAttributes]).fileKey()
+        if (directoryKey == null) None
+        else {
+          val manifests = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
+          val sidecars = try
+            manifests.iterator().asScala.toVector.sortBy(_.getFileName.toString).map { manifest =>
+              if (Files.isSymbolicLink(manifest) || !Files.isRegularFile(manifest))
+                throw new java.io.IOException(s"Invalid OpenIVM transaction manifest: $manifest")
+              manifest.getFileName.toString -> OpenIvmSnapshotArchive.sha256(manifest.toFile)
+            }
+          finally manifests.close()
+          Some(body(OpenIvmCheckpointReuse.Identity(
+            dbHandle,
+            directoryKey,
+            dbHandle.getLatestSequenceNumber,
+            columnFamilyHandles.keySet,
+            sidecars
+          )))
+        }
+      }
+    }
 
   /** The write/session mutex protects both lifetime and cross-family coherence.
     * Check the cached handle under that mutex BEFORE entering withSession:

@@ -37,6 +37,8 @@ private[rocksdb] object OpenIvmCheckpointReuse {
     try {
       val files = paths.iterator().asScala.toVector.filter(_ != path)
       if (files.exists(Files.isSymbolicLink(_))) throw new java.io.IOException("symbolic checkpoint entry")
+      if (files.exists(file => !Files.isDirectory(file) && !Files.isRegularFile(file)))
+        throw new java.io.IOException("non-regular checkpoint entry")
       val regular = files.filter(Files.isRegularFile(_)).sortBy(_.toString)
       val size = regular.map(Files.size(_)).sum
       if (size > maxStoreBytes) None
@@ -68,7 +70,10 @@ private[rocksdb] object OpenIvmCheckpointReuse {
   }
 
   private def copy(entry: Entry, destination: Path): Boolean = {
-    if (entry.files.exists(file => hash(file.bytes) != file.digest)) false
+    if (entry.files.exists { file =>
+        OpenIvmSnapshotArchive.checkInterrupted()
+        hash(file.bytes) != file.digest
+      }) false
     else {
       Files.createDirectories(destination)
       entry.files.foreach { file =>
@@ -102,4 +107,16 @@ private[rocksdb] object OpenIvmCheckpointReuse {
       db.checkpointTo(destination)
       "fallback"
     }
+
+  private[rocksdb] def clearForTesting(): Unit = synchronized {
+    cache.clear()
+    retainedBytes = 0L
+  }
+
+  private[rocksdb] def corruptForTesting(db: OpenIvmRocksDB): Unit = synchronized {
+    val file = cache(db).files.find(_.bytes.nonEmpty).getOrElse(
+      throw new IllegalStateException("cached checkpoint has no non-empty file")
+    )
+    file.bytes(0) = (file.bytes(0) ^ 1).toByte
+  }
 }
