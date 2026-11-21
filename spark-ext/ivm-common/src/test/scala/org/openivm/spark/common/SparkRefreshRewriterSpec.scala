@@ -2976,6 +2976,19 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       ) shouldBe "SELECT * FROM t WHERE region = 'r'"
     }
 
+    it("strips DuckDB 2 parenthesized timestamp horizons without removing adjacent filters") {
+      val horizon = "((openivm_timestamp) >= (TIMESTAMP '2026-11-21 18:06:28.082538'))"
+      SparkRefreshRewriter.stripTimestampPredicate(s"SELECT * FROM t WHERE $horizon") shouldBe "SELECT * FROM t"
+      SparkRefreshRewriter.stripTimestampPredicate(s"SELECT * FROM t WHERE $horizon AND region = 'r'") shouldBe
+        "SELECT * FROM t WHERE region = 'r'"
+      SparkRefreshRewriter.stripTimestampPredicate(s"SELECT * FROM t WHERE region = 'r' AND $horizon") shouldBe
+        "SELECT * FROM t WHERE region = 'r'"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        "SELECT * FROM t WHERE (event_time) >= (TIMESTAMP '2026-01-01')"
+      ) shouldBe
+        "SELECT * FROM t WHERE (event_time) >= (TIMESTAMP '2026-01-01')"
+    }
+
     it("does NOT hang on a long identifier before a timestamp predicate (ReDoS guard)") {
       val huge          = "a" * 500000 + " SELECT * FROM t WHERE openivm_timestamp >= '2024-01-01'::TIMESTAMP"
       val deadlineNanos = System.nanoTime() + 5000000000L

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
 import { SmokeAutomation } from '../ports/automation.js';
@@ -173,8 +174,6 @@ export class SmokeTestService implements SmokeAutomation {
       throw new Error(`Docker socket is unavailable: ${dockerSocket}`);
     }
 
-    this.cleanup();
-
     const platform = this.runner
       .run({
         args: ['image', 'inspect', '--format', '{{.Os}}/{{.Architecture}}', reference],
@@ -209,7 +208,7 @@ export class SmokeTestService implements SmokeAutomation {
       throw new Error(`Unexpected OCI source label on ${reference}: ${label}`);
     }
 
-    const containerName = `openivm-spark-devcontainer-smoke-${process.pid}`;
+    const containerName = `openivm-spark-devcontainer-smoke-${randomUUID()}`;
     const runArgs = [
       'run',
       '--detach',

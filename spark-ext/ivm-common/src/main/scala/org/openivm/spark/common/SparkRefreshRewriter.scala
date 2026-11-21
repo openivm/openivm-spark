@@ -2363,14 +2363,16 @@ object SparkRefreshRewriter {
     // The column can be optionally qualified with a table alias prefix
     // (e.g. `d.openivm_timestamp` in the AGGREGATE_GROUP retract companion
     // emitted by openivm when `force_view_delta_cascade=true`).
-    val qcol      = "(?<![\\w`])(?:`?\\w++`?\\s*\\.\\s*)?`?openivm_timestamp`?"
-    val tsLiteral = "(?:'[^']*+'::\\s*+TIMESTAMP|CAST\\s*+\\(\\s*+'[^']*+'\\s++AS\\s++TIMESTAMP\\s*+\\))"
+    val column = "(?<![\\w`])(?:`?\\w++`?\\s*\\.\\s*)?`?openivm_timestamp`?"
+    val qcol   = "(?:\\(\\s*+" + column + "\\s*+\\)|" + column + ")"
+    val tsLiteral = "(?:'[^']*+'::\\s*+TIMESTAMP|TIMESTAMP\\s++'[^']*+'|" +
+      "CAST\\s*+\\(\\s*+'[^']*+'\\s++AS\\s++TIMESTAMP\\s*+\\))"
     val metadataTable =
       "(?:(?:`?memory`?\\s*+\\.\\s*+`?main`?\\s*+\\.\\s*+)?`?openivm_delta_tables`?)"
     val metadataHorizon =
       "\\(\\s*+SELECT\\s++last_update\\s++FROM\\s++" + metadataTable + "\\s++WHERE\\s++" +
         "view_name\\s*+=\\s*+'[^']*+'\\s++AND\\s++table_name\\s*+=\\s*+'[^']*+'\\s*+\\)"
-    val refreshHorizon = "(?:" + tsLiteral + "|(?>" + metadataHorizon + "))"
+    val refreshHorizon = "(?:\\(\\s*+" + tsLiteral + "\\s*+\\)|" + tsLiteral + "|(?>" + metadataHorizon + "))"
     val cmp            = "\\s*+(?:>=|>|<=|<|=)\\s*+"
     // LPTS rewrites parenthesises each WHERE conjunct
     // (`WHERE (`openivm_timestamp`>=CAST(...))`), so match the predicate either

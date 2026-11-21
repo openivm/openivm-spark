@@ -69,10 +69,6 @@ jobs:
         if: always()
         run: npx --no-install nx run devcontainer:down
 
-      - name: Remove smoke containers
-        if: always()
-        run: npx --no-install nx run devcontainer:cleanup
-
       - name: Remove registry credentials
         if: always()
         run: docker logout ghcr.io || true

@@ -316,7 +316,7 @@ test('cleanup target is typed and smoke uses the stale-container label', () => {
     'utf8',
   );
   assert.equal('cleanup' in (project.targets ?? {}), true);
-  assert.equal(smokeSource.includes('this.cleanup();'), true);
+  assert.equal(smokeSource.includes('this.cleanup();'), false);
   assert.equal(smokeSource.includes("'--label'"), true);
   assert.equal(smokeSource.includes('this.settings.containerLabel'), true);
   assert.equal(smokeContainerLabel, 'org.openivm.spark.devcontainer.smoke=true');

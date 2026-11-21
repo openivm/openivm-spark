@@ -61,6 +61,52 @@ test('cleanup tolerates containers disappearing after discovery', () => {
   assert.deepEqual(removed, ['container-a']);
 });
 
+test('smoke runs remove only their own uniquely named containers', () => {
+  const calls: CommandSpec[] = [];
+  const fileSystem = new NodeFileSystem();
+  const exists = fileSystem.exists.bind(fileSystem);
+  fileSystem.exists = (path) => path === '/var/run/docker.sock' || exists(path);
+  fileSystem.groupId = () => 1;
+  const service = new SmokeTestService(
+    {
+      run: (spec) => {
+        calls.push(spec);
+        const format = spec.args?.[3];
+        const stdout =
+          spec.args?.[0] === 'image'
+            ? format === '{{.Os}}/{{.Architecture}}'
+              ? supportedImagePlatform
+              : sourceRepository
+            : '';
+        return { status: 0, stderr: '', stdout };
+      },
+    },
+    fileSystem,
+    new EnvironmentConfiguration(fileSystem),
+    {
+      containerLabel: smokeContainerLabel,
+      imagePlatform: supportedImagePlatform,
+      root: workspaceRoot,
+      sourceRepository,
+    },
+    () => undefined,
+  );
+  service.testImage('image');
+  service.testImage('image');
+  assert.equal(
+    calls.some((call) => call.args?.[0] === 'ps'),
+    false,
+  );
+  const runs = calls.filter((call) => call.args?.[0] === 'run');
+  const removals = calls.filter((call) => call.args?.[0] === 'rm');
+  const names = runs.map((call) => call.args?.[call.args.indexOf('--name') + 1]);
+  assert.equal(new Set(names).size, 2);
+  assert.deepEqual(
+    removals.map((call) => call.args),
+    names.map((name) => ['rm', '--force', name]),
+  );
+});
+
 test('native runtime smoke loads the pinned extension through the CLI', () => {
   const checks = createService({
     run: () => ({ status: 0, stderr: '', stdout: '' }),
