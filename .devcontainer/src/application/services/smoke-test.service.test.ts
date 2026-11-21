@@ -62,7 +62,9 @@ test('cleanup tolerates containers disappearing after discovery', () => {
 });
 
 test('native runtime smoke loads the pinned extension through the CLI', () => {
-  const checks = createService({ run: () => ({ status: 0, stderr: '', stdout: '' }) }).runtimeChecks();
+  const checks = createService({
+    run: () => ({ status: 0, stderr: '', stdout: '' }),
+  }).runtimeChecks();
   const native = checks.find((check) => check.name === 'JDKs, sbt, and native OpenIVM artifacts');
   assert.ok(native);
   assert.match(native.script, /LOAD '\/opt\/openivm\/openivm\.duckdb_extension'/u);
