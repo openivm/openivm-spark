@@ -1266,6 +1266,89 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     }
   }
 
+  it should "emit correlated driver and helper phases without altering CLI output" in {
+    withFakeCli(
+      """cat > /dev/null
+        |printf '%s\n' '{"refresh_type":2,"refresh_type_name":"SIMPLE_PROJECTION","sql":"SELECT 1;"}'
+        |""".stripMargin
+    ) { (compiler, dir, context) =>
+      implicit val ec: ExecutionContext = context
+      val events = new ConcurrentLinkedQueue[String]()
+      val identity = CompileTraceContext("refresh-1", Some("request-1"), "db.mv", enabled = true, sqlExecutionId = Some("sql-1"))
+      val traceFailures = new java.util.concurrent.atomic.AtomicInteger()
+      val tracer = new CompilerTrace(
+        Some(identity),
+        line => { events.add(line); () },
+        () => { traceFailures.incrementAndGet(); () }
+      )
+      val result = awaitCli(15.seconds) { compiler.compileWithTrace(cliTestRequest, tracer) }
+      traceFailures.get() shouldBe 0
+      result.sql shouldBe "SELECT 1;"
+      val mapper = new com.fasterxml.jackson.databind.ObjectMapper()
+      val rows = events.iterator().asScala.map(line => mapper.readTree(line)).toVector
+      val phases = rows.map(_.path("phase").asText()).toSet
+      phases should contain allOf ("compile_total", "helper_start", "helper_wait", "native_launch",
+        "native_lifecycle", "worker_output", "worker_cleanup", "worker_total", "driver_output_read", "driver_cleanup")
+      rows.foreach { row =>
+        row.path("operation_id").asText() shouldBe "refresh-1"
+        row.path("request_id").asText() shouldBe "request-1"
+        row.path("materialized_view").asText() shouldBe "db.mv"
+        row.path("sql_execution_id").asText() shouldBe "sql-1"
+        row.path("duration_ns").asLong() should be >= 0L
+        java.time.Instant.parse(row.path("start_utc").asText())
+      }
+      rows.find(_.path("phase").asText() == "native_launch").get.path("clock_domain").asText() shouldBe "helper"
+      events.asScala.mkString should not include cliTestRequest.viewSql
+      assertCliStopped(dir)
+    }
+  }
+
+  it should "separately correlate the scalar retry attempt" in {
+    withFakeCli(
+      """cat > /dev/null
+        |if [[ ! -e "$fixture_dir/retried" ]]; then
+        |  : > "$fixture_dir/retried"
+        |  printf 'unix_timestamp is unsupported\n' >&2
+        |else
+        |  printf '%s\n' '{"refresh_type":1,"refresh_type_name":"FULL_REFRESH","sql":"SELECT 1;"}'
+        |fi
+        |""".stripMargin
+    ) { (compiler, _, context) =>
+      implicit val ec: ExecutionContext = context
+      val events = new ConcurrentLinkedQueue[String]()
+      val tracer = new CompilerTrace(
+        Some(CompileTraceContext("refresh-retry", None, "mv", enabled = true)),
+        line => { events.add(line); () }
+      )
+      val request = cliTestRequest.copy(viewSql = "SELECT unix_timestamp(id) FROM cli_source")
+      val result = awaitCli(15.seconds) { compiler.compileWithTrace(request, tracer) }
+      result.refreshTypeName shouldBe "FULL_REFRESH"
+      val mapper = new com.fasterxml.jackson.databind.ObjectMapper()
+      val rows = events.iterator().asScala.map(line => mapper.readTree(line)).toVector
+      rows.filter(_.path("phase").asText() == "worker_total").map(_.path("attempt").asInt()).toSet shouldBe Set(1, 2)
+      rows.exists(r => r.path("phase").asText() == "scalar_retry" && r.path("attempt").asInt() == 2) shouldBe true
+    }
+  }
+
+  it should "retain failure behavior and return helper launch failure timing" in {
+    withFakeCli("") { (compiler, dir, context) =>
+      implicit val ec: ExecutionContext = context
+      dir.resolve("duckdb").toFile.setExecutable(false) shouldBe true
+      val events = new ConcurrentLinkedQueue[String]()
+      val tracer = new CompilerTrace(
+        Some(CompileTraceContext("refresh-2", None, "db.mv", enabled = true)),
+        line => { events.add(line); () }
+      )
+      val ex = the[OpenIvmCompileException] thrownBy awaitCli(15.seconds) {
+        compiler.compileWithTrace(cliTestRequest, tracer)
+      }
+      ex.getMessage should include("DuckDB CLI I/O helper failed")
+      val rows = events.iterator().asScala.map(line => new com.fasterxml.jackson.databind.ObjectMapper().readTree(line)).toVector
+      rows.exists(r => r.path("phase").asText() == "native_launch" && r.path("status").asText() == "failed") shouldBe true
+      rows.exists(r => r.path("phase").asText() == "compile_total" && r.path("status").asText() == "failed") shouldBe true
+    }
+  }
+
   it should "report a DuckDB CLI launch failure through the bounded I/O helper" in {
     withFakeCli("") { (compiler, dir, context) =>
       implicit val ec: ExecutionContext = context

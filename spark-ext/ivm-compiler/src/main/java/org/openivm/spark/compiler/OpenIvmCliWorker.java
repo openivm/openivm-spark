@@ -35,8 +35,12 @@ final class OpenIvmCliWorker {
 
     public static void main(String[] args) throws IOException {
         int status;
+        Trace trace = new Trace(args.length > 6 && "trace-v1".equals(args[6]));
+        Trace.Mark total = trace.start();
+        boolean success = false;
         try {
-            status = run(args);
+            status = run(args, trace);
+            success = status == 0;
         } catch (IOException | ExecutionException failure) {
             Files.write(Paths.get(args[4]), failure.toString().getBytes(StandardCharsets.UTF_8));
             status = IO_FAILURE;
@@ -47,12 +51,15 @@ final class OpenIvmCliWorker {
                 Thread.currentThread().interrupt();
             }
             status = IO_FAILURE;
+        } finally {
+            trace.finish("worker_total", total, success);
+            trace.publish();
         }
         // This is a standalone helper JVM, never a driver-side entry point.
         System.exit(status);
     }
 
-    private static int run(String[] args)
+    private static int run(String[] args, Trace trace)
             throws IOException, InterruptedException, ExecutionException {
         OpenIvmCliLifecycle lifecycle = new OpenIvmCliLifecycle(Paths.get(args[1]).getParent());
         ProcessBuilder builder = new ProcessBuilder(args[0], ":memory:", "-jsonlines", "-unsigned")
@@ -67,13 +74,20 @@ final class OpenIvmCliWorker {
             return PROCESS_TIMEOUT;
         }
         Process process;
+        Trace.Mark launch = trace.start();
+        boolean launched = false;
         try {
             process = builder.start();
+            launched = true;
         } catch (IOException launchFailure) {
             lifecycle.acknowledgeExit();
             throw launchFailure;
+        } finally {
+            trace.finish("native_launch", launch, launched);
         }
         ExecutorService readers = null;
+        Trace.Mark nativeLifecycle = trace.start();
+        boolean nativeSuccess = false;
         try {
             lifecycle.acknowledgeNative(process.toHandle());
             if (lifecycle.cancellationRequested()) {
@@ -96,33 +110,76 @@ final class OpenIvmCliWorker {
             }
             lifecycle.acknowledgeExit();
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(CLEANUP_TIMEOUT_SECONDS);
+            Trace.Mark output = trace.start();
+            boolean outputSuccess = false;
             try {
                 stdout.get(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
                 stderr.get(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+                outputSuccess = true;
             } catch (TimeoutException timeout) {
                 return OUTPUT_TIMEOUT;
+            } finally {
+                trace.finish("worker_output", output, outputSuccess);
             }
+            nativeSuccess = true;
             return 0;
         } finally {
-            if (readers != null) {
-                readers.shutdownNow();
+            trace.finish("native_lifecycle", nativeLifecycle, nativeSuccess);
+            Trace.Mark cleanup = trace.start();
+            boolean cleanupSuccess = false;
+            try {
+                if (readers != null) {
+                    readers.shutdownNow();
+                }
+                if (process.isAlive()) {
+                    List<ProcessHandle> descendants;
+                    try (Stream<ProcessHandle> children = process.descendants()) {
+                        descendants = children.collect(Collectors.toList());
+                    }
+                    for (int index = descendants.size() - 1; index >= 0; index--) {
+                        descendants.get(index).destroyForcibly();
+                    }
+                    // Process.destroyForcibly also closes streams and can block on
+                    // an inherited pipe's reader/reaper lock. Signal the handle only.
+                    process.toHandle().destroyForcibly();
+                    if (!process.waitFor(CLEANUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                        throw new IOException("DuckDB CLI did not terminate after being killed");
+                    }
+                }
+                lifecycle.acknowledgeExit();
+                cleanupSuccess = true;
+            } finally {
+                trace.finish("worker_cleanup", cleanup, cleanupSuccess);
             }
-            if (process.isAlive()) {
-                List<ProcessHandle> descendants;
-                try (Stream<ProcessHandle> children = process.descendants()) {
-                    descendants = children.collect(Collectors.toList());
-                }
-                for (int index = descendants.size() - 1; index >= 0; index--) {
-                    descendants.get(index).destroyForcibly();
-                }
-                // Process.destroyForcibly also closes streams and can block on
-                // an inherited pipe's reader/reaper lock. Signal the handle only.
-                process.toHandle().destroyForcibly();
-                if (!process.waitFor(CLEANUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                    throw new IOException("DuckDB CLI did not terminate after being killed");
-                }
+        }
+    }
+
+    private static final class Trace {
+        private final boolean enabled;
+        private final StringBuilder output = new StringBuilder("openivm-compiler-trace-v1\n");
+
+        private Trace(boolean enabled) { this.enabled = enabled; }
+
+        private static final class Mark {
+            final long epochMs = System.currentTimeMillis();
+            final long nanos = System.nanoTime();
+        }
+
+        private Mark start() { return enabled ? new Mark() : null; }
+
+        private void finish(String phase, Mark start, boolean success) {
+            if (start != null) {
+                output.append(phase).append('|').append(start.epochMs).append('|')
+                        .append(Math.max(0L, System.nanoTime() - start.nanos)).append('|')
+                        .append(success ? "success" : "failed").append('\n');
             }
-            lifecycle.acknowledgeExit();
+        }
+
+        private void publish() {
+            if (enabled) {
+                System.out.print(output.append("end\n").toString());
+                System.out.flush();
+            }
         }
     }
 

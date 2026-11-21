@@ -23,6 +23,26 @@ private[commands] final class PhaseTimeline(
     var childNs = 0L
   }
 
+  def external(phase: String, startEpochMs: Long, startNs: Long, endNs: Long, succeeded: Boolean): Unit = {
+    emit(OpenIvmInsightJson.obj(
+      "event_type" -> "phase",
+      "refresh_id" -> refreshId,
+      "request_id" -> requestId,
+      "materialized_view" -> viewName,
+      "operation" -> operation,
+      "phase" -> phase,
+      "phase_id" -> sequence.incrementAndGet(),
+      "parent_phase_id" -> Option.empty[Long],
+      "thread_name" -> Thread.currentThread().getName,
+      "clock_domain_id" -> MonotonicClockDomain.id,
+      "started_at" -> Instant.ofEpochMilli(startEpochMs).toString,
+      "start_monotonic_ns" -> startNs,
+      "inclusive_ns" -> math.max(0L, endNs - startNs),
+      "exclusive_scope" -> "unavailable_overlapping_interval",
+      "outcome" -> (if (succeeded) "success" else "failed")
+    ))
+  }
+
   def time[A](phase: String, detail: String)(body: => A): A = {
     val ancestors = Option(stack.get()).getOrElse(Nil)
     val frame = new Frame(sequence.incrementAndGet(), nanoTime(), epochMillis(), ancestors.headOption.map(_.id))

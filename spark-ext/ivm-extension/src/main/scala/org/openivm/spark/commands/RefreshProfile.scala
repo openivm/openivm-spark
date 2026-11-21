@@ -3,6 +3,7 @@ package org.openivm.spark.commands
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.{FeatureGate, MonotonicClockDomain, RefreshProfileCatalog, RefreshProfileRow}
 import org.openivm.spark.common.rocksdb.OpenIvmRocksDBTelemetry
+import org.openivm.spark.compiler.CompileTraceContext
 import org.openivm.spark.insights.{OpenIvmInsightJson, OpenIvmInsightsBroker, OpenIvmInsightsContract}
 import org.openivm.spark.telemetry.{BoundedTelemetryQueue, OpenIvmExecutionSpan}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
@@ -59,6 +60,17 @@ final class RefreshProfile private (
   private var spanEndNanos  = 0L
   private var finished      = false
 
+  private[commands] def compilerTrace: Option[CompileTraceContext] =
+    phaseTimeline.map(_ =>
+      CompileTraceContext(
+        operationId = refreshId,
+        requestId = OpenIvmInsightsBroker.currentRequestId(spark),
+        materializedView = viewName,
+        enabled = true,
+        sqlExecutionId = Option(spark.sparkContext.getLocalProperty("spark.sql.execution.id"))
+      )
+    )
+
   private[commands] def activateTraceContext(): Unit =
     phaseTimeline.foreach(_ => spark.sparkContext.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, refreshId))
 
@@ -66,6 +78,18 @@ final class RefreshProfile private (
     phaseTimeline.foreach(_ =>
       spark.sparkContext.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, previousTraceOperationId.orNull)
     )
+
+  private[commands] def recordStateBarrier(
+      requestedEpochMs: Long,
+      requestedNs: Long,
+      acquiredEpochMs: Long,
+      acquiredNs: Long,
+      releasedNs: Long,
+      succeeded: Boolean
+  ): Unit = phaseTimeline.foreach { timeline =>
+    timeline.external("state_barrier_wait", requestedEpochMs, requestedNs, acquiredNs, succeeded)
+    timeline.external("state_barrier_hold", acquiredEpochMs, acquiredNs, releasedNs, succeeded)
+  }
 
   /** True when this profile is wired to a real RocksDB sink. False instances
     * pay zero allocation per step.
@@ -344,6 +368,18 @@ object RefreshProfile {
       case Some(profile) => profile.timeObservedStep(stepName)(body)
       case None          => body
     }
+
+  private[commands] def recordActiveStateBarrier(
+      requestedEpochMs: Long,
+      requestedNs: Long,
+      acquiredEpochMs: Long,
+      acquiredNs: Long,
+      releasedNs: Long,
+      succeeded: Boolean
+  ): Unit =
+    Option(current.get()).foreach(
+      _.recordStateBarrier(requestedEpochMs, requestedNs, acquiredEpochMs, acquiredNs, releasedNs, succeeded)
+    )
 
   /** Lifecycle mode — drives the `refresh_id` shape so the chart's
     * `_create_mv_` substring discriminator routes CREATE-phase rows to the

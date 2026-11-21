@@ -20,6 +20,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 import scala.util.control.NonFatal
 
 private[openivm] object OpenIvmStateBarrier {
+  private val telemetryLog = org.slf4j.LoggerFactory.getLogger(getClass)
   private final class RootState {
     val lock: ReentrantReadWriteLock   = new ReentrantReadWriteLock(true)
     val mutationGeneration: AtomicLong = new AtomicLong(0L)
@@ -109,6 +110,34 @@ private[openivm] object OpenIvmStateBarrier {
       val state = forRoot(root(spark))
       state.trackingEnabled = state.trackingEnabled || trackingEnabled(spark)
       withRead(state)(withMutationTracking(state)(body))
+    } else body
+
+  def withMeasuredMutation[A](spark: SparkSession)(
+      report: (Long, Long, Long, Long, Long, Boolean) => Unit
+  )(body: => A): A =
+    if (!spark.sparkContext.getConf.getBoolean(BoundedTelemetryQueue.EnabledKey, false))
+      withMutation(spark)(body)
+    else if (OpenIvmStateSync.guardedSqlEnabled(spark) || stateSyncConfigured(spark)) {
+      OpenIvmStateSync.maybeRestore(spark)
+      val state = forRoot(root(spark))
+      state.trackingEnabled = state.trackingEnabled || trackingEnabled(spark)
+      val lock = state.lock.readLock()
+      val requestedEpochMs = System.currentTimeMillis()
+      val requestedNs = System.nanoTime()
+      lock.lock()
+      val acquiredEpochMs = System.currentTimeMillis()
+      val acquiredNs = System.nanoTime()
+      var succeeded = false
+      try {
+        val result = withMutationTracking(state)(body)
+        succeeded = true
+        result
+      } finally {
+        val releasedNs = System.nanoTime()
+        lock.unlock()
+        try report(requestedEpochMs, requestedNs, acquiredEpochMs, acquiredNs, releasedNs, succeeded)
+        catch { case NonFatal(_) => telemetryLog.warn("OpenIVM state barrier timing export failed") }
+      }
     } else body
 
   private[rocksdb] def withCurrentMutationGeneration[A](spark: SparkSession)(body: Long => A): A =

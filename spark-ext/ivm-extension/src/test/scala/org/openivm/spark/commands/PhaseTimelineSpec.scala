@@ -31,4 +31,22 @@ class PhaseTimelineSpec extends AnyFunSpec with Matchers {
     rows("failed").get("parent_phase_id").asLong() shouldBe rows("outer").get("phase_id").asLong()
     rows("failed").get("outcome").asText() shouldBe "failed"
   }
+
+  it("reports externally measured intervals without inventing exclusive time") {
+    val events = ArrayBuffer.empty[String]
+    val timeline = new PhaseTimeline("refresh-1", "db.mv", "refresh", line => { events += line; () })
+    timeline.external("state_barrier_wait", 0L, 10L, 30L, succeeded = true)
+    timeline.external("state_barrier_hold", 1L, 30L, 90L, succeeded = false)
+
+    val mapper = new ObjectMapper()
+    val rows = events.map(line => mapper.readTree(line))
+    rows.map(_.get("phase").asText()) shouldBe Seq("state_barrier_wait", "state_barrier_hold")
+    rows.map(_.get("inclusive_ns").asLong()) shouldBe Seq(20L, 60L)
+    rows.foreach { row =>
+      row.has("exclusive_ns") shouldBe false
+      row.get("exclusive_scope").asText() shouldBe "unavailable_overlapping_interval"
+      row.get("refresh_id").asText() shouldBe "refresh-1"
+    }
+    rows.last.get("outcome").asText() shouldBe "failed"
+  }
 }

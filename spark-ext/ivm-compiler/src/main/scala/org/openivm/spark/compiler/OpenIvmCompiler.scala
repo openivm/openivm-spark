@@ -164,7 +164,15 @@ class OpenIvmCompiler private (
     * @throws NotImplementedError     if a source schema column has an unsupported Spark type.
     * @throws IllegalStateException   if called after [[close]].
     */
-  def compile(req: CompileRequest): CompiledRefresh = {
+  def compile(req: CompileRequest): CompiledRefresh = compile(req, None)
+
+  def compile(req: CompileRequest, trace: Option[CompileTraceContext]): CompiledRefresh =
+    compileWithTrace(req, new CompilerTrace(trace))
+
+  private[compiler] def compileWithTrace(req: CompileRequest, trace: CompilerTrace): CompiledRefresh =
+    trace.time("compile_total", 0) { compileImpl(req, trace) }
+
+  private def compileImpl(req: CompileRequest, trace: CompilerTrace): CompiledRefresh = {
     if (closed) throw new IllegalStateException("OpenIvmCompiler has been closed")
 
     // Spark/Delta snapshot pins (`… VERSION AS OF <v>`) are a storage concern
@@ -230,7 +238,7 @@ class OpenIvmCompiler private (
     try {
       val script = buildScript(req, tableDdls, tmpDir, normalizedViewSql)
       val (stdout, stderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
-        runCli(script, tmpDir)
+        trace.time("attempt_cli", 1) { runCli(script, tmpDir, trace, 1) }
       }
       lastStdout = stdout
       lastStderr = stderr
@@ -245,19 +253,21 @@ class OpenIvmCompiler private (
                 val error = stderr.toLowerCase(Locale.ROOT)
                 error.contains("unix_timestamp") || error.contains("timestampdiff") || error.contains("lower(boolean)")
               } =>
-            val candidate = new SparkFunctionShimSql.ScalarDialectMarkers
-            val rewritten = candidate.rewrite(normalizedViewSql)
-            if (!candidate.nonEmpty || candidate.hasUnsafeArguments) throw first
-            resultDir = Files.createTempDirectory(tmpDir, "scalar_retry_")
-            val retry = buildScript(req, tableDdls, resultDir, rewritten, preserveScalarMarkers = true)
-            val (retryStdout, retryStderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
-              runCli(retry, resultDir)
+            trace.time("scalar_retry", 2) {
+              val candidate = new SparkFunctionShimSql.ScalarDialectMarkers
+              val rewritten = candidate.rewrite(normalizedViewSql)
+              if (!candidate.nonEmpty || candidate.hasUnsafeArguments) throw first
+              resultDir = Files.createTempDirectory(tmpDir, "scalar_retry_")
+              val retry = buildScript(req, tableDdls, resultDir, rewritten, preserveScalarMarkers = true)
+              val (retryStdout, retryStderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
+                trace.time("attempt_cli", 2) { runCli(retry, resultDir, trace, 2) }
+              }
+              resultStdout = retryStdout
+              lastStdout = retryStdout
+              lastStderr = retryStderr
+              markers = Some(candidate)
+              parseCompileResult(retryStdout, req.viewName, retryStderr)
             }
-            resultStdout = retryStdout
-            lastStdout = retryStdout
-            lastStderr = retryStderr
-            markers = Some(candidate)
-            parseCompileResult(retryStdout, req.viewName, retryStderr)
         }
       val nativeViewName = resultStdout.linesIterator
         .find(_.contains("\"openivm_bridge_view_key\""))
@@ -297,7 +307,7 @@ class OpenIvmCompiler private (
     } finally {
       OpenIvmMetrics.updateTimer("compiler.compile", System.nanoTime() - compileStarted)
       OpenIvmMetrics.CompilerInflight.decrementAndGet()
-      if (!retainControl) deleteDirRecursively(tmpDir)
+      if (!retainControl) trace.time("control_cleanup", 0) { deleteDirRecursively(tmpDir) }
     }
   }
 
@@ -690,7 +700,10 @@ class OpenIvmCompiler private (
     * process inherits read-only input and pipes, never writable capture files.
     * A stuck pipe reader is confined to the helper JVM, not the Spark driver.
     */
-  private[compiler] def runCli(script: String, tmpDir: Path): (String, String) = {
+  private[compiler] def runCli(script: String, tmpDir: Path): (String, String) =
+    runCli(script, tmpDir, new CompilerTrace(None), 1)
+
+  private def runCli(script: String, tmpDir: Path, trace: CompilerTrace, attempt: Int): (String, String) = {
     val stdinPath  = tmpDir.resolve("cli.sql")
     val stdoutPath = tmpDir.resolve("cli.stdout")
     val stderrPath = tmpDir.resolve("cli.stderr")
@@ -719,12 +732,23 @@ class OpenIvmCompiler private (
       .redirectInput(stdinPath.toFile)
       .redirectOutput(ProcessBuilder.Redirect.DISCARD)
       .redirectError(ProcessBuilder.Redirect.DISCARD)
-    val process     = pb.start()
+    if (trace.enabled) {
+      pb.command().add("trace-v1")
+      pb.redirectOutput(ProcessBuilder.Redirect.PIPE)
+    }
+    val process = trace.time("helper_start", attempt) { pb.start() }
     var interrupted = false
+    var workerReportRead = false
     try {
       lifecycle.acknowledgeHelper(process.toHandle())
-      if (!process.waitFor(OpenIvmCliWorker.PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-        throw new OpenIvmCompileException("DuckDB CLI timed out after 120 seconds", null)
+      trace.time("helper_wait", attempt) {
+        if (!process.waitFor(OpenIvmCliWorker.PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+          throw new OpenIvmCompileException("DuckDB CLI timed out after 120 seconds", null)
+      }
+      if (trace.enabled) {
+        workerReportRead = true
+        try trace.readWorkerOutput(process.getInputStream, attempt)
+        catch { case scala.util.control.NonFatal(_) => trace.workerMissing() }
       }
       process.exitValue() match {
         case 0 =>
@@ -736,18 +760,21 @@ class OpenIvmCompiler private (
           val detail = if (Files.exists(errorPath)) s": ${readCliOutput(errorPath)}" else ""
           throw new OpenIvmCompileException(s"DuckDB CLI I/O helper failed (exit $status)$detail", null)
       }
-      (readCliOutput(stdoutPath), readCliOutput(stderrPath))
+      trace.time("driver_output_read", attempt) { (readCliOutput(stdoutPath), readCliOutput(stderrPath)) }
     } catch {
       case e: InterruptedException =>
         interrupted = true
         throw e
     } finally {
+      if (!workerReportRead) trace.workerMissing()
       try {
-        terminateCliProcess(
-          process,
-          lifecycle,
-          System.nanoTime() + TimeUnit.SECONDS.toNanos(OpenIvmCliWorker.CLEANUP_TIMEOUT_SECONDS)
-        )
+        trace.time("driver_cleanup", attempt) {
+          terminateCliProcess(
+            process,
+            lifecycle,
+            System.nanoTime() + TimeUnit.SECONDS.toNanos(OpenIvmCliWorker.CLEANUP_TIMEOUT_SECONDS)
+          )
+        }
       } catch {
         case e: InterruptedException =>
           interrupted = true

@@ -3170,7 +3170,7 @@ case class CreateMaterializedViewCommand(
       "create_compile_classification",
       s"sources=${qualNames.size};group_cols=${groupKeys.size}"
     ) {
-      try compiler.compile(createCompileRequest)
+      try compiler.compile(createCompileRequest, profile.compilerTrace)
       catch {
         case e: org.openivm.spark.compiler.OpenIvmCompileException =>
           val compileFailedClassification =
@@ -4285,7 +4285,7 @@ case class RefreshMaterializedViewCommand(
           absent = true
           Seq(Row("absent", expectedQueryHash.get, sqlIdent(name), null, null, null))
         } else
-          OpenIvmStateBarrier.withMutation(spark) {
+          OpenIvmStateBarrier.withMeasuredMutation(spark)(RefreshProfile.recordActiveStateBarrier) {
             if (expectedQueryHash.isDefined) {
               if (FeatureGate.stateSyncAsyncEnabled(spark))
                 throw new IllegalStateException(
@@ -5865,7 +5865,7 @@ case class RefreshMaterializedViewCommand(
             else None
           recompileBridge match {
             case Some(bridge) =>
-              val compiled = compiler.compile(compileRequest)
+              val compiled = compiler.compile(compileRequest, profile.compilerTrace)
               if (compiled.refreshType != meta.refreshType || compiled.initialLoadSql.isEmpty)
                 throw new IllegalStateException(
                   s"Cannot rebaseline ${sqlIdent(name)}: recompiled initial load is incompatible with its refresh type"
@@ -6202,7 +6202,7 @@ case class RefreshMaterializedViewCommand(
           cachedCompiled match {
             case Some(program) => program
             case None =>
-              val fresh = compiler.compile(compileRequest)
+              val fresh = compiler.compile(compileRequest, profile.compilerTrace)
               if (compileCacheEnabled && fresh.sql.nonEmpty) {
                 val backfilled = refreshProperties ++
                   MvMetadata.compiledProperties(
