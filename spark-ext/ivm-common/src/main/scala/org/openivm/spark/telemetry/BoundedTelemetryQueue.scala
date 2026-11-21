@@ -25,30 +25,30 @@ final class BoundedTelemetryQueue private[telemetry] (
   import BoundedTelemetryQueue._
 
   require(capacity > 0 && maxChars > 0)
-  private val queue = new ConcurrentLinkedQueue[String]()
-  private val permits = new Semaphore(capacity)
-  private val gate = new ReentrantLock()
-  private val accepting = new AtomicBoolean(true)
-  private val accepted = new AtomicLong()
-  private val published = new AtomicLong()
-  private val full = new AtomicLong()
-  private val oversized = new AtomicLong()
-  private val closed = new AtomicLong()
-  private val contended = new AtomicLong()
-  private val failures = new AtomicLong()
+  private val queue            = new ConcurrentLinkedQueue[String]()
+  private val permits          = new Semaphore(capacity)
+  private val gate             = new ReentrantLock()
+  private val accepting        = new AtomicBoolean(true)
+  private val accepted         = new AtomicLong()
+  private val published        = new AtomicLong()
+  private val full             = new AtomicLong()
+  private val oversized        = new AtomicLong()
+  private val closed           = new AtomicLong()
+  private val contended        = new AtomicLong()
+  private val failures         = new AtomicLong()
   private val manifestFailures = new AtomicLong()
-  private val workerFailures = new AtomicLong()
+  private val workerFailures   = new AtomicLong()
   private final class SinkState(val kind: String, val writer: Writer) {
-    val published = new AtomicLong()
-    val failures = new AtomicLong()
+    val published        = new AtomicLong()
+    val failures         = new AtomicLong()
     val manifestFailures = new AtomicLong()
-    val manifestState = new AtomicReference[String]("not_attempted")
+    val manifestState    = new AtomicReference[String]("not_attempted")
   }
   private val sinks = new SinkState(destination.map(_.kind).getOrElse("local"), writer) +:
     extraDestinations.map { case (w, d) => new SinkState(d.kind, w) }
   private[telemetry] val destinations: Seq[Destination] = destination.toSeq ++ extraDestinations.map(_._2)
-  private val startedAt = Instant.now().toString
-  private val json = new ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+  private val startedAt                                 = Instant.now().toString
+  private val json   = new ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
   private val worker = new Thread(new Runnable { override def run(): Unit = drain() }, "openivm-telemetry-export")
   worker.setDaemon(true)
   worker.start()
@@ -81,12 +81,26 @@ final class BoundedTelemetryQueue private[telemetry] (
   override def write(key: String, line: String): Unit = { offer(line); () }
 
   def health: Health = Health(
-    accepted.get(), published.get(), full.get(), oversized.get(), closed.get(), contended.get(), failures.get(),
-    manifestFailures.get(), queue.size(), accepting.get(), worker.isAlive, workerFailures.get(),
+    accepted.get(),
+    published.get(),
+    full.get(),
+    oversized.get(),
+    closed.get(),
+    contended.get(),
+    failures.get(),
+    manifestFailures.get(),
+    queue.size(),
+    accepting.get(),
+    worker.isAlive,
+    workerFailures.get(),
     sinks.map { sink =>
       sink.kind -> DestinationHealth(
-        accepted.get(), sink.published.get(), sink.failures.get(), sink.manifestFailures.get(),
-        full.get() + oversized.get() + closed.get() + contended.get(), sink.manifestState.get()
+        accepted.get(),
+        sink.published.get(),
+        sink.failures.get(),
+        sink.manifestFailures.get(),
+        full.get() + oversized.get() + closed.get() + contended.get(),
+        sink.manifestState.get()
       )
     }.toMap
   )
@@ -108,12 +122,13 @@ final class BoundedTelemetryQueue private[telemetry] (
         if (line == null) Thread.sleep(25L)
         else {
           permits.release()
-          val rendered = try {
-            val raw = if (line.startsWith(LogPrefix)) line.substring(LogPrefix.length) else line
-            val node = json.readTree(raw)
-            if (node == null || !node.isObject) throw new IllegalArgumentException("expected a JSON object")
-            Some(json.writeValueAsString(node) + "\n")
-          } catch { case NonFatal(_) => None }
+          val rendered =
+            try {
+              val raw  = if (line.startsWith(LogPrefix)) line.substring(LogPrefix.length) else line
+              val node = json.readTree(raw)
+              if (node == null || !node.isObject) throw new IllegalArgumentException("expected a JSON object")
+              Some(json.writeValueAsString(node) + "\n")
+            } catch { case NonFatal(_) => None }
           var allPublished = rendered.nonEmpty
           sinks.foreach { sink =>
             try {
@@ -152,7 +167,7 @@ final class BoundedTelemetryQueue private[telemetry] (
   }
 
   private def manifestJson(): String = {
-    val s = health
+    val s    = health
     val node = json.createObjectNode()
     node.put("schema", "openivm.telemetry-export-manifest.v1")
     node.put("started_at", startedAt)
@@ -181,12 +196,12 @@ final class BoundedTelemetryQueue private[telemetry] (
 }
 
 object BoundedTelemetryQueue {
-  val EnabledKey = "spark.openivm.telemetry.queue.enabled"
-  val UriKey = "spark.openivm.telemetry.queue.uri"
-  val LocalUriKey = "spark.openivm.telemetry.queue.localUri"
-  val OneLakeUriKey = "spark.openivm.telemetry.queue.oneLakeUri"
-  val CapacityKey = "spark.openivm.telemetry.queue.capacity"
-  val MaxCharsKey = "spark.openivm.telemetry.queue.maxChars"
+  val EnabledKey        = "spark.openivm.telemetry.queue.enabled"
+  val UriKey            = "spark.openivm.telemetry.queue.uri"
+  val LocalUriKey       = "spark.openivm.telemetry.queue.localUri"
+  val OneLakeUriKey     = "spark.openivm.telemetry.queue.oneLakeUri"
+  val CapacityKey       = "spark.openivm.telemetry.queue.capacity"
+  val MaxCharsKey       = "spark.openivm.telemetry.queue.maxChars"
   private val LogPrefix = "OPENIVM_EXECUTION_SPAN "
 
   final case class Health(
@@ -215,7 +230,8 @@ object BoundedTelemetryQueue {
   )
 
   private[telemetry] final case class Destination(uri: String, hadoopConf: Configuration) {
-    def kind: String = if (Option(new Path(uri).toUri.getScheme).exists(_.equalsIgnoreCase("abfss"))) "abfss" else "local"
+    def kind: String =
+      if (Option(new Path(uri).toUri.getScheme).exists(_.equalsIgnoreCase("abfss"))) "abfss" else "local"
   }
 
   private[telemetry] trait Writer {
@@ -228,28 +244,38 @@ object BoundedTelemetryQueue {
     val enabled = conf.getOption(EnabledKey).map(_.trim.toLowerCase(Locale.ROOT)) match {
       case None | Some("false") => false
       case Some("true")         => true
-      case _ => throw new IllegalArgumentException(s"$EnabledKey must be true or false")
+      case _                    => throw new IllegalArgumentException(s"$EnabledKey must be true or false")
     }
     if (!enabled) Seq.empty
     else {
       def read(key: String): Option[String] = conf.getOption(key).map(_.trim).filter(_.nonEmpty)
-      val legacy = read(UriKey)
-      val local = read(LocalUriKey)
-      val oneLake = read(OneLakeUriKey)
-      require(!(legacy.nonEmpty && (local.nonEmpty || oneLake.nonEmpty)), "legacy and explicit telemetry URIs cannot be combined")
-      val candidates = legacy.toSeq.map(_ -> "either") ++ local.toSeq.map(_ -> "local") ++ oneLake.toSeq.map(_ -> "abfss")
+      val legacy                            = read(UriKey)
+      val local                             = read(LocalUriKey)
+      val oneLake                           = read(OneLakeUriKey)
+      require(
+        !(legacy.nonEmpty && (local.nonEmpty || oneLake.nonEmpty)),
+        "legacy and explicit telemetry URIs cannot be combined"
+      )
+      val candidates =
+        legacy.toSeq.map(_ -> "either") ++ local.toSeq.map(_ -> "local") ++ oneLake.toSeq.map(_ -> "abfss")
       require(candidates.nonEmpty, "telemetry queue destination is required")
       val paths = candidates.map { case (uri, expected) =>
-        val path = new Path(uri)
+        val path   = new Path(uri)
         val parsed = path.toUri
         val scheme = Option(parsed.getScheme).getOrElse("file").toLowerCase(Locale.ROOT)
         require(scheme == "file" || scheme == "abfss", "telemetry queue URI must use file or abfss")
-        require(expected == "either" || (expected == "local" && scheme == "file") || expected == scheme,
-          "telemetry destination URI has the wrong scheme")
-        require(parsed.getRawQuery == null && parsed.getRawFragment == null,
-          "telemetry queue URI cannot include query or fragment")
-        require(scheme != "abfss" || Option(parsed.getAuthority).exists(_.contains("@")),
-          "abfss telemetry queue URI must include filesystem and account")
+        require(
+          expected == "either" || (expected == "local" && scheme == "file") || expected == scheme,
+          "telemetry destination URI has the wrong scheme"
+        )
+        require(
+          parsed.getRawQuery == null && parsed.getRawFragment == null,
+          "telemetry queue URI cannot include query or fragment"
+        )
+        require(
+          scheme != "abfss" || Option(parsed.getAuthority).exists(_.contains("@")),
+          "abfss telemetry queue URI must include filesystem and account"
+        )
         path.toString
       }
       require(paths.distinct.size == paths.size, "telemetry queue destinations must be distinct")
@@ -270,14 +296,20 @@ object BoundedTelemetryQueue {
         val destination = Destination(uri, copiedConf)
         (new HadoopWriter(new Path(uri), copiedConf): Writer, destination)
       }
-      Some(new BoundedTelemetryQueue(
-        capacity, maxChars, configured.head._1, Some(configured.head._2), configured.tail
-      ))
+      Some(
+        new BoundedTelemetryQueue(
+          capacity,
+          maxChars,
+          configured.head._1,
+          Some(configured.head._2),
+          configured.tail
+        )
+      )
     }
   }
 
   private final class HadoopWriter(root: Path, conf: Configuration) extends Writer {
-    private val run = UUID.randomUUID().toString
+    private val run      = UUID.randomUUID().toString
     private var sequence = 0L
 
     override def record(line: String): Unit = {

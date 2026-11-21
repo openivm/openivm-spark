@@ -11,7 +11,7 @@ private[commands] object GeneratedActionOwnership {
     action match {
       case None => run
       case Some(value) =>
-        val context = spark.sparkContext
+        val context  = spark.sparkContext
         val previous = context.getLocalProperty(TelemetryJobListener.ActionProperty)
         context.setLocalProperty(
           TelemetryJobListener.ActionProperty,

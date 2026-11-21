@@ -13,7 +13,7 @@ class CompilerTraceSpec extends AnyFlatSpec with Matchers {
     "openivm-compiler-trace-v1\nnative_launch|1000|42|success\nworker_total|1000|50|success\nend\n"
 
   "Compiler tracing" should "be disabled unless explicitly enabled" in {
-    val events = ArrayBuffer.empty[String]
+    val events   = ArrayBuffer.empty[String]
     var failures = 0
     val trace = new CompilerTrace(
       Some(CompileTraceContext("op", None, "mv")),
@@ -21,10 +21,13 @@ class CompilerTraceSpec extends AnyFlatSpec with Matchers {
       () => failures += 1
     )
     trace.time("phase", 1) { 42 } shouldBe 42
-    trace.readWorkerOutput(new InputStream {
-      override def read(): Int = throw new IOException("sensitive")
-      override def available(): Int = throw new IOException("sensitive")
-    }, 1)
+    trace.readWorkerOutput(
+      new InputStream {
+        override def read(): Int      = throw new IOException("sensitive")
+        override def available(): Int = throw new IOException("sensitive")
+      },
+      1
+    )
     trace.workerOutput(Array.emptyByteArray, 1)
     trace.workerMissing()
     events shouldBe empty
@@ -32,7 +35,7 @@ class CompilerTraceSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "count missing, truncated, malformed, oversized and unreadable reports" in {
-    val events = ArrayBuffer.empty[String]
+    val events   = ArrayBuffer.empty[String]
     var failures = 0
     val trace = new CompilerTrace(
       Some(CompileTraceContext("op", None, "mv", enabled = true)),
@@ -51,17 +54,26 @@ class CompilerTraceSpec extends AnyFlatSpec with Matchers {
     )
     invalid.foreach(value => trace.workerOutput(value.getBytes("UTF-8"), 1))
     trace.readWorkerOutput(new ByteArrayInputStream(Array.fill[Byte](CompilerTrace.MaxWorkerBytes + 1)(0)), 1)
-    trace.readWorkerOutput(new InputStream {
-      override def read(): Int = throw new IOException("sensitive")
-      override def available(): Int = throw new IOException("sensitive")
-    }, 1)
-    trace.readWorkerOutput(new InputStream {
-      override def read(): Int = throw new IOException("sensitive")
-      override def available(): Int = 1
-    }, 1)
-    trace.readWorkerOutput(new ByteArrayInputStream(validReport.getBytes("UTF-8")) {
-      override def available(): Int = super.available() + 1
-    }, 1)
+    trace.readWorkerOutput(
+      new InputStream {
+        override def read(): Int      = throw new IOException("sensitive")
+        override def available(): Int = throw new IOException("sensitive")
+      },
+      1
+    )
+    trace.readWorkerOutput(
+      new InputStream {
+        override def read(): Int      = throw new IOException("sensitive")
+        override def available(): Int = 1
+      },
+      1
+    )
+    trace.readWorkerOutput(
+      new ByteArrayInputStream(validReport.getBytes("UTF-8")) {
+        override def available(): Int = super.available() + 1
+      },
+      1
+    )
     trace.workerMissing()
     failures shouldBe invalid.size + 5
     events shouldBe empty
@@ -76,13 +88,13 @@ class CompilerTraceSpec extends AnyFlatSpec with Matchers {
     )
     trace.time("success", 1) { 42 } shouldBe 42
     val original = new IllegalStateException("body")
-    val caught = the[IllegalStateException] thrownBy trace.time("failure", 1) { throw original }
+    val caught   = the[IllegalStateException] thrownBy trace.time("failure", 1) { throw original }
     caught shouldBe original
     failures shouldBe 2
   }
 
   it should "rate-limit a constant warning while counting every failure" in {
-    var now = 10L
+    var now      = 10L
     val warnings = ArrayBuffer.empty[String]
     val reporter = new CompileTraceFailureReporter(
       () => now,
@@ -116,13 +128,13 @@ class CompilerTraceSpec extends AnyFlatSpec with Matchers {
     )
     trace.time("success", 1) { 42 } shouldBe 42
     val original = new IllegalStateException("body")
-    val caught = the[IllegalStateException] thrownBy trace.time("failure", 1) { throw original }
+    val caught   = the[IllegalStateException] thrownBy trace.time("failure", 1) { throw original }
     caught shouldBe original
     reporter.failureCount shouldBe 2L
   }
 
   it should "return helper durations without assigning driver monotonic timestamps" in {
-    val events = ArrayBuffer.empty[String]
+    val events   = ArrayBuffer.empty[String]
     var failures = 0
     val trace = new CompilerTrace(
       Some(CompileTraceContext("op", Some("req"), "mv", enabled = true)),

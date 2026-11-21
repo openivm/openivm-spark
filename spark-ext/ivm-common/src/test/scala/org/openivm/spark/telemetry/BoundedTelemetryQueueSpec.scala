@@ -34,13 +34,13 @@ class BoundedTelemetryQueueSpec extends AnyFunSpec with Matchers {
         q.offer("OPENIVM_EXECUTION_SPAN {\"duration_ms\":3}") shouldBe true
         q.shutdown(10000) shouldBe true
         q.health.published shouldBe 1L
-        val files = root.listFiles().toSeq
+        val files   = root.listFiles().toSeq
         val records = files.filter(_.getName.endsWith(".jsonl"))
         records.size shouldBe 1
         val data = new String(Files.readAllBytes(records.head.toPath), StandardCharsets.UTF_8)
         json.readTree(data).get("duration_ms").asInt() shouldBe 3
         val manifest = files.find(_.getName.endsWith("-manifest.json")).get
-        val m = json.readTree(Files.readAllBytes(manifest.toPath))
+        val m        = json.readTree(Files.readAllBytes(manifest.toPath))
         m.get("published").asLong() shouldBe 1L
         m.get("started_at").asText().endsWith("Z") shouldBe true
         m.get("finished_at").asText().endsWith("Z") shouldBe true
@@ -59,12 +59,15 @@ class BoundedTelemetryQueueSpec extends AnyFunSpec with Matchers {
         override def manifest(value: String): Unit = ()
       }
       val other = new BoundedTelemetryQueue.Writer {
-        override def record(line: String): Unit = ()
+        override def record(line: String): Unit    = ()
         override def manifest(value: String): Unit = ()
       }
       val conf = new Configuration(false)
       val q = new BoundedTelemetryQueue(
-        1, 100, writer, Some(BoundedTelemetryQueue.Destination("file:/local", conf)),
+        1,
+        100,
+        writer,
+        Some(BoundedTelemetryQueue.Destination("file:/local", conf)),
         Seq(other -> BoundedTelemetryQueue.Destination("abfss://fs@account/path", conf))
       )
       try {
@@ -92,7 +95,7 @@ class BoundedTelemetryQueueSpec extends AnyFunSpec with Matchers {
 
     it("counts malformed JSON and a failed manifest without exposing exception content") {
       val writer = new BoundedTelemetryQueue.Writer {
-        override def record(line: String): Unit = fail("invalid JSON was published")
+        override def record(line: String): Unit    = fail("invalid JSON was published")
         override def manifest(value: String): Unit = throw new IllegalStateException("secret")
       }
       val q = new BoundedTelemetryQueue(2, 100, writer)
@@ -141,13 +144,16 @@ class BoundedTelemetryQueueSpec extends AnyFunSpec with Matchers {
       val entered = new CountDownLatch(1)
       val release = new CountDownLatch(1)
       val writer = new BoundedTelemetryQueue.Writer {
-        override def record(line: String): Unit = { entered.countDown(); release.await(); () }
+        override def record(line: String): Unit    = { entered.countDown(); release.await(); () }
         override def manifest(value: String): Unit = ()
       }
       val conf = new Configuration(false)
       conf.set("openivm.test.marker", "copied")
       val q = new BoundedTelemetryQueue(
-        1, 100, writer, Some(BoundedTelemetryQueue.Destination("file:/queue-sink", conf)),
+        1,
+        100,
+        writer,
+        Some(BoundedTelemetryQueue.Destination("file:/queue-sink", conf)),
         Seq(writer -> BoundedTelemetryQueue.Destination("abfss://fs@account/queue-sink", conf))
       )
       val before = BoundedTelemetryRuntime.withSinkTopology((epoch: Long) => epoch)
@@ -172,16 +178,19 @@ class BoundedTelemetryQueueSpec extends AnyFunSpec with Matchers {
     it("exports to both destinations independently and reports partial failures in the manifest") {
       var cloudManifest = ""
       val failedLocal = new BoundedTelemetryQueue.Writer {
-        override def record(line: String): Unit = throw new IllegalStateException("local unavailable")
+        override def record(line: String): Unit    = throw new IllegalStateException("local unavailable")
         override def manifest(value: String): Unit = throw new IllegalStateException("local unavailable")
       }
       val cloud = new BoundedTelemetryQueue.Writer {
-        override def record(line: String): Unit = ()
+        override def record(line: String): Unit    = ()
         override def manifest(value: String): Unit = { cloudManifest = value }
       }
       val conf = new Configuration(false)
       val q = new BoundedTelemetryQueue(
-        1, 100, failedLocal, Some(BoundedTelemetryQueue.Destination("file:/local", conf)),
+        1,
+        100,
+        failedLocal,
+        Some(BoundedTelemetryQueue.Destination("file:/local", conf)),
         Seq(cloud -> BoundedTelemetryQueue.Destination("abfss://fs@account/path", conf))
       )
       q.offer("{}") shouldBe true
@@ -224,16 +233,19 @@ class BoundedTelemetryQueueSpec extends AnyFunSpec with Matchers {
       }
       gauge("configuration_failures") shouldBe before + 1L
       val local = new BoundedTelemetryQueue.Writer {
-        override def record(line: String): Unit = ()
+        override def record(line: String): Unit    = ()
         override def manifest(value: String): Unit = ()
       }
       val cloud = new BoundedTelemetryQueue.Writer {
-        override def record(line: String): Unit = throw new IllegalStateException("unavailable")
+        override def record(line: String): Unit    = throw new IllegalStateException("unavailable")
         override def manifest(value: String): Unit = ()
       }
       val conf = new Configuration(false)
       val q = new BoundedTelemetryQueue(
-        1, 100, local, Some(BoundedTelemetryQueue.Destination("file:/local", conf)),
+        1,
+        100,
+        local,
+        Some(BoundedTelemetryQueue.Destination("file:/local", conf)),
         Seq(cloud -> BoundedTelemetryQueue.Destination("abfss://fs@account/path", conf))
       )
       BoundedTelemetryRuntime.startWith(Some(q))

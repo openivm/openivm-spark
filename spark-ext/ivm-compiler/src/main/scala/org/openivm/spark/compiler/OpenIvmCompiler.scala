@@ -736,8 +736,8 @@ class OpenIvmCompiler private (
       pb.command().add("trace-v1")
       pb.redirectOutput(ProcessBuilder.Redirect.PIPE)
     }
-    val process = trace.time("helper_start", attempt) { pb.start() }
-    var interrupted = false
+    val process          = trace.time("helper_start", attempt) { pb.start() }
+    var interrupted      = false
     var workerReportRead = false
     try {
       lifecycle.acknowledgeHelper(process.toHandle())

@@ -15,12 +15,12 @@ import org.scalatest.matchers.should.Matchers
 import scala.jdk.CollectionConverters._
 
 private[rocksdb] object CdfFinalizationCrashProbe {
-  private val base = "default.cdf_gap_source"
-  private val mv = "default.cdf_gap_mv"
+  private val base  = "default.cdf_gap_source"
+  private val mv    = "default.cdf_gap_mv"
   private val query = s"SELECT k, COUNT(*) AS n FROM $base GROUP BY k"
 
   def main(args: Array[String]): Unit = {
-    val root = Paths.get(args(0))
+    val root  = Paths.get(args(0))
     val phase = args(1)
     if (phase == "classpath") {
       Seq(
@@ -55,11 +55,11 @@ private[rocksdb] object CdfFinalizationCrashProbe {
       .config(FeatureGate.GcEnabledKey, "false")
       .getOrCreate()
 
-    def sql(text: String): Unit = { spark.sql(text).collect(); () }
+    def sql(text: String): Unit      = { spark.sql(text).collect(); () }
     def version(table: String): Long = spark.sql(s"DESCRIBE HISTORY $table LIMIT 1").head().getLong(0)
     def metadata = MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)).get
     def parity(): Unit = {
-      val actual = spark.sql(s"SELECT k, n FROM $mv")
+      val actual   = spark.sql(s"SELECT k, n FROM $mv")
       val expected = spark.sql(query)
       require(actual.exceptAll(expected).count() == 0L && expected.exceptAll(actual).count() == 0L)
     }
@@ -74,8 +74,8 @@ private[rocksdb] object CdfFinalizationCrashProbe {
       (log, rows)
     }
     def lines(path: Path): Vector[String] = Files.readAllLines(path, UTF_8).asScala.toVector
-    val receipt = root.resolve("before-crash")
-    val marker = root.resolve("in-watermark-put")
+    val receipt                           = root.resolve("before-crash")
+    val marker                            = root.resolve("in-watermark-put")
     try {
       if (phase == "crash") {
         sql(s"CREATE TABLE $base(k INT) USING DELTA TBLPROPERTIES ('delta.enableChangeDataFeed'='true')")
@@ -87,7 +87,7 @@ private[rocksdb] object CdfFinalizationCrashProbe {
         parity()
         val source = metadata.sourceTables match {
           case Seq(single) => single
-          case other => sys.error(s"Expected one source, got $other")
+          case other       => sys.error(s"Expected one source, got $other")
         }
         val beforeOffset = CdfWatermarkCatalog.get(spark, mv, source).get
         require(beforeOffset == version(base))
@@ -123,8 +123,11 @@ private[rocksdb] object CdfFinalizationCrashProbe {
               row.durationMs >= 0L && sql.contains("MERGE INTO") && sql.contains("CDF_GAP_MV")
             }
             val full = rows.filter(_.category == "full_refresh_stmt")
-            val witness = Seq(s"refresh_id=${log.refreshId}", s"incremental_merges=${merge.size}",
-              s"full_refresh_statements=${full.size}") ++
+            val witness = Seq(
+              s"refresh_id=${log.refreshId}",
+              s"incremental_merges=${merge.size}",
+              s"full_refresh_statements=${full.size}"
+            ) ++
               rows.map(row => s"${row.category} | ${row.stmtKind} | ${row.durationMs} | ${row.sqlText}") ++
               stack.map(_.toString)
             Files.write(marker, witness.asJava, UTF_8)
@@ -138,11 +141,11 @@ private[rocksdb] object CdfFinalizationCrashProbe {
         val saved = lines(receipt)
         require(Files.isRegularFile(marker), "the exact finalization hook was not reached")
         require(saved(0).toLong != ProcessHandle.current().pid())
-        val source = saved(1)
-        val oldOffset = saved(2).toLong
+        val source        = saved(1)
+        val oldOffset     = saved(2).toLong
         val pendingOffset = saved(3).toLong
-        val oldMv = saved(4).toLong
-        val liveMv = version(mv)
+        val oldMv         = saved(4).toLong
+        val liveMv        = version(mv)
         require(liveMv > oldMv, "refresh did not commit MV data before the crash")
         require(metadata.refreshType != RefreshTypeCode.FullRefresh)
         require(metadata.lastVersion == liveMv, "catalog advance was not durable after the crash")

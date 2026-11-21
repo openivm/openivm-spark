@@ -22,12 +22,12 @@ import scala.util.control.NonFatal
 private[openivm] object OpenIvmStateBarrier {
   private val telemetryLog = org.slf4j.LoggerFactory.getLogger(getClass)
   private final class RootState {
-    val lock: ReentrantReadWriteLock   = new ReentrantReadWriteLock(true)
-    val mutationGeneration: AtomicLong = new AtomicLong(0L)
-    @volatile var trackingEnabled      = false
+    val lock: ReentrantReadWriteLock    = new ReentrantReadWriteLock(true)
+    val mutationGeneration: AtomicLong  = new AtomicLong(0L)
+    @volatile var trackingEnabled       = false
     @volatile var untrackedSinkObserved = false
-    private val mutationMonitor        = new Object
-    private var activeMutations        = 0
+    private val mutationMonitor         = new Object
+    private var activeMutations         = 0
 
     def beginMutation(): Unit = mutationMonitor.synchronized {
       activeMutations += 1
@@ -121,13 +121,13 @@ private[openivm] object OpenIvmStateBarrier {
       OpenIvmStateSync.maybeRestore(spark)
       val state = forRoot(root(spark))
       state.trackingEnabled = state.trackingEnabled || trackingEnabled(spark)
-      val lock = state.lock.readLock()
+      val lock             = state.lock.readLock()
       val requestedEpochMs = System.currentTimeMillis()
-      val requestedNs = System.nanoTime()
+      val requestedNs      = System.nanoTime()
       lock.lock()
       val acquiredEpochMs = System.currentTimeMillis()
-      val acquiredNs = System.nanoTime()
-      var succeeded = false
+      val acquiredNs      = System.nanoTime()
+      var succeeded       = false
       try {
         val result = withMutationTracking(state)(body)
         succeeded = true
@@ -270,14 +270,15 @@ private[openivm] object OpenIvmStateBarrier {
     forRoot(stateRoot).untrackedSinkObserved
 
   private[rocksdb] def observeTelemetrySinks(spark: SparkSession, stateRoot: NioPath): Unit = {
-    val disjoint = try {
-      val sinks = Seq(FeatureGate.telemetryUri(spark), FeatureGate.oneLakeTelemetryDir(spark)).flatten
-      val spanSinksDisjoint = sinks.isEmpty || {
-        val conf = spark.sessionState.newHadoopConf()
-        sinks.forall(telemetrySinkDisjoint(_, conf, stateRoot))
-      }
-      spanSinksDisjoint && queueSinkDisjoint(spark, stateRoot)
-    } catch { case NonFatal(_) => false }
+    val disjoint =
+      try {
+        val sinks = Seq(FeatureGate.telemetryUri(spark), FeatureGate.oneLakeTelemetryDir(spark)).flatten
+        val spanSinksDisjoint = sinks.isEmpty || {
+          val conf = spark.sessionState.newHadoopConf()
+          sinks.forall(telemetrySinkDisjoint(_, conf, stateRoot))
+        }
+        spanSinksDisjoint && queueSinkDisjoint(spark, stateRoot)
+      } catch { case NonFatal(_) => false }
     if (!disjoint) markUntrackedSink(stateRoot)
     observeRuntimeTelemetrySinks(stateRoot)
   }
@@ -289,19 +290,20 @@ private[openivm] object OpenIvmStateBarrier {
   private def queueSinkDisjoint(spark: SparkSession, stateRoot: NioPath): Boolean = {
     // The plugin reads driver SparkConf and driver Hadoop configuration, not the SQL session overrides.
     val sc = spark.sparkContext
-    BoundedTelemetryQueue.configuredDestinationUris(sc.getConf)
+    BoundedTelemetryQueue
+      .configuredDestinationUris(sc.getConf)
       .forall(telemetrySinkDisjoint(_, sc.hadoopConfiguration, stateRoot))
   }
 
   private[spark] def telemetrySinkDisjoint(value: String, conf: Configuration, stateRoot: NioPath): Boolean =
     try {
       val path = new Path(value)
-      val uri = path.toUri
+      val uri  = path.toUri
       // Do not guess what a relative/default-FS path or a custom filesystem maps to.
       if (!path.isAbsolute || uri.getScheme == null || uri.getFragment != null || uri.getQuery != null) false
       else {
         val scheme = uri.getScheme.toLowerCase(java.util.Locale.ROOT)
-        val impl = FileSystem.getFileSystemClass(scheme, conf)
+        val impl   = FileSystem.getFileSystemClass(scheme, conf)
         scheme match {
           case "file" if impl == classOf[LocalFileSystem] || impl == classOf[RawLocalFileSystem] =>
             if (uri.getAuthority != null) false

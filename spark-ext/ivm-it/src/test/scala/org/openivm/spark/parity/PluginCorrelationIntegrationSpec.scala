@@ -19,20 +19,20 @@ class PluginCorrelationIntegrationSpec
     extends IvmParitySpecBase("plugin-correlation")
     with InterceptMode
     with Eventually {
-  private val suffix = UUID.randomUUID().toString.take(8)
+  private val suffix   = UUID.randomUUID().toString.take(8)
   private val queueDir = new File(s"target/plugin-correlation-queue-$suffix").getAbsoluteFile
-  private val syncDir = new File(s"target/plugin-correlation-sync-$suffix").getAbsoluteFile
-  private val mapper = new ObjectMapper()
+  private val syncDir  = new File(s"target/plugin-correlation-sync-$suffix").getAbsoluteFile
+  private val mapper   = new ObjectMapper()
 
   override implicit val patienceConfig: PatienceConfig = PatienceConfig(Span(60, Seconds), Span(1, Seconds))
 
   override protected def extraSparkConf: Map[String, String] = Map(
-    "spark.plugins" -> "org.openivm.spark.plugin.metrics.OpenIvmMetricsPlugin",
-    BoundedTelemetryQueue.EnabledKey -> "false",
-    FeatureGate.StateSyncUriKey -> syncDir.toURI.toString,
-    FeatureGate.StateSyncAsyncEnabledKey -> "false",
-    FeatureGate.StateSyncCheckpointEnabledKey -> "true",
-    FeatureGate.ProfileRefreshKey -> "true",
+    "spark.plugins"                                  -> "org.openivm.spark.plugin.metrics.OpenIvmMetricsPlugin",
+    BoundedTelemetryQueue.EnabledKey                 -> "false",
+    FeatureGate.StateSyncUriKey                      -> syncDir.toURI.toString,
+    FeatureGate.StateSyncAsyncEnabledKey             -> "false",
+    FeatureGate.StateSyncCheckpointEnabledKey        -> "true",
+    FeatureGate.ProfileRefreshKey                    -> "true",
     FeatureGate.CompileClassificationCacheEnabledKey -> "false"
   )
 
@@ -67,12 +67,13 @@ class PluginCorrelationIntegrationSpec
         StandardOpenOption.CREATE_NEW,
         StandardOpenOption.WRITE
       )
-      try files.foreach { file =>
-        Files.readAllLines(file.toPath, StandardCharsets.UTF_8).asScala.foreach { line =>
-          writer.write(line)
-          writer.newLine()
+      try
+        files.foreach { file =>
+          Files.readAllLines(file.toPath, StandardCharsets.UTF_8).asScala.foreach { line =>
+            writer.write(line)
+            writer.newLine()
+          }
         }
-      }
       finally writer.close()
     }
 
@@ -93,9 +94,9 @@ class PluginCorrelationIntegrationSpec
     sql(s"DELETE FROM $source WHERE id = 2")
     spark.sparkContext.setLocalProperty("openivm.request_id", request)
     refreshMv(view)
-    val outcomes = RefreshProfileCatalog.scanAll(spark).filter(row =>
-      row.viewName.split("\\.").last == view && row.stepName == "total_refresh"
-    )
+    val outcomes = RefreshProfileCatalog
+      .scanAll(spark)
+      .filter(row => row.viewName.split("\\.").last == view && row.stepName == "total_refresh")
     outcomes should have size 1
     outcomes.head.detail should include("outcome=incremental_executed")
     assertMvCorrect(view, s"SELECT name, age FROM $source")
@@ -107,11 +108,13 @@ class PluginCorrelationIntegrationSpec
     val baseline = runRefresh("plugcorr_off_src", "plugcorr_off_mv", "plugcorr-off")
     BoundedTelemetryRuntime.health shouldBe None
     OpenIvmRocksDBRegistry.closeAll()
-    restartSpark(extraSparkConf ++ Map(
-      BoundedTelemetryQueue.EnabledKey -> "true",
-      BoundedTelemetryQueue.LocalUriKey -> queueDir.toURI.toString,
-      BoundedTelemetryQueue.CapacityKey -> "65536"
-    ))
+    restartSpark(
+      extraSparkConf ++ Map(
+        BoundedTelemetryQueue.EnabledKey  -> "true",
+        BoundedTelemetryQueue.LocalUriKey -> queueDir.toURI.toString,
+        BoundedTelemetryQueue.CapacityKey -> "65536"
+      )
+    )
     val observed = runRefresh("plugcorr_on_src", "plugcorr_on_mv", "plugcorr-on")
     observed shouldBe baseline
 
@@ -132,17 +135,23 @@ class PluginCorrelationIntegrationSpec
         node.has("exclusive_ns") shouldBe false
         node.path("inclusive_ns").asLong(-1L) should be >= 0L
       }
-      val compiler = events.filter(n => text(n, "record_type") == "compiler_phase" &&
-        text(n, "operation_id") == refreshId)
+      val compiler = events.filter(n =>
+        text(n, "record_type") == "compiler_phase" &&
+          text(n, "operation_id") == refreshId
+      )
       compiler should not be empty
       compiler.foreach(n => text(n, "request_id") shouldBe "plugcorr-on")
-      val createPhases = events.filter(n => text(n, "event_type") == "phase" &&
-        text(n, "request_id") == "plugcorr-on-create" && text(n, "operation") == "create")
+      val createPhases = events.filter(n =>
+        text(n, "event_type") == "phase" &&
+          text(n, "request_id") == "plugcorr-on-create" && text(n, "operation") == "create"
+      )
       createPhases should not be empty
       val createIds = createPhases.map(n => text(n, "refresh_id")).filter(_.nonEmpty).distinct
       createIds should have size 1
-      events.exists(n => text(n, "record_type") == "compiler_phase" &&
-        text(n, "operation_id") == createIds.head && text(n, "request_id") == "plugcorr-on-create") shouldBe true
+      events.exists(n =>
+        text(n, "record_type") == "compiler_phase" &&
+          text(n, "operation_id") == createIds.head && text(n, "request_id") == "plugcorr-on-create"
+      ) shouldBe true
       val starts = events.filter(n => text(n, "event_type") == "spark_job_start").filter { node =>
         val action = mapper.readTree(text(node, "action_context"))
         text(action, "action").startsWith(s"$refreshId/") && Set("sql", "collect").contains(text(action, "boundary"))
@@ -157,21 +166,25 @@ class PluginCorrelationIntegrationSpec
       val endedIds = events.filter(n => text(n, "event_type") == "spark_job_end").map(_.path("job_id").asInt()).toSet
       starts.exists(n => endedIds.contains(n.path("job_id").asInt())) shouldBe true
       val stageIds = starts.flatMap(_.path("stage_ids").elements().asScala.map(_.asInt())).toSet
-      val completedStages = events.filter(n => text(n, "event_type") == "spark_stage_completed")
-        .map(_.path("stage_id").asInt()).toSet
+      val completedStages = events
+        .filter(n => text(n, "event_type") == "spark_stage_completed")
+        .map(_.path("stage_id").asInt())
+        .toSet
       stageIds.intersect(completedStages) should not be empty
-      val spans = events.filter(n => text(n, "request_id") == "plugcorr-on" &&
-        text(n, "operation") == "refresh" && text(n, "outcome") == "incremental_executed")
+      val spans = events.filter(n =>
+        text(n, "request_id") == "plugcorr-on" &&
+          text(n, "operation") == "refresh" && text(n, "outcome") == "incremental_executed"
+      )
       spans should not be empty
       spans.exists(n => text(n, "effective_refresh_type") == "SIMPLE_PROJECTION") shouldBe true
       val requests = spans.flatMap(n => n.path("state_sync").path("requests").elements().asScala)
       requests.exists { n =>
         val acknowledged = text(n, "acknowledged_snapshot_generation_id").nonEmpty
-        val publication = n.path("published").asBoolean()
-        val reused = n.path("reused").asBoolean() && n.path("coverage_proven").asBoolean()
+        val publication  = n.path("published").asBoolean()
+        val reused       = n.path("reused").asBoolean() && n.path("coverage_proven").asBoolean()
         text(n, "parent_request_id") == "plugcorr-on" && text(n, "parent_operation_id") == refreshId &&
-          text(n, "effective_state_sync_mode") == "synchronous" && text(n, "status") == "success" &&
-          acknowledged && (publication || reused)
+        text(n, "effective_state_sync_mode") == "synchronous" && text(n, "status") == "success" &&
+        acknowledged && (publication || reused)
       } shouldBe true
       val health = BoundedTelemetryRuntime.health.getOrElse(fail("plugin queue not started"))
       health.accepted shouldBe health.published

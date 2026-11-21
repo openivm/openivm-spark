@@ -661,7 +661,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         "checkpoint-cancelled-candidate-waiter",
         remote,
         Seq(
-          FeatureGate.StatePathKey -> stateRoot.getAbsolutePath,
+          FeatureGate.StatePathKey      -> stateRoot.getAbsolutePath,
           FeatureGate.ProfileRefreshKey -> "true"
         )
       )
@@ -818,17 +818,27 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         val publications = evidence.asScala.toVector.flatMap(_.publications)
         publications.map(_.status) shouldBe Seq("success", "failed", "success")
         publications.map(_.snapshotGenerationId) shouldBe Seq(Some(firstCommit._1), None, Some(secondCommit._1))
-        publications.map(_.requestedMutationGeneration) shouldBe Seq(Some(firstMutation), Some(secondMutation), Some(secondMutation))
+        publications.map(_.requestedMutationGeneration) shouldBe Seq(
+          Some(firstMutation),
+          Some(secondMutation),
+          Some(secondMutation)
+        )
         publications.map(_.capturedMutationGeneration) shouldBe publications.map(_.requestedMutationGeneration)
         publications.map(_.publishedMutationGeneration) shouldBe Seq(Some(firstMutation), None, Some(secondMutation))
         publications(1).phases.find(_.operation == "spark.backup.commit").map(_.status) shouldBe Some("failed")
 
         val requests = evidence.asScala.toVector.flatMap(_.requests)
         requests.map(_.outcome.get) shouldBe Seq(
-          "published_covered_generation", "reused_committed_coverage", "publication_failed", "published_covered_generation"
+          "published_covered_generation",
+          "reused_committed_coverage",
+          "publication_failed",
+          "published_covered_generation"
         )
         requests.map(_.acknowledgedSnapshotGenerationId) shouldBe Seq(
-          Some(firstCommit._1), Some(firstCommit._1), None, Some(secondCommit._1)
+          Some(firstCommit._1),
+          Some(firstCommit._1),
+          None,
+          Some(secondCommit._1)
         )
         requests(1).publicationId shouldBe publications.head.publicationId
         requests(1).reused shouldBe true
@@ -852,14 +862,14 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
 
     it("binds concurrent traced waiters to the one real coalesced publication covering both generations") {
       implicit val executionContext: scala.concurrent.ExecutionContext = scala.concurrent.ExecutionContext.global
-      val fixture = newDir("traced-coalescing")
-      val remote = new File(fixture, "remote")
-      val state = new File(fixture, "state")
-      val spark = newSpark("traced-coalescing", remote, Seq(FeatureGate.StatePathKey -> state.getAbsolutePath))
-      val evidence = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
-      val firstCopy = new CountDownLatch(1)
+      val fixture                                                      = newDir("traced-coalescing")
+      val remote                                                       = new File(fixture, "remote")
+      val state                                                        = new File(fixture, "state")
+      val spark       = newSpark("traced-coalescing", remote, Seq(FeatureGate.StatePathKey -> state.getAbsolutePath))
+      val evidence    = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
+      val firstCopy   = new CountDownLatch(1)
       val releaseCopy = new CountDownLatch(1)
-      val blocked = new AtomicBoolean(false)
+      val blocked     = new AtomicBoolean(false)
       OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => { evidence.add(value); () })
       OpenIvmStateSync.setBeforeLocalFileCopyHookForTesting(_ => {
         if (blocked.compareAndSet(false, true)) {
@@ -893,7 +903,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         releaseCopy.countDown()
         pending.foreach(future => Await.result(future, 60.seconds))
 
-        val records = evidence.asScala.toVector
+        val records      = evidence.asScala.toVector
         val publications = records.flatMap(_.publications)
         publications.size shouldBe 2
         val coalesced = publications.find(_.requestedRequests == 2).get
@@ -940,7 +950,11 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       OpenIvmStateBarrier.telemetrySinkDisjoint(fixtureRoot.toURI.toString, conf, root) shouldBe false
       Files.createSymbolicLink(alias.toPath, root)
       try {
-        OpenIvmStateBarrier.telemetrySinkDisjoint(new File(alias, "future/receipts").toURI.toString, conf, root) shouldBe false
+        OpenIvmStateBarrier.telemetrySinkDisjoint(
+          new File(alias, "future/receipts").toURI.toString,
+          conf,
+          root
+        ) shouldBe false
       } finally Files.delete(alias.toPath)
       OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe false
 
@@ -964,17 +978,17 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
     it("accounts for independent queue writes without a span, profile, or synchronous sink") {
       Seq("disabled", "disjoint", "overlap", "unknown", "missing", "dual-unknown").foreach { arm =>
         val fixture = newDir(s"queue-sink-$arm")
-        val remote = new File(fixture, "remote")
-        val state = new File(fixture, "state")
-        val sink = if (arm == "disjoint") new File(fixture, "sink") else new File(state, "_openivm/queue")
+        val remote  = new File(fixture, "remote")
+        val state   = new File(fixture, "state")
+        val sink    = if (arm == "disjoint") new File(fixture, "sink") else new File(state, "_openivm/queue")
         val destinations = arm match {
           case "unknown" => Seq(BoundedTelemetryQueue.UriKey -> "file:relative/queue")
           case "missing" => Seq.empty
           case "dual-unknown" =>
             Seq(
-              BoundedTelemetryQueue.LocalUriKey -> new File(fixture, "sink").toURI.toString,
+              BoundedTelemetryQueue.LocalUriKey   -> new File(fixture, "sink").toURI.toString,
               BoundedTelemetryQueue.OneLakeUriKey -> "abfss://workspace@onelake.example/Files/telemetry",
-              "spark.hadoop.fs.abfss.impl" -> classOf[org.apache.hadoop.fs.LocalFileSystem].getName
+              "spark.hadoop.fs.abfss.impl"        -> classOf[org.apache.hadoop.fs.LocalFileSystem].getName
             )
           case _ => Seq(BoundedTelemetryQueue.UriKey -> sink.toURI.toString)
         }
@@ -982,7 +996,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
           s"checkpoint-queue-$arm",
           remote,
           Seq(
-            FeatureGate.StatePathKey -> state.getAbsolutePath,
+            FeatureGate.StatePathKey         -> state.getAbsolutePath,
             BoundedTelemetryQueue.EnabledKey -> (arm != "disabled").toString
           ) ++ destinations
         )
@@ -1005,7 +1019,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
             OpenIvmStateBarrier.currentMutationGeneration(spark) shouldBe generation
           }
           if (arm == "overlap" || arm == "disjoint") {
-            val sc = spark.sparkContext
+            val sc    = spark.sparkContext
             val queue = BoundedTelemetryQueue.configured(sc.getConf, sc.hadoopConfiguration).get
             try queue.offer("""{"checkpoint_queue_canary":true}""") shouldBe true
             finally queue.shutdown(5000L) shouldBe true
@@ -1021,12 +1035,13 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
           }
           if (arm == "overlap") {
             val archive = new File(remote, s".openivm-state-sync/snapshots/${second._1}/snapshot.zip")
-            val zip = new java.util.zip.ZipFile(archive)
+            val zip     = new java.util.zip.ZipFile(archive)
             try {
               Option(zip.getEntry("queue-canary-state")) should not be empty
-              zip.entries().asScala.exists(entry =>
-                entry.getName.startsWith("queue/") && entry.getName.endsWith(".jsonl")
-              ) shouldBe true
+              zip
+                .entries()
+                .asScala
+                .exists(entry => entry.getName.startsWith("queue/") && entry.getName.endsWith(".jsonl")) shouldBe true
             } finally zip.close()
           }
         } finally stopSpark(spark)
@@ -1035,19 +1050,19 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
 
     it("exports actual publish and reuse evidence in queue-only mode without changing the checkpoint path") {
       val fixture = newDir("queue-only-evidence")
-      val remote = new File(fixture, "remote")
-      val state = new File(fixture, "state")
-      val sink = new File(fixture, "sink")
+      val remote  = new File(fixture, "remote")
+      val state   = new File(fixture, "state")
+      val sink    = new File(fixture, "sink")
       val spark = newSpark(
         "checkpoint-queue-only-evidence",
         remote,
         Seq(
-          FeatureGate.StatePathKey -> state.getAbsolutePath,
+          FeatureGate.StatePathKey         -> state.getAbsolutePath,
           BoundedTelemetryQueue.EnabledKey -> "true",
-          BoundedTelemetryQueue.UriKey -> sink.toURI.toString
+          BoundedTelemetryQueue.UriKey     -> sink.toURI.toString
         )
       )
-      val sc = spark.sparkContext
+      val sc    = spark.sparkContext
       val queue = BoundedTelemetryRuntime.start(sc.getConf, sc.hadoopConfiguration).get
       try {
         OpenIvmExecutionSpan.captureCurrent() shouldBe None
@@ -1066,17 +1081,24 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       val generations = committedGenerations(spark, remote.toURI.toString)
       generations should have size 1
       val generation = generations.head
-      val json = new com.fasterxml.jackson.databind.ObjectMapper()
-      val files = Files.list(sink.toPath)
-      val evidence = try files.iterator().asScala
-        .filter(_.getFileName.toString.endsWith(".jsonl"))
-        .map(path => json.readTree(path.toFile).path("state_sync"))
-        .toVector
-      finally files.close()
+      val json       = new com.fasterxml.jackson.databind.ObjectMapper()
+      val files      = Files.list(sink.toPath)
+      val evidence =
+        try
+          files
+            .iterator()
+            .asScala
+            .filter(_.getFileName.toString.endsWith(".jsonl"))
+            .map(path => json.readTree(path.toFile).path("state_sync"))
+            .toVector
+        finally files.close()
       val requests = evidence.flatMap(_.path("requests").elements().asScala)
       requests should have size 2
       requests.map(_.path("parent_operation_id").asText()).distinct shouldBe Seq("refresh-evidence")
-      requests.map(_.path("outcome").asText()).toSet shouldBe Set("published_covered_generation", "reused_committed_coverage")
+      requests.map(_.path("outcome").asText()).toSet shouldBe Set(
+        "published_covered_generation",
+        "reused_committed_coverage"
+      )
       requests.map(_.path("acknowledged_snapshot_generation_id").asText()).distinct shouldBe Seq(generation)
       val publications = evidence.flatMap(_.path("publications").elements().asScala)
       publications.map(_.path("snapshot_generation_id").asText()) shouldBe Seq(generation)
@@ -1085,13 +1107,13 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
 
     it("invalidates cached coverage when a runtime queue writes and exits between checkpoint requests") {
       val fixture = newDir("queue-topology")
-      val remote = new File(fixture, "remote")
-      val state = new File(fixture, "state")
+      val remote  = new File(fixture, "remote")
+      val state   = new File(fixture, "state")
       val spark = newSpark("checkpoint-queue-topology", remote, Seq(FeatureGate.StatePathKey -> state.getAbsolutePath))
       recordProfile(spark, "queue-topology")
       OpenIvmStateSync.backupNow(spark)
       val first = commitDetails(spark, remote.toURI.toString)
-      val sc = spark.sparkContext
+      val sc    = spark.sparkContext
       val config = sc.getConf
         .set(BoundedTelemetryQueue.EnabledKey, "true")
         .set(BoundedTelemetryQueue.UriKey, new File(state, "_openivm/queue").toURI.toString)
@@ -1104,8 +1126,12 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       val second = commitDetails(spark, remote.toURI.toString)
       second._1 should not be first._1
       val archive = new File(remote, s".openivm-state-sync/snapshots/${second._1}/snapshot.zip")
-      val zip = new java.util.zip.ZipFile(archive)
-      try zip.entries().asScala.exists(entry => entry.getName.startsWith("queue/") && entry.getName.endsWith(".jsonl")) shouldBe true
+      val zip     = new java.util.zip.ZipFile(archive)
+      try
+        zip
+          .entries()
+          .asScala
+          .exists(entry => entry.getName.startsWith("queue/") && entry.getName.endsWith(".jsonl")) shouldBe true
       finally zip.close()
     }
 

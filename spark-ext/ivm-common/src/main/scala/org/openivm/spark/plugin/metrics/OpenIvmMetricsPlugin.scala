@@ -44,7 +44,7 @@ object OpenIvmMetricsPlugin extends Logging {
 }
 
 class OpenIvmMetricsDriverPlugin extends DriverPlugin with Logging {
-  private var telemetryQueue: Option[BoundedTelemetryQueue] = None
+  private var telemetryQueue: Option[BoundedTelemetryQueue]             = None
   private var jobListener: Option[(SparkContext, TelemetryJobListener)] = None
 
   override def init(sc: SparkContext, ctx: PluginContext): java.util.Map[String, String] = {

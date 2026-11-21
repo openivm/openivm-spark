@@ -14,7 +14,7 @@ import scala.jdk.CollectionConverters._
 
 class TelemetryJobListenerSpec extends AnyFunSpec with Matchers {
   it("correlates shared stages to jobs and stops reporting after their last owner ends") {
-    val lines = ArrayBuffer.empty[String]
+    val lines    = ArrayBuffer.empty[String]
     val listener = new TelemetryJobListener(line => { lines += line; () })
     listener.recordJobStart(1, 100L, Seq(4, 5, 5), "refresh-1/action-1", Some("sql-1"))
     listener.recordJobStart(2, 110L, Seq(5), "refresh-2/action-1", None)
@@ -26,7 +26,7 @@ class TelemetryJobListenerSpec extends AnyFunSpec with Matchers {
 
     val mapper = new ObjectMapper()
     val events = lines.map(line => mapper.readTree(line))
-    val first = events.head
+    val first  = events.head
     first.get("action_context").asText() shouldBe "refresh-1/action-1"
     first.get("spark_sql_execution_id").asText() shouldBe "sql-1"
     first.get("stage_ids").size() shouldBe 2
@@ -38,7 +38,7 @@ class TelemetryJobListenerSpec extends AnyFunSpec with Matchers {
   }
 
   it("marks correlations truncated when a job exceeds the bounded stage limit") {
-    val lines = ArrayBuffer.empty[String]
+    val lines    = ArrayBuffer.empty[String]
     val listener = new TelemetryJobListener(line => { lines += line; () })
     listener.recordJobStart(1, 0L, 0 until 300, "refresh/action", None)
     val event = new ObjectMapper().readTree(lines.head)
@@ -67,14 +67,18 @@ class TelemetryJobListenerSpec extends AnyFunSpec with Matchers {
       BoundedTelemetryRuntime.health.get.published should be >= 3L
     } finally sc.stop()
     val stream = Files.list(root)
-    val paths = try stream.iterator().asScala.filter(_.toString.endsWith(".jsonl")).toVector finally stream.close()
+    val paths =
+      try stream.iterator().asScala.filter(_.toString.endsWith(".jsonl")).toVector
+      finally stream.close()
     val mapper = new ObjectMapper()
     val events = paths.flatMap(path => Files.readAllLines(path, UTF_8).asScala).map(line => mapper.readTree(line))
-    val start = events.find(_.get("event_type").asText() == "spark_job_start").get
+    val start  = events.find(_.get("event_type").asText() == "spark_job_start").get
     start.get("action_context").asText() shouldBe "refresh-1/action-1"
     val stage = events.find(_.get("event_type").asText() == "spark_stage_completed").get
-    start.get("stage_ids").elements().asScala.map(_.asInt()).toSeq should contain (stage.get("stage_id").asInt())
-    events.exists(e => e.get("event_type").asText() == "spark_job_end" &&
-      e.get("job_id").asInt() == start.get("job_id").asInt()) shouldBe true
+    start.get("stage_ids").elements().asScala.map(_.asInt()).toSeq should contain(stage.get("stage_id").asInt())
+    events.exists(e =>
+      e.get("event_type").asText() == "spark_job_end" &&
+        e.get("job_id").asInt() == start.get("job_id").asInt()
+    ) shouldBe true
   }
 }

@@ -40,16 +40,18 @@ final class RefreshProfile private (
     private val executionSpan: OpenIvmExecutionSpan
 ) {
 
-  private val stepOrder     = new AtomicInteger(0)
-  private val buffer        = scala.collection.mutable.ArrayBuffer.empty[RefreshProfileRow]
+  private val stepOrder = new AtomicInteger(0)
+  private val buffer    = scala.collection.mutable.ArrayBuffer.empty[RefreshProfileRow]
   private val phaseTimeline =
     if (spark != null && spark.sparkContext.getConf.getBoolean(BoundedTelemetryQueue.EnabledKey, false))
-      Some(new PhaseTimeline(
-        refreshId,
-        viewName,
-        if (mode == RefreshProfile.Mode.Create) "create" else "refresh",
-        requestId = OpenIvmInsightsBroker.currentRequestId(spark)
-      ))
+      Some(
+        new PhaseTimeline(
+          refreshId,
+          viewName,
+          if (mode == RefreshProfile.Mode.Create) "create" else "refresh",
+          requestId = OpenIvmInsightsBroker.currentRequestId(spark)
+        )
+      )
     else None
   private val previousTraceOperationId =
     if (phaseTimeline.nonEmpty)
@@ -72,11 +74,14 @@ final class RefreshProfile private (
     )
 
   private[commands] def activateTraceContext(): Unit =
-    phaseTimeline.foreach(_ => spark.sparkContext.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, refreshId))
+    phaseTimeline.foreach(_ =>
+      spark.sparkContext.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, refreshId)
+    )
 
   private[commands] def clearTraceContext(): Unit =
     phaseTimeline.foreach(_ =>
-      spark.sparkContext.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, previousTraceOperationId.orNull)
+      spark.sparkContext
+        .setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, previousTraceOperationId.orNull)
     )
 
   private[commands] def recordStateBarrier(

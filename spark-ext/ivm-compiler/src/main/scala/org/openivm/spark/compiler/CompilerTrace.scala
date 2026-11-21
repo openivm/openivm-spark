@@ -31,7 +31,7 @@ object CompileTraceDiagnostics {
     TimeUnit.MINUTES.toNanos(1)
   )
 
-  def failureCount: Long = reporter.failureCount
+  def failureCount: Long                      = reporter.failureCount
   private[compiler] def recordFailure(): Unit = reporter.recordFailure()
 }
 
@@ -40,7 +40,7 @@ private[compiler] final class CompileTraceFailureReporter(
     warn: String => Unit,
     intervalNanos: Long
 ) {
-  private val failures = new AtomicLong()
+  private val failures    = new AtomicLong()
   private val lastWarning = new AtomicReference[java.lang.Long]()
 
   def failureCount: Long = failures.get()
@@ -48,7 +48,7 @@ private[compiler] final class CompileTraceFailureReporter(
   def recordFailure(): Unit = {
     failures.incrementAndGet()
     try {
-      val now = clock()
+      val now      = clock()
       val previous = lastWarning.get()
       if ((previous eq null) || now - previous.longValue() >= intervalNanos) {
         if (lastWarning.compareAndSet(previous, java.lang.Long.valueOf(now)))
@@ -67,8 +67,8 @@ private[compiler] final class CompilerTrace(
 
   def time[A](phase: String, attempt: Int)(body: => A): A = {
     if (!enabled) return body
-    val utc = Instant.now().toString
-    val start = System.nanoTime()
+    val utc     = Instant.now().toString
+    val start   = System.nanoTime()
     var success = false
     try {
       val result = body
@@ -99,15 +99,19 @@ private[compiler] final class CompilerTrace(
   def workerOutput(bytes: Array[Byte], attempt: Int): Unit = {
     if (!enabled) return
     try {
-      val text = new String(bytes, StandardCharsets.UTF_8)
+      val text  = new String(bytes, StandardCharsets.UTF_8)
       val lines = text.split("\n", -1).toVector
-      require(lines.length >= 4 && lines.head == "openivm-compiler-trace-v1" &&
-        lines(lines.length - 2) == "end" && lines.last.isEmpty)
+      require(
+        lines.length >= 4 && lines.head == "openivm-compiler-trace-v1" &&
+          lines(lines.length - 2) == "end" && lines.last.isEmpty
+      )
       val entries = lines.slice(1, lines.length - 2).map { line =>
         val fields = line.split("\\|", -1)
-        require(fields.length == 4 && CompilerTrace.workerPhases.contains(fields(0)) &&
-          Set("success", "failed").contains(fields(3)))
-        val epochMs = fields(1).toLong
+        require(
+          fields.length == 4 && CompilerTrace.workerPhases.contains(fields(0)) &&
+            Set("success", "failed").contains(fields(3))
+        )
+        val epochMs  = fields(1).toLong
         val duration = fields(2).toLong
         require(duration >= 0L)
         (fields(0), Instant.ofEpochMilli(epochMs).toString, duration, fields(3))
@@ -122,25 +126,28 @@ private[compiler] final class CompilerTrace(
   private def record(phase: String, attempt: Int, utc: String, duration: Long, status: String, domain: String): Unit =
     try {
       context.filter(_.enabled).foreach { c =>
-        emit(OpenIvmInsightJson.obj(
-          "schema" -> "openivm.compiler-phase.v1",
-          "record_type" -> "compiler_phase",
-          "operation_id" -> c.operationId,
-          "request_id" -> c.requestId,
-          "materialized_view" -> c.materializedView,
-          "sql_execution_id" -> c.sqlExecutionId,
-          "phase" -> phase,
-          "attempt" -> attempt,
-          "start_utc" -> utc,
-          "duration_ns" -> math.max(0L, duration),
-          "status" -> status,
-          "clock_domain" -> domain
-        ))
+        emit(
+          OpenIvmInsightJson.obj(
+            "schema"            -> "openivm.compiler-phase.v1",
+            "record_type"       -> "compiler_phase",
+            "operation_id"      -> c.operationId,
+            "request_id"        -> c.requestId,
+            "materialized_view" -> c.materializedView,
+            "sql_execution_id"  -> c.sqlExecutionId,
+            "phase"             -> phase,
+            "attempt"           -> attempt,
+            "start_utc"         -> utc,
+            "duration_ns"       -> math.max(0L, duration),
+            "status"            -> status,
+            "clock_domain"      -> domain
+          )
+        )
       }
     } catch { case NonFatal(_) => failure() }
 }
 
 private[compiler] object CompilerTrace {
   val MaxWorkerBytes = 4096
-  val workerPhases: Set[String] = Set("worker_total", "native_launch", "native_lifecycle", "worker_output", "worker_cleanup")
+  val workerPhases: Set[String] =
+    Set("worker_total", "native_launch", "native_lifecycle", "worker_output", "worker_cleanup")
 }

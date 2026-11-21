@@ -66,8 +66,8 @@ object OpenIvmGarbageCollector {
       referenceCount: Long
   )
 
-  private val telemetryEmissionFailures = new AtomicLong()
-  private val defaultTelemetryOffer: String => Unit = BoundedTelemetryRuntime.offer _
+  private val telemetryEmissionFailures                = new AtomicLong()
+  private val defaultTelemetryOffer: String => Unit    = BoundedTelemetryRuntime.offer _
   @volatile private var telemetryOffer: String => Unit = defaultTelemetryOffer
 
   def telemetryEmissionFailureCount: Long = telemetryEmissionFailures.get()
@@ -163,10 +163,10 @@ object OpenIvmGarbageCollector {
           telemetry,
           summary.status,
           Seq(
-            "tombstone_count"         -> candidates.tombstoned.size.toLong,
-            "reference_count"         -> candidates.referenced.size.toLong,
+            "tombstone_count"          -> candidates.tombstoned.size.toLong,
+            "reference_count"          -> candidates.referenced.size.toLong,
             "tombstones_deleted_count" -> summary.tombstonesDeleted,
-            "orphan_sweep_scheduled"  -> summary.sweepScheduled
+            "orphan_sweep_scheduled"   -> summary.sweepScheduled
           )
         )
       }
@@ -177,7 +177,7 @@ object OpenIvmGarbageCollector {
       candidates: Plan,
       gcTelemetry: Option[GcTelemetryContext]
   ): CleanupSummary = {
-    var status             = "success"
+    var status            = "success"
     var tombstonesDeleted = 0L
     var sweepScheduled    = 0L
     try {
@@ -254,11 +254,11 @@ object OpenIvmGarbageCollector {
   }
 
   private def runSweep(sweep: Sweep): Unit = {
-    val telemetry = startTelemetry(sweep.gcTelemetry, "orphan_sweep")
-    var status            = "success"
-    var orphanCandidates  = 0L
-    var orphanDeleted     = 0L
-    var telemetryDeleted  = 0L
+    val telemetry        = startTelemetry(sweep.gcTelemetry, "orphan_sweep")
+    var status           = "success"
+    var orphanCandidates = 0L
+    var orphanDeleted    = 0L
+    var telemetryDeleted = 0L
     try {
       val fs             = sweep.warehouse.getFileSystem(sweep.hadoopConf)
       val protectedPaths = sweep.protectedPaths.map(path => qualify(fs, path))
@@ -296,11 +296,11 @@ object OpenIvmGarbageCollector {
         telemetry,
         status,
         Seq(
-          "tombstone_count"          -> sweep.tombstoneCount,
-          "reference_count"          -> sweep.referenceCount,
-          "orphan_candidates_count"  -> orphanCandidates,
-          "orphan_deleted_count"     -> orphanDeleted,
-          "telemetry_deleted_count"  -> telemetryDeleted
+          "tombstone_count"         -> sweep.tombstoneCount,
+          "reference_count"         -> sweep.referenceCount,
+          "orphan_candidates_count" -> orphanCandidates,
+          "orphan_deleted_count"    -> orphanDeleted,
+          "telemetry_deleted_count" -> telemetryDeleted
         )
       )
     }
@@ -325,8 +325,7 @@ object OpenIvmGarbageCollector {
       val operationId =
         try {
           Option(spark.sparkContext.getLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty)).filter(_.nonEmpty)
-        }
-        catch {
+        } catch {
           case NonFatal(_) =>
             recordTelemetryFailure()
             None
@@ -339,16 +338,16 @@ object OpenIvmGarbageCollector {
     span.foreach { value =>
       try {
         val fields = Seq[(String, Any)](
-          "event_type"             -> "openivm_gc",
-          "clock_domain_id"        -> MonotonicClockDomain.id,
-          "scope"                  -> "garbage_collection",
-          "phase"                  -> value.phase,
-          "operation_id"           -> value.context.operationId.orNull,
-          "context_status"         -> value.context.contextStatus,
-          "status"                 -> status,
-          "start_utc"              -> value.startUtc,
-          "start_monotonic_ns"     -> value.startMonotonicNs,
-          "inclusive_duration_ns"  -> (System.nanoTime() - value.startMonotonicNs)
+          "event_type"            -> "openivm_gc",
+          "clock_domain_id"       -> MonotonicClockDomain.id,
+          "scope"                 -> "garbage_collection",
+          "phase"                 -> value.phase,
+          "operation_id"          -> value.context.operationId.orNull,
+          "context_status"        -> value.context.contextStatus,
+          "status"                -> status,
+          "start_utc"             -> value.startUtc,
+          "start_monotonic_ns"    -> value.startMonotonicNs,
+          "inclusive_duration_ns" -> (System.nanoTime() - value.startMonotonicNs)
         ) ++ counts
         telemetryOffer(OpenIvmInsightJson.obj(fields: _*))
       } catch {

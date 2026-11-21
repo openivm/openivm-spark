@@ -1363,22 +1363,24 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       Seq(false, true).foreach { export =>
         val suffix = if (export) "traced" else "plain"
         val source = s"sales_t1_lock_$suffix"
-        val view = s"mv_t1_lock_$suffix"
+        val view   = s"mv_t1_lock_$suffix"
         spark.sql(s"CREATE TABLE $source(id INT) USING DELTA").collect()
         spark.sql(s"INSERT INTO $source VALUES (1)").collect()
-        val backupEntered = new CountDownLatch(1)
-        val releaseBackup = new CountDownLatch(1)
-        val publicationThread = new AtomicReference[Thread]()
+        val backupEntered      = new CountDownLatch(1)
+        val releaseBackup      = new CountDownLatch(1)
+        val publicationThread  = new AtomicReference[Thread]()
         val publicationEntered = new CountDownLatch(1)
-        val activeExport = new AtomicBoolean(false)
-        val telemetryRoot = new Path(new File(warehouseDir, s"telemetry-lock-$suffix").toURI)
+        val activeExport       = new AtomicBoolean(false)
+        val telemetryRoot      = new Path(new File(warehouseDir, s"telemetry-lock-$suffix").toURI)
         val conf = Seq(FeatureGate.StateSyncAsyncEnabledKey -> "false") ++
-          (if (export) Seq(
-            FeatureGate.TelemetryUriKey -> telemetryRoot.toString,
-            FeatureGate.TelemetryCampaignIdKey -> "create-lock-parity",
-            FeatureGate.TelemetryCorrelationIdKey -> s"correlation-$suffix",
-            FeatureGate.TelemetryPhaseKey -> "full"
-          ) else Seq.empty)
+          (if (export)
+             Seq(
+               FeatureGate.TelemetryUriKey           -> telemetryRoot.toString,
+               FeatureGate.TelemetryCampaignIdKey    -> "create-lock-parity",
+               FeatureGate.TelemetryCorrelationIdKey -> s"correlation-$suffix",
+               FeatureGate.TelemetryPhaseKey         -> "full"
+             )
+           else Seq.empty)
         withSparkConfs(conf: _*) {
           OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(s"file:/state-sync-create-lock-$suffix"))
           OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
@@ -2256,18 +2258,23 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       spark.sql("CREATE TABLE src_t5ac_parity(id INT) USING DELTA").collect()
       spark.sql("INSERT INTO src_t5ac_parity VALUES (1)").collect()
       val version = DeltaTableVersion.requireLatest(spark, "src_t5ac_parity")
-      spark.sql(
-        s"CREATE MATERIALIZED VIEW mv_t5ac_parity AS SELECT id FROM src_t5ac_parity VERSION AS OF $version"
-      ).collect()
+      spark
+        .sql(
+          s"CREATE MATERIALIZED VIEW mv_t5ac_parity AS SELECT id FROM src_t5ac_parity VERSION AS OF $version"
+        )
+        .collect()
       Seq(false, true).foreach { export =>
-        val suffix = if (export) "traced" else "plain"
+        val suffix        = if (export) "traced" else "plain"
         val telemetryRoot = new Path(new File(warehouseDir, s"telemetry-advance-parity-$suffix").toURI)
-        val conf = if (export) Seq(
-          FeatureGate.TelemetryUriKey -> telemetryRoot.toString,
-          FeatureGate.TelemetryCampaignIdKey -> "advance-parity",
-          FeatureGate.TelemetryCorrelationIdKey -> s"advance-$suffix",
-          FeatureGate.TelemetryPhaseKey -> "source_refresh_staging"
-        ) else Seq.empty
+        val conf =
+          if (export)
+            Seq(
+              FeatureGate.TelemetryUriKey           -> telemetryRoot.toString,
+              FeatureGate.TelemetryCampaignIdKey    -> "advance-parity",
+              FeatureGate.TelemetryCorrelationIdKey -> s"advance-$suffix",
+              FeatureGate.TelemetryPhaseKey         -> "source_refresh_staging"
+            )
+          else Seq.empty
         withSparkConfs(conf: _*) {
           withSparkLocalProperties(
             OpenIvmTelemetryContract.RequestIdProperty -> s"advance-parity-$suffix",
@@ -2275,14 +2282,20 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
           ) {
             val failure = intercept[Exception] {
               CommandConcurrencyInjection.withForcedPreApplyVersionCaptureFailure {
-                spark.sql(
-                  s"ALTER MATERIALIZED VIEW mv_t5ac_parity ADVANCE SOURCE VERSIONS " +
-                    s"(src_t5ac_parity = $version)"
-                ).collect()
+                spark
+                  .sql(
+                    s"ALTER MATERIALIZED VIEW mv_t5ac_parity ADVANCE SOURCE VERSIONS " +
+                      s"(src_t5ac_parity = $version)"
+                  )
+                  .collect()
               }
             }
-            Iterator.iterate[Throwable](failure)(_.getCause).takeWhile(_ != null)
-              .exists(error => Option(error.getMessage).exists(_.contains("cannot capture the pre-apply MV version"))) shouldBe true
+            Iterator
+              .iterate[Throwable](failure)(_.getCause)
+              .takeWhile(_ != null)
+              .exists(error =>
+                Option(error.getMessage).exists(_.contains("cannot capture the pre-apply MV version"))
+              ) shouldBe true
           }
         }
       }

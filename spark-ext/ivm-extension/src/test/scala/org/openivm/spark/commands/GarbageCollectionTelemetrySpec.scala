@@ -17,7 +17,7 @@ import scala.jdk.CollectionConverters._
 class GarbageCollectionTelemetrySpec extends AnyFunSpec with BeforeAndAfterAll with Matchers {
   private var spark: SparkSession = _
   private val warehouse = new File(s"target/test-warehouse-gc-telemetry-${UUID.randomUUID().toString.take(8)}")
-  private val mapper = new ObjectMapper()
+  private val mapper    = new ObjectMapper()
 
   override def beforeAll(): Unit = {
     spark = SparkSession
@@ -53,7 +53,7 @@ class GarbageCollectionTelemetrySpec extends AnyFunSpec with BeforeAndAfterAll w
   describe("GC telemetry with the queue enabled") {
     it("emits correlated plan and cleanup events without exposing paths") {
       val originalOpId = spark.sparkContext.getLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty)
-      val events = ArrayBuffer.empty[String]
+      val events       = ArrayBuffer.empty[String]
       try {
         spark.sparkContext.getConf.getBoolean(BoundedTelemetryQueue.EnabledKey, false) shouldBe true
         OpenIvmGarbageCollector.setTelemetryOfferForTesting(line => { events += line; () })
@@ -96,7 +96,7 @@ class GarbageCollectionTelemetrySpec extends AnyFunSpec with BeforeAndAfterAll w
 
     it("marks absent operation context explicitly") {
       val originalOpId = spark.sparkContext.getLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty)
-      val events = ArrayBuffer.empty[String]
+      val events       = ArrayBuffer.empty[String]
       try {
         spark.sparkContext.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, null)
         OpenIvmGarbageCollector.setTelemetryOfferForTesting(line => { events += line; () })

@@ -755,9 +755,15 @@ object OpenIvmExecutionSpan extends Logging {
       item.put("published", java.lang.Boolean.valueOf(request.published))
       item.put("snapshot_generation_id", request.snapshotGenerationId.orNull)
       item.put("acknowledged_snapshot_generation_id", request.acknowledgedSnapshotGenerationId.orNull)
-      item.put("requested_mutation_generation", request.requestedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
+      item.put(
+        "requested_mutation_generation",
+        request.requestedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull
+      )
       item.put("captured_mutation_generation", request.capturedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
-      item.put("published_mutation_generation", request.publishedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
+      item.put(
+        "published_mutation_generation",
+        request.publishedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull
+      )
       item.put("reused", java.lang.Boolean.valueOf(request.reused))
       item.put("coalesced", java.lang.Boolean.valueOf(request.coalesced))
       item.put("coverage_proven", java.lang.Boolean.valueOf(request.coverageProven))
@@ -798,9 +804,18 @@ object OpenIvmExecutionSpan extends Logging {
       item.put("captured", java.lang.Boolean.valueOf(publication.captured))
       item.put("published", java.lang.Boolean.valueOf(publication.published))
       item.put("snapshot_generation_id", publication.snapshotGenerationId.orNull)
-      item.put("requested_mutation_generation", publication.requestedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
-      item.put("captured_mutation_generation", publication.capturedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
-      item.put("published_mutation_generation", publication.publishedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull)
+      item.put(
+        "requested_mutation_generation",
+        publication.requestedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull
+      )
+      item.put(
+        "captured_mutation_generation",
+        publication.capturedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull
+      )
+      item.put(
+        "published_mutation_generation",
+        publication.publishedMutationGeneration.map(java.lang.Long.valueOf(_)).orNull
+      )
       val counts = new LinkedHashMap[String, AnyRef]()
       publication.counts.toSeq.sortBy(_._1).foreach { case (name, value) =>
         counts.put(name, value.map(count => java.lang.Long.valueOf(math.max(0L, count))).orNull)
@@ -1068,11 +1083,13 @@ object OpenIvmExecutionSpan extends Logging {
       return existing
     }
     val oneLakeDir = FeatureGate.oneLakeTelemetryDir(spark)
-    val sinkDirs = Seq(FeatureGate.telemetryUri(spark), oneLakeDir).flatten
-    val sinkDisjoint = if (sinkDirs.isEmpty) None else {
-      val conf = spark.sessionState.newHadoopConf()
-      Some((root: Path) => sinkDirs.forall(OpenIvmStateBarrier.telemetrySinkDisjoint(_, conf, root)))
-    }
+    val sinkDirs   = Seq(FeatureGate.telemetryUri(spark), oneLakeDir).flatten
+    val sinkDisjoint =
+      if (sinkDirs.isEmpty) None
+      else {
+        val conf = spark.sessionState.newHadoopConf()
+        Some((root: Path) => sinkDirs.forall(OpenIvmStateBarrier.telemetrySinkDisjoint(_, conf, root)))
+      }
     correlationIdsFromSpark(spark) match {
       case (requestId, dbtNodeId) =>
         startInternal(
