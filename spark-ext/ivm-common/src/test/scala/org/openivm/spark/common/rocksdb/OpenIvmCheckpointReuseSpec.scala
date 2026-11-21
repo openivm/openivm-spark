@@ -10,7 +10,7 @@ class OpenIvmCheckpointReuseSpec extends AnyFunSpec with Matchers {
   describe("checkpoint reuse") {
     it("preserves interruption without failing optional retention after publication") {
       val root = Files.createTempDirectory("openivm-checkpoint-retain-test-")
-      val db = new OpenIvmRocksDB(root.resolve("live").toString, OpenIvmRocksDBConf.default, Seq("meta"))
+      val db   = new OpenIvmRocksDB(root.resolve("live").toString, OpenIvmRocksDBConf.default, Seq("meta"))
       try {
         db.load()
         db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("k"), RocksDBCodec.utf8("v")))
