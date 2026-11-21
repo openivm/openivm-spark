@@ -747,7 +747,7 @@ class OpenIvmCompiler private (
       if (Files.isRegularFile(javaBin.resolve("java.exe"))) javaBin.resolve("java.exe") else javaBin.resolve("java")
     val workerClass     = classOf[OpenIvmCliWorker]
     val workerClasspath = Paths.get(workerClass.getProtectionDomain.getCodeSource.getLocation.toURI).toString
-    val pb = new ProcessBuilder(
+    val workerArgs = Seq(
       javaPath.toString,
       "-Xmx64m",
       "-cp",
@@ -758,9 +758,10 @@ class OpenIvmCompiler private (
       stdoutPath.toString,
       stderrPath.toString,
       errorPath.toString,
-      nativeLibraryPath.getOrElse(""),
-      if (recordExecutable) tmpDir.resolve("cli-executable.sha256").toString else ""
+      nativeLibraryPath.getOrElse("")
     )
+    val args = if (recordExecutable) workerArgs :+ tmpDir.resolve("cli-executable.sha256").toString else workerArgs
+    val pb = new ProcessBuilder(args.asJava)
       .redirectInput(stdinPath.toFile)
       .redirectOutput(ProcessBuilder.Redirect.DISCARD)
       .redirectError(ProcessBuilder.Redirect.DISCARD)

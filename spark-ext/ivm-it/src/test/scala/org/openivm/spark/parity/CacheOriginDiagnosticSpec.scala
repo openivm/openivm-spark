@@ -119,9 +119,27 @@ class CacheOriginDiagnosticSpec extends IvmParitySpecBase("cache-origin-diagnost
       failed.path("command_status").asText() shouldBe "error"
       failed.path("observation_status").asText() shouldBe "incomplete"
       failed.has("origin_operation_id") shouldBe false
+
+      sql("CREATE TABLE origin_src_c(id INT, v INT) USING DELTA").collect()
+      sql("INSERT INTO origin_src_c VALUES (1,10)").collect()
+      sql("CREATE MATERIALIZED VIEW origin_mv_c AS SELECT id,v FROM origin_src_c").collect()
+      sql("INSERT INTO origin_src_c VALUES (2,20)").collect()
+      spark.conf.set(CacheOriginDiagnostic.ConfigKey, "false")
+      refreshAs("origin_mv_c", "off-c", "dbt:c")
+      mapper.readTree(CacheOriginDiagnostic.recordsJson("off-c")).size() shouldBe 0
+      assertMvCorrect("origin_mv_c", "SELECT id,v FROM origin_src_c")
+      spark.conf.set(CacheOriginDiagnostic.ConfigKey, "true")
+      sql("INSERT INTO origin_src_c VALUES (3,30)").collect()
+      refreshAs("origin_mv_c", "hit-without-origin-c", "dbt:c")
+      val missing = record("hit-without-origin-c")
+      missing.path("cache_hit").asBoolean() shouldBe true
+      missing.has("origin_operation_id") shouldBe false
+      missing.path("observation_status").asText() shouldBe "incomplete"
+      assertMvCorrect("origin_mv_c", "SELECT id,v FROM origin_src_c")
       val evidence = mapper.createArrayNode()
-      Seq("miss-a", "miss-b", "hit-a", "hit-b", "replacement-a", "failure-b").foreach { request =>
-        evidence.add(record(request))
+      Seq("miss-a", "miss-b", "hit-a", "hit-b", "replacement-a", "failure-b", "hit-without-origin-c").foreach {
+        request =>
+          evidence.add(record(request))
       }
       Files.write(
         Paths.get("target", "cache-origin-synthetic-observations.json"),

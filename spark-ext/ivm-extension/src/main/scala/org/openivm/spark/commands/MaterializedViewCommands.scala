@@ -6654,6 +6654,7 @@ case class RefreshMaterializedViewCommand(
             }
             def logSkippedStmt(stmtIdx: Int, kind: String): Unit = {
               advanceStmtCounterPast(stmtIdx)
+              CacheOriginDiagnostic.observe(origin)(_.skipped(stmtIdx, kind))
               RefreshPerf.logStmt(refreshId, viewLabel, stmtIdx, kind, 0L)
               profile.appendStep(
                 "execute_refresh_sql_stmt",
@@ -6678,6 +6679,7 @@ case class RefreshMaterializedViewCommand(
                 }
               else None
             if (groupedWindowRefresh.nonEmpty) {
+              CacheOriginDiagnostic.observe(origin)(_.problem("grouped_window_action_not_observed"))
               val update = groupedWindowRefresh.get
               val select = update.register(); sourceSnapshotTempViews += update.temporaryView
               executeSqlAt(
@@ -6742,6 +6744,9 @@ case class RefreshMaterializedViewCommand(
                           // cheapest force-eval action that respects the cache.
                           spark.table(s"global_temp.$scratchView").count()
                         }
+                        CacheOriginDiagnostic.observe(origin)(
+                          _.executed(0, selectBody, succeeded = true, kind = "fused_select")
+                        )
                         val elapsedMs = (System.nanoTime() - t0) / 1000000L
                         advanceStmtCounterPast(0)
                         RefreshPerf.logStmt(
@@ -6769,6 +6774,9 @@ case class RefreshMaterializedViewCommand(
                         Some(scratchView)
                       } catch {
                         case t: Throwable =>
+                          CacheOriginDiagnostic.observe(origin)(
+                            _.executed(0, selectBody, succeeded = false, kind = "fused_select")
+                          )
                           sqlLog.record(
                             category = "fused_view_delta_select",
                             stmtOrder = qOrder,
@@ -7465,6 +7473,9 @@ case class RefreshMaterializedViewCommand(
                       try {
                         val df = spark.sql(deleteSql)
                         val r  = df.collect()
+                        CacheOriginDiagnostic.observe(origin)(
+                          _.executed(idx, deleteSql, succeeded = true, kind = "count_monoid_cleanup")
+                        )
                         recordPlanMetrics(df, "delete")
                         val ms = (System.nanoTime() - t0) / 1000000L
                         sqlLog.record(
@@ -7479,6 +7490,9 @@ case class RefreshMaterializedViewCommand(
                         r
                       } catch {
                         case t: Throwable =>
+                          CacheOriginDiagnostic.observe(origin)(
+                            _.executed(idx, deleteSql, succeeded = false, kind = "count_monoid_cleanup")
+                          )
                           val ms = (System.nanoTime() - t0) / 1000000L
                           sqlLog.record(
                             "count_monoid_cleanup",

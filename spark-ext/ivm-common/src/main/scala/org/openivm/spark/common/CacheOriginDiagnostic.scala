@@ -115,6 +115,8 @@ object CacheOriginDiagnostic extends Logging {
     private var cacheHit       = false
     private var persisted      = false
     private var terminal       = false
+    private var plannedCount   = 0
+    private val accounted      = mutable.Set.empty[Int]
     fields.put("operation_id", operationId)
     fields.put("application_id", applicationId)
     fields.put("jvm_id", jvmId)
@@ -214,15 +216,26 @@ object CacheOriginDiagnostic extends Logging {
       }
 
     def rewritten(statements: Seq[String]): Unit = synchronized {
+      plannedCount = statements.size
       val plan = fields.putArray("rewritten_sha256")
       statements.foreach(s => plan.add(sha256(s)))
     }
 
-    def executed(index: Int, sql: String, succeeded: Boolean): Unit = synchronized {
+    def executed(index: Int, sql: String, succeeded: Boolean, kind: String = "sql"): Unit = synchronized {
       val item = executions.addObject()
       item.put("statement_index", index)
       item.put("sql_sha256", sha256(sql))
       item.put("succeeded", succeeded)
+      item.put("kind", kind)
+      if (succeeded) accounted += index
+    }
+
+    def skipped(index: Int, reason: String): Unit = synchronized {
+      val item = executions.addObject()
+      item.put("statement_index", index)
+      item.put("kind", "skipped")
+      item.put("reason", reason)
+      accounted += index
     }
 
     def finish(success: Boolean): Unit = synchronized {
@@ -250,8 +263,10 @@ object CacheOriginDiagnostic extends Logging {
             }
           }
         }
-        fields.put("execution_coverage", "common_sql_dispatch_only")
-        problems.add("execution_coverage_unverified")
+        val covered = plannedCount > 0 && (0 until plannedCount).forall(accounted)
+        fields.put("execution_coverage", if (covered) "planned_indices_accounted" else "incomplete")
+        if (!covered) problems.add("execution_coverage_unverified")
+        problems.add("external_identity_and_cache_mutations_unobservable")
         fields.put("observation_status", if (problems.isEmpty) "observed" else "incomplete")
         fields.set[com.fasterxml.jackson.databind.JsonNode]("native_invocations", invocations)
         fields.set[com.fasterxml.jackson.databind.JsonNode]("executions", executions)
