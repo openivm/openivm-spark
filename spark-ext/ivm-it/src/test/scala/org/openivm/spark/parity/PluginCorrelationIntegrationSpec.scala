@@ -2,7 +2,7 @@ package org.openivm.spark.parity
 
 import java.io.File
 import java.nio.charset.StandardCharsets
-import java.nio.file.Files
+import java.nio.file.{Files, StandardOpenOption}
 import java.util.UUID
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
@@ -35,19 +35,49 @@ class PluginCorrelationIntegrationSpec
   )
 
   override def afterAll(): Unit =
-    try super.afterAll()
-    finally {
+    try {
+      super.afterAll()
+      saveEvidence()
+    } finally {
       deleteDir(queueDir)
       deleteDir(syncDir)
     }
 
-  private def records: Vector[JsonNode] =
-    Option(queueDir.listFiles()).toVector.flatten
-      .filter(_.getName.endsWith(".jsonl"))
-      .toVector
-      .flatMap { file =>
-        Files.readAllLines(file.toPath, StandardCharsets.UTF_8).asScala.map(line => mapper.readTree(line))
+  private def eventFiles: Vector[File] =
+    Option(queueDir.listFiles()).toVector.flatten.filter(_.getName.endsWith(".jsonl")).sortBy(_.getName)
+
+  private def saveEvidence(): Unit =
+    sys.env.get("OPENIVM_PLUGIN_CORRELATION_EVIDENCE").filter(_.nonEmpty).foreach { value =>
+      val requested = new File(value)
+      require(requested.isAbsolute, "OPENIVM_PLUGIN_CORRELATION_EVIDENCE must be an absolute file path")
+      val output = requested.getCanonicalFile.toPath
+      require(output.getParent != null && Files.isDirectory(output.getParent), "evidence parent directory must exist")
+      Seq(queueDir, syncDir, new File(warehouseDir)).foreach { root =>
+        require(!output.startsWith(root.getCanonicalFile.toPath), "evidence must be outside test cleanup directories")
       }
+      val health = BoundedTelemetryRuntime.health.getOrElse(fail("plugin queue did not start; no evidence"))
+      require(!health.workerAlive, "plugin queue is still draining; evidence is incomplete")
+      val files = eventFiles
+      require(files.nonEmpty, "plugin queue produced no evidence files")
+      val writer = Files.newBufferedWriter(
+        output,
+        StandardCharsets.UTF_8,
+        StandardOpenOption.CREATE_NEW,
+        StandardOpenOption.WRITE
+      )
+      try files.foreach { file =>
+        Files.readAllLines(file.toPath, StandardCharsets.UTF_8).asScala.foreach { line =>
+          writer.write(line)
+          writer.newLine()
+        }
+      }
+      finally writer.close()
+    }
+
+  private def records: Vector[JsonNode] =
+    eventFiles.flatMap { file =>
+      Files.readAllLines(file.toPath, StandardCharsets.UTF_8).asScala.map(line => mapper.readTree(line))
+    }
 
   private def text(node: JsonNode, field: String): String = node.path(field).asText("")
 
@@ -134,8 +164,14 @@ class PluginCorrelationIntegrationSpec
       spans should not be empty
       spans.exists(n => text(n, "effective_refresh_type") == "SIMPLE_PROJECTION") shouldBe true
       val requests = spans.flatMap(n => n.path("state_sync").path("requests").elements().asScala)
-      requests.exists(n => text(n, "parent_request_id") == "plugcorr-on" &&
-        text(n, "parent_operation_id") == refreshId && n.path("published").asBoolean()) shouldBe true
+      requests.exists { n =>
+        val acknowledged = text(n, "acknowledged_snapshot_generation_id").nonEmpty
+        val publication = n.path("published").asBoolean()
+        val reused = n.path("reused").asBoolean() && n.path("coverage_proven").asBoolean()
+        text(n, "parent_request_id") == "plugcorr-on" && text(n, "parent_operation_id") == refreshId &&
+          text(n, "effective_state_sync_mode") == "synchronous" && text(n, "status") == "success" &&
+          acknowledged && (publication || reused)
+      } shouldBe true
       val health = BoundedTelemetryRuntime.health.getOrElse(fail("plugin queue not started"))
       health.accepted shouldBe health.published
       health.queued shouldBe 0

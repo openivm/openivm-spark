@@ -4,8 +4,11 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.rocksdb.OpenIvmStateBarrier
+import org.openivm.spark.insights.OpenIvmInsightJson
+import org.openivm.spark.telemetry.{BoundedTelemetryQueue, BoundedTelemetryRuntime, OpenIvmExecutionSpan}
 import org.slf4j.LoggerFactory
 
+import java.time.Instant
 import java.util.concurrent.{ExecutorService, Executors}
 import java.util.concurrent.atomic.AtomicLong
 import scala.util.control.NonFatal
@@ -34,6 +37,19 @@ object OpenIvmGarbageCollector {
     */
   final case class Plan(tombstoned: Set[String], referenced: Set[String])
 
+  private final case class GcTelemetryContext(operationId: Option[String]) {
+    def contextStatus: String = if (operationId.isDefined) "present" else "missing"
+  }
+
+  private final case class GcTelemetrySpan(
+      context: GcTelemetryContext,
+      phase: String,
+      startMonotonicNs: Long,
+      startUtc: String
+  )
+
+  private final case class CleanupSummary(status: String, tombstonesDeleted: Long, sweepScheduled: Long)
+
   /** Staging-record roots and the depth of their record locations below each root. */
   private val OwnedRoots: Seq[(String, Int)] =
     Seq("_ivm/staging" -> 3, "_ivm/view_deltas" -> 2, "_openivm/triggers" -> 2)
@@ -44,8 +60,21 @@ object OpenIvmGarbageCollector {
       stateRoot: String,
       protectedPaths: Set[String],
       cutoffMs: Long,
-      telemetry: Option[(Path, Long)]
+      telemetry: Option[(Path, Long)],
+      gcTelemetry: Option[GcTelemetryContext],
+      tombstoneCount: Long,
+      referenceCount: Long
   )
+
+  private val telemetryEmissionFailures = new AtomicLong()
+  private val defaultTelemetryOffer: String => Unit = BoundedTelemetryRuntime.offer _
+  @volatile private var telemetryOffer: String => Unit = defaultTelemetryOffer
+
+  def telemetryEmissionFailureCount: Long = telemetryEmissionFailures.get()
+
+  private[openivm] def setTelemetryOfferForTesting(offer: String => Unit): Unit = telemetryOffer = offer
+
+  private[openivm] def resetTelemetryOfferForTesting(): Unit = telemetryOffer = defaultTelemetryOffer
 
   private val lastSweepMs                                         = new AtomicLong(0L)
   private[openivm] def setSweepClockForTesting(value: Long): Unit = lastSweepMs.set(value)
@@ -73,9 +102,12 @@ object OpenIvmGarbageCollector {
 
   private def prepareCandidates(spark: SparkSession, sweepDue: => Boolean): Option[Plan] =
     if (!FeatureGate.gcEnabled(spark)) None
-    else
+    else {
+      val telemetry = startTelemetry(spark, "plan")
+      var status    = "success"
+      var planned   = Option.empty[Plan]
       try {
-        StagingCatalog.garbageCollectionPaths(spark, sweepDue).map { stagingPaths =>
+        planned = StagingCatalog.garbageCollectionPaths(spark, sweepDue).map { stagingPaths =>
           val metadataReferences = MvCatalog
             .list(spark)
             .iterator
@@ -88,11 +120,25 @@ object OpenIvmGarbageCollector {
             recorded ++ metadataReferences ++ StagingDeltaView.CachedViewDeltaRef.inputsOf(recorded)
           )
         }
+        if (planned.isEmpty) status = "empty"
+        planned
       } catch {
         case NonFatal(error) =>
+          status = "failed"
           log.warn(s"openivm gc: cannot read garbage candidates: $error")
           None
+      } finally {
+        emitTelemetry(
+          telemetry,
+          status,
+          Seq(
+            "plan_count"      -> planned.fold(0L)(_ => 1L),
+            "tombstone_count" -> planned.fold(0L)(_.tombstoned.size.toLong),
+            "reference_count" -> planned.fold(0L)(_.referenced.size.toLong)
+          )
+        )
       }
+    }
 
   /** Delete the tombstoned locations of `plan` that nothing references, then start a background
     * orphan sweep when one is due. Call only after the state `plan` was read from is durable.
@@ -102,12 +148,38 @@ object OpenIvmGarbageCollector {
     */
   def collect(spark: SparkSession, plan: Option[Plan]): Unit =
     plan.foreach { candidates =>
-      OpenIvmStateBarrier.withMutation(spark) {
-        collectUnderBarrier(spark, candidates)
+      val telemetry = startTelemetry(spark, "cleanup")
+      var summary   = CleanupSummary("success", 0L, 0L)
+      try {
+        OpenIvmStateBarrier.withMutation(spark) {
+          summary = collectUnderBarrier(spark, candidates, telemetry.map(_.context))
+        }
+      } catch {
+        case NonFatal(error) =>
+          summary = summary.copy(status = "failed")
+          throw error
+      } finally {
+        emitTelemetry(
+          telemetry,
+          summary.status,
+          Seq(
+            "tombstone_count"         -> candidates.tombstoned.size.toLong,
+            "reference_count"         -> candidates.referenced.size.toLong,
+            "tombstones_deleted_count" -> summary.tombstonesDeleted,
+            "orphan_sweep_scheduled"  -> summary.sweepScheduled
+          )
+        )
       }
     }
 
-  private def collectUnderBarrier(spark: SparkSession, candidates: Plan): Unit = {
+  private def collectUnderBarrier(
+      spark: SparkSession,
+      candidates: Plan,
+      gcTelemetry: Option[GcTelemetryContext]
+  ): CleanupSummary = {
+    var status             = "success"
+    var tombstonesDeleted = 0L
+    var sweepScheduled    = 0L
     try {
       val removed = candidates.tombstoned.filterNot(candidates.referenced.contains).filter { location =>
         try deleteLocation(spark.sessionState.newHadoopConf(), location)
@@ -117,6 +189,7 @@ object OpenIvmGarbageCollector {
             false
         }
       }
+      tombstonesDeleted = removed.size.toLong
       StagingCatalog.forgetGarbage(spark, removed)
       if (removed.nonEmpty) log.info(s"openivm gc: deleted ${removed.size} consumed staging location(s)")
       val now  = System.currentTimeMillis()
@@ -130,13 +203,20 @@ object OpenIvmGarbageCollector {
           now - FeatureGate.gcOrphanGracePeriodMs(spark),
           FeatureGate
             .oneLakeTelemetryDir(spark)
-            .map(dir => new Path(dir) -> (now - FeatureGate.telemetryOneLakeRetentionMs(spark)))
+            .map(dir => new Path(dir) -> (now - FeatureGate.telemetryOneLakeRetentionMs(spark))),
+          gcTelemetry,
+          candidates.tombstoned.size.toLong,
+          candidates.referenced.size.toLong
         )
         executor.execute(() => runSweep(sweep))
+        sweepScheduled = 1L
       }
     } catch {
-      case NonFatal(error) => log.warn(s"openivm gc: collection failed: $error")
+      case NonFatal(error) =>
+        status = "failed"
+        log.warn(s"openivm gc: collection failed: $error")
     }
+    CleanupSummary(status, tombstonesDeleted, sweepScheduled)
   }
 
   /** Run an orphan sweep synchronously, as [[collect]] does in the background.
@@ -145,19 +225,22 @@ object OpenIvmGarbageCollector {
     * @param plan  candidates from [[prepare]], taken after the orphans were abandoned
     * @param nowMs time the grace period and telemetry retention are measured from
     */
-  private[openivm] def sweepNow(spark: SparkSession, plan: Plan, nowMs: Long): Unit =
-    runSweep(
-      Sweep(
-        spark.sessionState.newHadoopConf(),
-        new Path(spark.conf.get("spark.sql.warehouse.dir")),
-        OpenIvmStateBarrier.root(spark).toString,
-        plan.referenced ++ plan.tombstoned,
-        nowMs - FeatureGate.gcOrphanGracePeriodMs(spark),
-        FeatureGate
-          .oneLakeTelemetryDir(spark)
-          .map(dir => new Path(dir) -> (nowMs - FeatureGate.telemetryOneLakeRetentionMs(spark)))
-      )
+  private[openivm] def sweepNow(spark: SparkSession, plan: Plan, nowMs: Long): Unit = {
+    val sweep = Sweep(
+      spark.sessionState.newHadoopConf(),
+      new Path(spark.conf.get("spark.sql.warehouse.dir")),
+      OpenIvmStateBarrier.root(spark).toString,
+      plan.referenced ++ plan.tombstoned,
+      nowMs - FeatureGate.gcOrphanGracePeriodMs(spark),
+      FeatureGate
+        .oneLakeTelemetryDir(spark)
+        .map(dir => new Path(dir) -> (nowMs - FeatureGate.telemetryOneLakeRetentionMs(spark))),
+      captureTelemetryContext(spark),
+      plan.tombstoned.size.toLong,
+      plan.referenced.size.toLong
     )
+    runSweep(sweep)
+  }
 
   @volatile private[common] var afterSweepDeleteHookForTesting: Path => Unit = (_: Path) => ()
 
@@ -170,37 +253,113 @@ object OpenIvmGarbageCollector {
     deleted
   }
 
-  private def runSweep(sweep: Sweep): Unit =
+  private def runSweep(sweep: Sweep): Unit = {
+    val telemetry = startTelemetry(sweep.gcTelemetry, "orphan_sweep")
+    var status            = "success"
+    var orphanCandidates  = 0L
+    var orphanDeleted     = 0L
+    var telemetryDeleted  = 0L
     try {
       val fs             = sweep.warehouse.getFileSystem(sweep.hadoopConf)
       val protectedPaths = sweep.protectedPaths.map(path => qualify(fs, path))
-      var removed        = 0
       OwnedRoots.foreach { case (relative, depth) =>
         locations(fs, new Path(sweep.warehouse, relative), depth).foreach { location =>
+          orphanCandidates += 1L
           val path = fs.makeQualified(location.getPath)
           if (
             !protectedPaths.contains(path.toString) &&
             lastModified(fs, location) < sweep.cutoffMs &&
             deleteSweepPath(sweep, fs, path, recursive = true)
-          ) removed += 1
+          ) orphanDeleted += 1L
         }
       }
-      if (removed > 0) log.info(s"openivm gc: deleted $removed unreferenced staging location(s)")
+      if (orphanDeleted > 0) log.info(s"openivm gc: deleted $orphanDeleted unreferenced staging location(s)")
       sweep.telemetry.foreach { case (root, expiryMs) =>
         val rootFs = root.getFileSystem(sweep.hadoopConf)
         if (rootFs.exists(root)) {
-          val expired = rootFs
-            .listStatus(root)
-            .count(status =>
-              status.isFile && status.getModificationTime < expiryMs &&
-                deleteSweepPath(sweep, rootFs, status.getPath, recursive = false)
-            )
-          if (expired > 0) log.info(s"openivm gc: deleted $expired expired telemetry span(s) under $root")
+          rootFs.listStatus(root).foreach { span =>
+            if (
+              span.isFile && span.getModificationTime < expiryMs &&
+              deleteSweepPath(sweep, rootFs, span.getPath, recursive = false)
+            ) telemetryDeleted += 1L
+          }
+          if (telemetryDeleted > 0)
+            log.info(s"openivm gc: deleted $telemetryDeleted expired telemetry span(s) under $root")
         }
       }
     } catch {
-      case NonFatal(error) => log.warn(s"openivm gc: orphan sweep failed: $error")
+      case NonFatal(error) =>
+        status = "failed"
+        log.warn(s"openivm gc: orphan sweep failed: $error")
+    } finally {
+      emitTelemetry(
+        telemetry,
+        status,
+        Seq(
+          "tombstone_count"          -> sweep.tombstoneCount,
+          "reference_count"          -> sweep.referenceCount,
+          "orphan_candidates_count"  -> orphanCandidates,
+          "orphan_deleted_count"     -> orphanDeleted,
+          "telemetry_deleted_count"  -> telemetryDeleted
+        )
+      )
     }
+  }
+
+  private def startTelemetry(spark: SparkSession, phase: String): Option[GcTelemetrySpan] =
+    startTelemetry(captureTelemetryContext(spark), phase)
+
+  private def startTelemetry(context: Option[GcTelemetryContext], phase: String): Option[GcTelemetrySpan] =
+    context.map(value => GcTelemetrySpan(value, phase, System.nanoTime(), Instant.now().toString))
+
+  private def captureTelemetryContext(spark: SparkSession): Option[GcTelemetryContext] = {
+    val enabled =
+      try spark.sparkContext.getConf.getBoolean(BoundedTelemetryQueue.EnabledKey, defaultValue = false)
+      catch {
+        case NonFatal(_) =>
+          recordTelemetryFailure()
+          false
+      }
+    if (!enabled) None
+    else {
+      val operationId =
+        try {
+          Option(spark.sparkContext.getLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty)).filter(_.nonEmpty)
+        }
+        catch {
+          case NonFatal(_) =>
+            recordTelemetryFailure()
+            None
+        }
+      Some(GcTelemetryContext(operationId))
+    }
+  }
+
+  private def emitTelemetry(span: Option[GcTelemetrySpan], status: String, counts: Seq[(String, Long)]): Unit =
+    span.foreach { value =>
+      try {
+        val fields = Seq[(String, Any)](
+          "event_type"             -> "openivm_gc",
+          "clock_domain_id"        -> MonotonicClockDomain.id,
+          "scope"                  -> "garbage_collection",
+          "phase"                  -> value.phase,
+          "operation_id"           -> value.context.operationId.orNull,
+          "context_status"         -> value.context.contextStatus,
+          "status"                 -> status,
+          "start_utc"              -> value.startUtc,
+          "start_monotonic_ns"     -> value.startMonotonicNs,
+          "inclusive_duration_ns"  -> (System.nanoTime() - value.startMonotonicNs)
+        ) ++ counts
+        telemetryOffer(OpenIvmInsightJson.obj(fields: _*))
+      } catch {
+        case NonFatal(_) => recordTelemetryFailure()
+      }
+    }
+
+  private def recordTelemetryFailure(): Unit = {
+    val count = telemetryEmissionFailures.incrementAndGet()
+    if (count == 1L) log.warn("openivm gc: telemetry emission failed (failure_count=1)")
+  }
 
   private def deleteLocation(hadoopConf: Configuration, location: String): Boolean = {
     val path = new Path(location)

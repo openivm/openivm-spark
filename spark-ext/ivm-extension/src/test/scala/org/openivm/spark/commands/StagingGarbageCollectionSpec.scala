@@ -64,6 +64,16 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
   }
 
   describe("staging garbage collection") {
+    it("keeps GC telemetry off by default") {
+      val events = scala.collection.mutable.ArrayBuffer.empty[String]
+      try {
+        spark.sparkContext.getConf.getBoolean("spark.openivm.telemetry.queue.enabled", false) shouldBe false
+        OpenIvmGarbageCollector.setTelemetryOfferForTesting(line => { events += line; () })
+        OpenIvmGarbageCollector.prepare(spark)
+        events shouldBe empty
+      } finally OpenIvmGarbageCollector.resetTelemetryOfferForTesting()
+    }
+
     it("defers an idle plan across the sweep deadline and lets a later refresh sweep with references") {
       OpenIvmGarbageCollector.setSweepClockForTesting(System.currentTimeMillis())
       OpenIvmGarbageCollector.prepareForRefresh(spark) shouldBe None
