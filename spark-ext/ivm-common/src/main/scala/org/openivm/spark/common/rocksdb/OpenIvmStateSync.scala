@@ -1,6 +1,7 @@
 package org.openivm.spark.common.rocksdb
 
 import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.SparkContext
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.common.FeatureGate
 import org.openivm.spark.telemetry.OpenIvmExecutionSpan
@@ -58,6 +59,15 @@ object OpenIvmStateSync {
 
   private final case class AsyncRequest(request: BackupRequest, afterPublish: () => Unit)
   private final case class SynchronousRequest(request: BackupRequest, completion: CompletableFuture[Unit])
+  private final class GuardedBinding(val root: String, val store: GuardedSnapshotDecisions.ArchiveStore) {
+    val backup                                              = new BackupState
+    val restored                                            = new CompletableFuture[Unit]()
+    val restoring                                           = new AtomicBoolean(false)
+    var latest: Option[GuardedSnapshotDecisions.Generation] = None
+  }
+
+  private val guardedBindings = new java.util.WeakHashMap[SparkContext, GuardedBinding]()
+
 
   private final class BackupState {
     val passLock                    = new ReentrantLock(true)
@@ -410,6 +420,63 @@ object OpenIvmStateSync {
     if (hook == null) FeatureGate.stateSyncUri(spark) else hook(spark)
   }
 
+  private[rocksdb] def guardedUri(spark: SparkSession): Option[String] =
+    spark.sparkContext.getConf.getOption(FeatureGate.GuardedStateSyncUriKey)
+
+  private[openivm] def guardedSqlEnabled(spark: SparkSession): Boolean = guardedUri(spark).isDefined
+
+  private def checkGuardedSettings(spark: SparkSession): Unit = {
+    if (
+      spark.sparkContext.isStopped || stateSyncUri(spark).nonEmpty ||
+      spark.conf.getOption(FeatureGate.StateSyncUriKey).exists(_.trim.nonEmpty) ||
+      FeatureGate.stateSyncAsyncEnabled(spark) || FeatureGate.gcEnabled(spark)
+    )
+      throw new java.io.IOException(
+        "guarded SQL state sync requires an active Spark application, no legacy URI, synchronous state sync, and legacy GC disabled"
+      )
+  }
+
+  private[rocksdb] def attachGuarded(
+      spark: SparkSession,
+      store: GuardedSnapshotDecisions.ArchiveStore
+  ): Unit = {
+    checkGuardedSettings(spark)
+    if (!guardedUri(spark).contains(store.canonicalRoot))
+      throw new java.io.IOException("guarded SQL checkpoint root does not match the startup configuration")
+    val binding = new GuardedBinding(canonicalLocalRoot(spark), store)
+    guardedBindings.synchronized {
+      if (guardedBindings.containsKey(spark.sparkContext))
+        throw new java.io.IOException("guarded SQL checkpoint transport is already attached")
+      guardedBindings.put(spark.sparkContext, binding)
+    }
+  }
+
+  private def guardedBinding(spark: SparkSession): Option[GuardedBinding] = guardedUri(spark).map { uri =>
+    checkGuardedSettings(spark)
+    val binding = guardedBindings
+      .synchronized(Option(guardedBindings.get(spark.sparkContext)))
+      .getOrElse(throw new java.io.IOException("guarded SQL checkpoint transport was not attached at startup"))
+    if (binding.store.canonicalRoot != uri || binding.root != canonicalLocalRoot(spark))
+      throw new java.io.IOException("guarded SQL checkpoint binding changed")
+    binding
+  }
+
+  private def restoreGuardedOnce(spark: SparkSession, binding: GuardedBinding): Unit = {
+    if (binding.restoring.compareAndSet(false, true)) {
+      try {
+        binding.latest = restoreGuarded(spark, binding.store)
+        binding.restored.complete(())
+      } catch {
+        case error: Throwable =>
+          binding.restored.completeExceptionally(error)
+          throw error
+      }
+    } else {
+      try binding.restored.get()
+      catch { case error: java.util.concurrent.ExecutionException => throw error.getCause }
+    }
+  }
+
   private def backupStateFor(key: String): BackupState = {
     val fresh    = new BackupState
     val existing = backupStates.putIfAbsent(key, fresh)
@@ -419,6 +486,12 @@ object OpenIvmStateSync {
   /** Download the remote state tree into the local `_openivm` dir on the first
     * call per Spark application. Restore failures fail all callers closed. */
   def maybeRestore(spark: SparkSession): Unit = {
+    guardedBinding(spark) match {
+      case Some(binding) =>
+        restoreGuardedOnce(spark, binding)
+        return
+      case None => ()
+    }
     val uri = stateSyncUri(spark)
       .getOrElse(
         return
@@ -459,6 +532,8 @@ object OpenIvmStateSync {
     }
 
   private def backupAsync(spark: SparkSession, afterPublish: () => Unit): Unit = {
+    if (guardedSqlEnabled(spark))
+      throw new java.io.IOException("guarded SQL checkpoint publication cannot be asynchronous")
     val uri = stateSyncUri(spark)
       .getOrElse {
         afterPublish()
@@ -514,6 +589,43 @@ object OpenIvmStateSync {
 
   /** Synchronously publish a snapshot covering this request's committed state. */
   def backupNow(spark: SparkSession): Unit = {
+    guardedBinding(spark) match {
+      case Some(binding) =>
+        restoreGuardedOnce(spark, binding)
+        val span    = OpenIvmExecutionSpan.captureCurrent()
+        val started = System.nanoTime()
+        try
+          binding.backup.backupSynchronous(newBackupRequest(spark, "synchronous")) { requests =>
+            val previous = new GuardedSnapshotDecisions(binding.store).latestPublished().map(_.generation)
+            if (previous != binding.latest)
+              throw new java.io.IOException(
+                "guarded SQL checkpoint was published by another writer; fresh restore required"
+              )
+            val previousStamp = previous.map(_.value.take(19).toLong).getOrElse(0L)
+            val stamp         = math.max(System.currentTimeMillis(), Math.addExact(previousStamp, 1L))
+            val generation    = GuardedSnapshotDecisions.Generation(f"$stamp%019d-${UUID.randomUUID()}")
+            val trace = new BackupPassTrace(requests, "synchronous", UUID.randomUUID().toString)
+            trace.markAdmitted(System.nanoTime())
+            trace.setSnapshotGeneration(generation.value)
+            var failure = Option.empty[Throwable]
+            try {
+              publishGuardedWithTrace(spark, generation, binding.store, trace)
+              binding.latest = Some(generation)
+            } catch {
+              case error: Throwable =>
+                failure = Some(error)
+                throw error
+            } finally {
+              try trace.finish(failure.fold("success")(_ => spanStatus(failure.get)), System.nanoTime(), failure)
+              catch {
+                case NonFatal(error) => log.warn(s"openivm state-sync: optional telemetry emission failed: $error")
+              }
+            }
+          }
+        finally span.foreach(_.recordRocksDbBackup((System.nanoTime() - started) / 1000000L))
+        return
+      case None => ()
+    }
     val uri = stateSyncUri(spark)
       .getOrElse(
         return
@@ -634,6 +746,14 @@ object OpenIvmStateSync {
     if (!fs.mkdirs(remoteRoot))
       throw new java.io.IOException(s"openivm state-sync: cannot create snapshot $remoteRoot")
     trace.setSnapshotGeneration(generation)
+    withPackedSnapshot(spark, local, generation, trace) { (archive, archiveBytes, checksum) =>
+      publishLegacy(spark, uri, fs, controlRoot, commitRoot, remoteRoot, generation, archive, archiveBytes, checksum, trace)
+    }
+  }
+
+  private def withPackedSnapshot(spark: SparkSession, local: File, generation: String, trace: BackupPassTrace)(
+      consume: (File, Long, String) => Unit
+  ): Unit = {
     OpenIvmStateBarrier.register(spark)
     val archive = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
     val capture = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
@@ -700,8 +820,27 @@ object OpenIvmStateSync {
         trace.markArchive(archiveBytes)
         PackedArchive(checksum, archiveBytes)
       }
-      val archiveBytes  = packed.archiveBytes
-      val remoteArchive = new Path(remoteRoot, "snapshot.zip")
+      consume(archive, packed.archiveBytes, packed.checksum)
+    } finally {
+      try Files.deleteIfExists(archive.toPath)
+      finally deleteStagedTree(capture)
+    }
+  }
+
+  private def publishLegacy(
+      spark: SparkSession,
+      uri: String,
+      fs: FileSystem,
+      controlRoot: Path,
+      commitRoot: Path,
+      remoteRoot: Path,
+      generation: String,
+      archive: File,
+      archiveBytes: Long,
+      checksum: String,
+      trace: BackupPassTrace
+  ): Unit = {
+    val remoteArchive = new Path(remoteRoot, "snapshot.zip")
       val copyHook      = copyLocalFileHookForTesting
       trace.measure("spark.backup.upload", "durability") {
         if (copyHook != null) copyHook(fs, archive, remoteArchive)
@@ -718,7 +857,7 @@ object OpenIvmStateSync {
         val output = fs.create(pendingCommit, false)
         try
           output.write(
-            s"OPENIVM_STATE_SNAPSHOT_V2\n$generation\n$archiveBytes\n${packed.checksum}\n".getBytes(
+            s"OPENIVM_STATE_SNAPSHOT_V2\n$generation\n$archiveBytes\n${checksum}\n".getBytes(
               StandardCharsets.UTF_8
             )
           )
@@ -742,11 +881,58 @@ object OpenIvmStateSync {
         counts = Map("deleted_paths" -> pruned.deletedPaths),
         error = pruned.failure
       )
-    } finally {
-      try Files.deleteIfExists(archive.toPath)
-      finally deleteStagedTree(capture)
+  }
+
+  // Explicit guarded entry points; there is no configured OneLake transport or legacy fallback.
+  private[rocksdb] def publishGuarded(
+      spark: SparkSession,
+      generation: GuardedSnapshotDecisions.Generation,
+      store: GuardedSnapshotDecisions.ArchiveStore
+  ): Unit =
+    publishGuardedWithTrace(spark, generation, store, new BackupPassTrace(Seq.empty, "synchronous", ""))
+
+  private def publishGuardedWithTrace(
+      spark: SparkSession,
+      generation: GuardedSnapshotDecisions.Generation,
+      store: GuardedSnapshotDecisions.ArchiveStore,
+      trace: BackupPassTrace
+  ): Unit = {
+    store.verifyNamespace()
+    val local = localRoot(spark)
+    withPackedSnapshot(spark, local, generation.value, trace) { (archive, length, digest) =>
+      val receipt = trace.measure("spark.backup.upload", "durability") {
+        val uploaded = store.sealUpload(generation, archive, length, digest)
+        trace.markUploaded(uploaded.bytes)
+        uploaded
+      }
+      if (receipt.generation != generation || receipt.bytes != length || receipt.sha256 != digest)
+        throw new java.io.IOException("openivm state-sync: guarded upload receipt does not match local archive")
+      val commitHook = beforeSnapshotCommitHookForTesting
+      if (commitHook != null) commitHook()
+      OpenIvmSnapshotArchive.checkInterrupted()
+      trace.measure("spark.backup.commit", "durability") {
+        new GuardedSnapshotDecisions(store).publish(receipt)
+        trace.markPublished()
+      }
     }
   }
+
+  private[rocksdb] def restoreGuarded(
+      spark: SparkSession,
+      store: GuardedSnapshotDecisions.ArchiveStore
+  ): Option[GuardedSnapshotDecisions.Generation] =
+    OpenIvmStateBarrier.withCapture(spark) {
+      val selected = new GuardedSnapshotDecisions(store).latestPublished()
+      val local    = localRoot(spark)
+      if (hasLocalStateFiles(local))
+        throw new java.io.IOException("openivm state-sync: guarded restore requires an empty local state root")
+      selected.map { receipt =>
+        restorePackedArchive(receipt.bytes -> receipt.sha256, local)(archive =>
+          store.copyExactArchive(receipt, archive)
+        )
+        receipt.generation
+      }
+    }
 
   /** Delete committed generations older than the newest `retain`, then snapshots and pending
     * commit markers older than every retained generation, which interrupted publishes left behind.
@@ -880,12 +1066,18 @@ object OpenIvmStateSync {
     val remote = new Path(root, "snapshot.zip")
     if (fs.getFileStatus(remote).getLen != info._1)
       throw new java.io.IOException("openivm state-sync: archive length mismatch")
+    restorePackedArchive(info, local)(archive =>
+      fs.copyToLocalFile(false, remote, new Path(archive.getAbsolutePath), true)
+    )
+  }
+
+  private def restorePackedArchive(info: (Long, String), local: File)(download: File => Unit): Unit = {
     val suffix  = UUID.randomUUID().toString
     val archive = new File(local.getParentFile, s".openivm-state-restore-$suffix.zip")
     val staged  = new File(local.getParentFile, s".openivm-state-restore-$suffix")
     Files.createDirectories(local.getParentFile.toPath)
     try {
-      fs.copyToLocalFile(false, remote, new Path(archive.getAbsolutePath), true)
+      download(archive)
       if (archive.length() != info._1 || OpenIvmSnapshotArchive.sha256(archive) != info._2)
         throw new java.io.IOException("openivm state-sync: archive checksum mismatch")
       Files.createDirectories(staged.toPath)

@@ -2965,7 +2965,8 @@ case class CreateMaterializedViewCommand(
           }
           // An existing view is only looked up; there is no state change to publish.
           if (finalizeUnderLock) {
-            if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
+            if (outcome != "create_already_exists" || OpenIvmStateSync.guardedSqlEnabled(spark))
+              OpenIvmStateSync.backupForCommand(spark)
             createOutcome = outcome
           }
           outcome
@@ -2974,7 +2975,8 @@ case class CreateMaterializedViewCommand(
         }
       }
       if (!finalizeUnderLock) {
-        if (outcome != "create_already_exists") OpenIvmStateSync.backupForCommand(spark)
+        if (outcome != "create_already_exists" || OpenIvmStateSync.guardedSqlEnabled(spark))
+          OpenIvmStateSync.backupForCommand(spark)
         createOutcome = outcome
       }
       if (outcome == "create_executed")
