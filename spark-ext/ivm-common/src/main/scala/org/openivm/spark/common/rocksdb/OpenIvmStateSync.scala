@@ -635,10 +635,13 @@ object OpenIvmStateSync {
     if (hook == null) stateSyncKey(spark, uri) else hook(spark, uri)
   }
 
-  private def stateSyncUri(spark: SparkSession): Option[String] = {
+  private def configuredStateSyncUri(spark: SparkSession): Option[String] = {
     val hook = stateSyncUriHookForTesting
-    val configured = if (hook == null) FeatureGate.stateSyncUri(spark) else hook(spark)
-    configured.map { value =>
+    if (hook == null) FeatureGate.stateSyncUri(spark) else hook(spark)
+  }
+
+  private def stateSyncUri(spark: SparkSession): Option[String] =
+    configuredStateSyncUri(spark).map { value =>
       val path = new Path(value)
       if (backupPassHookForTesting != null) path.toString
       else {
@@ -648,7 +651,6 @@ object OpenIvmStateSync {
           new Path(new File(qualified).getCanonicalFile.toURI).toString
         else new Path(qualified).toString
       }
-    }
   }
 
   private[rocksdb] def guardedUri(spark: SparkSession): Option[String] =
@@ -658,7 +660,7 @@ object OpenIvmStateSync {
 
   private def checkGuardedSettings(spark: SparkSession): Unit = {
     if (
-      spark.sparkContext.isStopped || stateSyncUri(spark).nonEmpty ||
+      spark.sparkContext.isStopped || configuredStateSyncUri(spark).nonEmpty ||
       spark.conf.getOption(FeatureGate.StateSyncUriKey).exists(_.trim.nonEmpty) ||
       FeatureGate.stateSyncAsyncEnabled(spark) || FeatureGate.gcEnabled(spark)
     )
@@ -754,7 +756,7 @@ object OpenIvmStateSync {
         return
       case None => ()
     }
-    val uri = stateSyncUri(spark)
+    val uri = configuredStateSyncUri(spark)
       .getOrElse(
         return
       )
