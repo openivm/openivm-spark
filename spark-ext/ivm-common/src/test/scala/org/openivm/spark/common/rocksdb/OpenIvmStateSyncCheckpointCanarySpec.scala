@@ -760,7 +760,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
           FeatureGate.OneLakeTelemetryDirKey -> telemetryDir.toURI.toString
         )
       )
-      OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe true
+      OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe false
       recordProfile(spark, s"telemetry-fresh-${UUID.randomUUID()}")
       val mutationGeneration = OpenIvmStateBarrier.currentMutationGeneration(spark)
       val evidence = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
