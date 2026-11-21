@@ -144,6 +144,15 @@ per-generation terminal decision is not a namespace writer fence: independent
 drivers must not write the same namespace concurrently. The qualification-only
 `publish`, `restore`, and `retire` methods remain separate.
 
+The experimental `spark.openivm.stateSync.checkpointReuse.enabled` setting defaults
+to `false`. When enabled, eligible unchanged, live single-process stores can reuse
+verified in-memory checkpoint bytes; other stores use the normal native checkpoint.
+Each backup still publishes an independently restorable V2 generation. The cache
+retains at most 128 MiB of file bytes across 256 stores, with at most 16 MiB
+and 1,024 files per store. Successful
+generation logs report `fresh`, `reuse`, or `fallback` per hashed store path;
+failed publication logs are reported separately.
+
 ## Cross-thread query-hash annotations
 
 When an event callback began capture on a different Java thread, append

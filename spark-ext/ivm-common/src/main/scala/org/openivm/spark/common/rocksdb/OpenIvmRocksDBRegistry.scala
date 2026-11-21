@@ -79,15 +79,25 @@ object OpenIvmRocksDBRegistry {
       }
     }
 
-    def checkpoint(spark: SparkSession, destination: java.nio.file.Path): Unit = {
+    def checkpoint(
+        spark: SparkSession,
+        destination: java.nio.file.Path,
+        reuse: Boolean
+    ): OpenIvmCheckpointReuse.Capture = {
       lock.lock()
       try {
         if (retired) throw SlotRetiredSignal
-        if (entry != null) entry.db.checkpointTo(destination)
-        else {
+        if (entry != null) {
+          if (reuse) OpenIvmCheckpointReuse.checkpoint(entry.db, destination)
+          else {
+            entry.db.checkpointTo(destination)
+            OpenIvmCheckpointReuse.Capture("fresh")
+          }
+        } else {
           val db = new OpenIvmRocksDB(canonicalPath, OpenIvmRocksDBConf.fromSpark(spark), Seq.empty)
           try db.checkpointTo(destination)
           finally db.close()
+          OpenIvmCheckpointReuse.Capture(if (reuse) "fallback" else "fresh")
         }
       } finally lock.unlock()
     }
@@ -394,20 +404,23 @@ object OpenIvmRocksDBRegistry {
   private[rocksdb] def checkpoint(
       spark: SparkSession,
       dbPath: String,
-      destination: java.nio.file.Path
-  ): Unit = {
-    val canonicalPath = canonicalLocalPath(dbPath)
-    var completed     = false
+      destination: java.nio.file.Path,
+      reuse: Boolean
+  ): OpenIvmCheckpointReuse.Capture = {
+    val canonicalPath                           = canonicalLocalPath(dbPath)
+    var completed                               = false
+    var outcome: OpenIvmCheckpointReuse.Capture = null
     while (!completed) {
       val slot = slotFor(canonicalPath)
       try {
-        slot.checkpoint(spark, destination)
+        outcome = slot.checkpoint(spark, destination, reuse)
         completed = true
       } catch {
         case SlotRetiredSignal => evictIfRetired(canonicalPath, slot)
       }
     }
     pruneSlotIfEmpty(canonicalPath)
+    outcome
   }
 
   private def slotFor(canonicalPath: String): Slot = {
