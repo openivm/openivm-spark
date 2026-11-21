@@ -151,8 +151,9 @@ requires an explicit local `spark.openivm.statePath` disjoint from the Spark
 warehouse, single-process RocksDB, no telemetry file sinks, and a destination URI
 not observed with a second local state root in this driver. Any unresolved/shared
 configuration takes a fresh synchronous capture on every request; it never reuses
-an in-flight pass or cached archive. Requests with state-sync telemetry enabled
-also take the ordinary traced publication path. Opt-in receipts bind acknowledgements to the
+an in-flight pass or cached archive. Telemetry alone does not disable eligible
+reuse, but overlapping or unresolvable telemetry sinks invalidate its coverage
+proof for the live state root. Opt-in receipts bind acknowledgements to the
 committed generation, captured/requested mutation generations, archive SHA256 and
 byte count. Async backups retain their existing behavior and invalidate synchronous
 reuse proof. The URI must still have a single writer
