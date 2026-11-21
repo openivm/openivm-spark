@@ -24,6 +24,8 @@ class PluginCorrelationIntegrationSpec
   private val syncDir = new File(s"target/plugin-correlation-sync-$suffix").getAbsoluteFile
   private val mapper = new ObjectMapper()
 
+  override implicit val patienceConfig: PatienceConfig = PatienceConfig(Span(60, Seconds), Span(1, Seconds))
+
   override protected def extraSparkConf: Map[String, String] = Map(
     "spark.plugins" -> "org.openivm.spark.plugin.metrics.OpenIvmMetricsPlugin",
     BoundedTelemetryQueue.EnabledKey -> "false",
@@ -113,7 +115,6 @@ class PluginCorrelationIntegrationSpec
     val observed = runRefresh("plugcorr_on_src", "plugcorr_on_mv", "plugcorr-on")
     observed shouldBe baseline
 
-    implicit val patience: PatienceConfig = PatienceConfig(Span(60, Seconds), Span(1, Seconds))
     eventually {
       val events = records
       val phases = events.filter(n => text(n, "event_type") == "phase" && text(n, "request_id") == "plugcorr-on")
