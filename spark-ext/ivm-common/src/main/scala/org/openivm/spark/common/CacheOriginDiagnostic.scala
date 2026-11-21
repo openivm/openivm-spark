@@ -69,15 +69,15 @@ object CacheOriginDiagnostic extends Logging {
           ambiguous ++= members
           ambiguous += recorder.operationId
         }
-  } catch {
-        case NonFatal(e) =>
-          logWarning("Could not start cache-origin diagnostic", e)
-          None
-  }
         members += recorder.operationId
       }
       Some(recorder)
     }
+  } catch {
+    case NonFatal(e) =>
+      logWarning("Could not start cache-origin diagnostic", e)
+      None
+  }
 
   /** Returns all terminal records for an exact request. Multiple records are ambiguous. */
   def recordsJson(requestId: String): String = synchronized {
