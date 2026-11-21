@@ -5,6 +5,8 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.{CacheOriginDiagnostic, FeatureGate, MvCatalog}
 import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Paths}
 import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration._
@@ -74,10 +76,21 @@ class CacheOriginDiagnosticSpec extends IvmParitySpecBase("cache-origin-diagnost
         miss.path("cache_hit").asBoolean() shouldBe false
         hit.path("cache_hit").asBoolean() shouldBe true
         miss.path("cache_write_succeeded").asBoolean() shouldBe true
+        miss.path("dbt_node_id").asText() shouldBe s"dbt:$s"
+        miss.path("application_id").asText() shouldBe hit.path("application_id").asText()
+        miss.path("jvm_id").asText() shouldBe hit.path("jvm_id").asText()
         miss.path("target_table_id").asText() shouldBe hit.path("target_table_id").asText()
         miss.path("compiled_sql_sha256").asText() shouldBe hit.path("compiled_sql_sha256").asText()
+        val persisted = MvCatalog.lookup(spark, TableIdentifier(s"origin_mv_$s")).get
+        CacheOriginDiagnostic.sha256(persisted.properties(miss.path("cache_key").asText())) shouldBe
+          miss.path("compiled_sql_sha256").asText()
         hit.path("origin_operation_id").asText() shouldBe miss.path("operation_id").asText()
         miss.path("native_invocations").size() should be > 0
+        miss.path("native_invocations").get(0).path("executable_sha256").asText() shouldBe
+          "7ec8dce4491fe4365aba27439d010396c8529d6551e476925b312ccb22b4389b"
+        miss.path("native_invocations").get(0).path("extension_file_sha256").asText() shouldBe
+          "fc5cec69e8fee7fc555895d02743c013168904b10f9af702f9b716a64fc01388"
+        miss.path("native_invocations").get(0).path("ordered_native_rows").size() should be > 0
         hit.path("native_invocations").size() shouldBe 0
         miss.path("rewritten_sha256").size() should be > 0
         assertMvCorrect(s"origin_mv_$s", s"SELECT id,v FROM origin_src_$s")
@@ -106,6 +119,14 @@ class CacheOriginDiagnosticSpec extends IvmParitySpecBase("cache-origin-diagnost
       failed.path("command_status").asText() shouldBe "error"
       failed.path("observation_status").asText() shouldBe "incomplete"
       failed.has("origin_operation_id") shouldBe false
+      val evidence = mapper.createArrayNode()
+      Seq("miss-a", "miss-b", "hit-a", "hit-b", "replacement-a", "failure-b").foreach { request =>
+        evidence.add(record(request))
+      }
+      Files.write(
+        Paths.get("target", "cache-origin-synthetic-observations.json"),
+        mapper.writeValueAsString(evidence).getBytes(StandardCharsets.UTF_8)
+      )
     }
   }
 }

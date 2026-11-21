@@ -4230,15 +4230,16 @@ case class RefreshMaterializedViewCommand(
     } finally {
       // runUnderLock has many early returns and failure paths. Always detach
       // its telemetry collector from the reusable driver thread.
-      val failedOutcome = if (commandCompleted) None else Some("refresh_failed")
-      try RefreshProfile.flushActive(failedOutcome)
-      finally {
-        try RefreshSqlLog.finishActive(failedOutcome)
+      val failedOutcome      = if (commandCompleted) None else Some("refresh_failed")
+      var telemetryCompleted = false
+      try {
+        try RefreshProfile.flushActive(failedOutcome)
         finally {
-          try OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
-          finally CacheOriginDiagnostic.observe(origin)(_.finish(commandCompleted))
+          try RefreshSqlLog.finishActive(failedOutcome)
+          finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
         }
-      }
+        telemetryCompleted = true
+      } finally CacheOriginDiagnostic.observe(origin)(_.finish(commandCompleted && telemetryCompleted))
     }
   }
 
@@ -6065,17 +6066,28 @@ case class RefreshMaterializedViewCommand(
           }
         }
       }
-      CacheOriginDiagnostic.observe(origin)(
-        _.cache(
+      CacheOriginDiagnostic.observe(origin) { recorder =>
+        val persisted = MvCatalog.lookup(spark, name).exists { current =>
+          current.querySql == meta.querySql &&
+          current.sourceSchemaFingerprint == meta.sourceSchemaFingerprint &&
+          MvMetadata
+            .cachedCompiledSql(current.properties, meta.sourceSchemaFingerprint, compileCacheTier)
+            .contains(compiled.sql) &&
+          MvMetadata
+            .cachedCompiledClassification(current.properties, meta.sourceSchemaFingerprint, compileCacheTier)
+            .contains(compiled.refreshType -> compiled.refreshTypeName)
+        }
+        if (!persisted) recorder.problem("persisted_cache_value_mismatch_or_missing")
+        recorder.cache(
           compileCacheHit,
           compileCacheTier,
           MvMetadata.compileCacheSqlKey(meta.sourceSchemaFingerprint, compileCacheTier),
           compiled.refreshType.toString,
           compiled.refreshTypeName,
           compiled.sql,
-          cachePersisted
+          cachePersisted && persisted
         )
-      )
+      }
       if (
         preparedSourceAdvance.nonEmpty &&
         (compiled.refreshType == RefreshTypeCode.FullRefresh ||

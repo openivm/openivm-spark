@@ -17,8 +17,9 @@ object CacheOriginDiagnostic extends Logging {
   private val completed = mutable.LinkedHashMap.empty[String, (String, String)]
   private val active    = mutable.Map.empty[String, mutable.Set[String]]
   private val ambiguous = mutable.Set.empty[String]
-  private val origins   = mutable.LinkedHashMap.empty[String, String]
+  private val origins   = mutable.LinkedHashMap.empty[String, (String, String, Boolean)]
   private val limit     = 4096
+  private val jvmId     = UUID.randomUUID().toString
   val ConfigKey         = "spark.openivm.diagnostics.cacheOrigin.enabled"
 
   def observe(origin: Option[Recorder])(f: Recorder => Unit): Unit = origin.foreach { recorder =>
@@ -61,9 +62,7 @@ object CacheOriginDiagnostic extends Logging {
         sc.applicationId,
         target,
         Option(sc.getLocalProperty("openivm.request_id")).filter(_.trim.nonEmpty),
-        Option(sc.getLocalProperty("openivm.node_id"))
-          .orElse(Option(sc.getLocalProperty("spark.jobGroup.id")))
-          .filter(_.trim.nonEmpty)
+        Option(sc.getLocalProperty("openivm.node_id")).filter(_.trim.nonEmpty)
       )
       synchronized {
         val members = active.getOrElseUpdate(recorder.ownerKey, mutable.Set.empty[String])
@@ -111,13 +110,16 @@ object CacheOriginDiagnostic extends Logging {
     private val executions     = mapper.createArrayNode()
     private val problems       = mapper.createArrayNode()
     private var boundIdentity  = Option.empty[(String, String)]
+    private var cacheOriginKey = Option.empty[String]
     private var cacheSignature = Option.empty[String]
     private var cacheHit       = false
     private var persisted      = false
     private var terminal       = false
     fields.put("operation_id", operationId)
     fields.put("application_id", applicationId)
+    fields.put("jvm_id", jvmId)
     fields.put("target", target)
+    fields.put("identity_scope", "same_driver_managed_lock_key_only")
     requestId.foreach(fields.put("request_id", _))
     owner.foreach(fields.put("dbt_node_id", _))
     if (requestId.isEmpty) problems.add("missing_request_id")
@@ -172,7 +174,7 @@ object CacheOriginDiagnostic extends Logging {
       synchronized {
         cacheHit = hit
         persisted = writeSucceeded
-        val parts = Seq(
+        val keyParts = Seq(
           applicationId,
           target,
           fields.path("target_table_id").asText(),
@@ -180,12 +182,12 @@ object CacheOriginDiagnostic extends Logging {
           fields.path("query_sha256").asText(),
           fields.path("source_schema_fingerprint").asText(),
           tier,
-          key,
-          code,
-          classification,
-          sha256(sql)
+          key
         )
-        cacheSignature = Some(sha256(parts.map(s => s"${s.length}:$s").mkString))
+        val originKey = sha256(keyParts.map(s => s"${s.length}:$s").mkString)
+        val signature = sha256(Seq(code, classification, sha256(sql)).map(s => s"${s.length}:$s").mkString)
+        cacheOriginKey = Some(originKey)
+        cacheSignature = Some(signature)
         fields.put("tier", tier)
         fields.put("cache_key", key)
         fields.put("compiled_sql_sha256", sha256(sql))
@@ -196,6 +198,19 @@ object CacheOriginDiagnostic extends Logging {
         if (sql.isEmpty) problems.add("empty_compiled_program")
         if (!hit && !writeSucceeded) problems.add("cache_write_not_persisted")
         if (!hit && invocations.isEmpty) problems.add("native_origin_missing")
+        CacheOriginDiagnostic.synchronized {
+          if (hit) {
+            origins.get(originKey) match {
+              case Some((sameSignature, operation, true))
+                  if sameSignature == signature && completed.contains(operation) =>
+                fields.put("origin_operation_id", operation)
+              case _ => problems.add("matching_miss_provenance_missing")
+            }
+          } else {
+            origins.put(originKey, (signature, operationId, false))
+            while (origins.size > limit) origins.remove(origins.head._1)
+          }
+        }
       }
 
     def rewritten(statements: Seq[String]): Unit = synchronized {
@@ -223,15 +238,15 @@ object CacheOriginDiagnostic extends Logging {
             members -= operationId
             if (members.isEmpty) active.remove(ownerKey)
           }
-          cacheSignature.foreach { signature =>
-            if (cacheHit) {
-              origins.get(signature) match {
-                case Some(id) => fields.put("origin_operation_id", id)
-                case None     => problems.add("matching_miss_provenance_missing")
+          cacheOriginKey.foreach { key =>
+            if (!cacheHit) {
+              origins.get(key) match {
+                case Some((signature, id, _)) if id == operationId =>
+                  if (persisted && success && problems.isEmpty)
+                    origins.put(key, (signature, operationId, true))
+                  else origins.remove(key)
+                case _ => ()
               }
-            } else if (persisted && success && problems.isEmpty) {
-              origins.put(signature, operationId)
-              while (origins.size > limit) origins.remove(origins.head._1)
             }
           }
         }
