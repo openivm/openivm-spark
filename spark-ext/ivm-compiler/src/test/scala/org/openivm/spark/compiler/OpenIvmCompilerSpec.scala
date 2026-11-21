@@ -1016,6 +1016,14 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     normalized should include(s"/* openivm_delta_$key */")
   }
 
+  it should "leave unrelated qualified and non-suffix native-like identifiers unchanged" in {
+    val key = "__openivm_mv_6d656d6f7279_6d61696e_6d76"
+    val sql = s"""SELECT * FROM other.openivm_data_$key
+                 |JOIN other."openivm_data_$key" USING (id)
+                 |JOIN openivm_data_${key}_suffix USING (id)""".stripMargin
+    OpenIvmCompiler.normalizeNativeViewObjects(sql, key, "mv") shouldBe sql
+  }
+
   it should "read the encoded native initial-load file and retain hidden keys and source pins" in {
     val key  = "__openivm_mv_6d656d6f7279_6d61696e_6d76"
     val dir  = Files.createTempDirectory("openivm-native-initial-load-")

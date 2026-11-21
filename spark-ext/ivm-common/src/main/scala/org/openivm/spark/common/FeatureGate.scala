@@ -51,6 +51,9 @@ object FeatureGate {
   val StateSyncUriKey: String        = "spark.openivm.stateSync.uri"
   val GuardedStateSyncUriKey: String = "spark.openivm.stateSync.guarded.uri"
 
+  /** Opt in to mutation-covered coalescing for synchronous state snapshots. */
+  val StateSyncCheckpointEnabledKey: String = "spark.openivm.stateSync.checkpoint.enabled"
+
   /** Return from MV commands before remote backup completes (default true).
     * Local commits remain synchronous; driver loss can restore an older remote generation.
     */
@@ -529,6 +532,9 @@ object FeatureGate {
 
   def stateSyncUri(spark: SparkSession): Option[String] =
     stateSyncUri(spark.sparkContext.getConf)
+
+  def stateSyncCheckpointEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, StateSyncCheckpointEnabledKey, default = false)
 
   def stateSyncAsyncEnabled(spark: SparkSession): Boolean =
     spark.conf

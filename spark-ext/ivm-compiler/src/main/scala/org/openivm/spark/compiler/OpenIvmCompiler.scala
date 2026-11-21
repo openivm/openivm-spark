@@ -1043,7 +1043,7 @@ object OpenIvmCompiler {
   private[compiler] def normalizeNativeViewObjects(sql: String, nativeKey: String, viewName: String): String = {
     val objects = java.util.regex.Pattern
       .compile(
-        """(?i)(?<![A-Za-z0-9_`"])(?:(?:`memory`|"memory"|memory)\.(?:`main`|"main"|main)\.)?(?:`(openivm_[A-Za-z0-9_]+)`|"(openivm_[A-Za-z0-9_]+)"|(openivm_[A-Za-z0-9_]+))(?![A-Za-z0-9_`"])|(`(?:``|[^`])*`)"""
+        """(?i)(?<![A-Za-z0-9_.`"])(?:(?:`memory`|"memory"|memory)\.(?:`main`|"main"|main)\.)?(?:`(openivm_[A-Za-z0-9_]+)`|"(openivm_[A-Za-z0-9_]+)"|(openivm_[A-Za-z0-9_]+))(?![A-Za-z0-9_`"])|(`(?:``|[^`])*`)"""
       )
       .matcher(sql)
       .useTransparentBounds(true)

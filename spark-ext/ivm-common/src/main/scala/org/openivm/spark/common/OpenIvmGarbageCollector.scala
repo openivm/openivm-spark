@@ -159,6 +159,17 @@ object OpenIvmGarbageCollector {
       )
     )
 
+  @volatile private[common] var afterSweepDeleteHookForTesting: Path => Unit = (_: Path) => ()
+
+  private[common] def setAfterSweepDeleteHookForTesting(hook: Path => Unit): Unit =
+    afterSweepDeleteHookForTesting = hook
+
+  private def deleteSweepPath(sweep: Sweep, fs: FileSystem, path: Path, recursive: Boolean): Boolean = {
+    val deleted = OpenIvmStateBarrier.withDbMutation(sweep.stateRoot) { fs.delete(path, recursive) }
+    if (deleted) afterSweepDeleteHookForTesting(path)
+    deleted
+  }
+
   private def runSweep(sweep: Sweep): Unit =
     try {
       val fs             = sweep.warehouse.getFileSystem(sweep.hadoopConf)
@@ -170,7 +181,7 @@ object OpenIvmGarbageCollector {
           if (
             !protectedPaths.contains(path.toString) &&
             lastModified(fs, location) < sweep.cutoffMs &&
-            OpenIvmStateBarrier.withDbOperation(sweep.stateRoot) { fs.delete(path, true) }
+            deleteSweepPath(sweep, fs, path, recursive = true)
           ) removed += 1
         }
       }
@@ -182,7 +193,7 @@ object OpenIvmGarbageCollector {
             .listStatus(root)
             .count(status =>
               status.isFile && status.getModificationTime < expiryMs &&
-                OpenIvmStateBarrier.withDbOperation(sweep.stateRoot) { rootFs.delete(status.getPath, false) }
+                deleteSweepPath(sweep, rootFs, status.getPath, recursive = false)
             )
           if (expired > 0) log.info(s"openivm gc: deleted $expired expired telemetry span(s) under $root")
         }
