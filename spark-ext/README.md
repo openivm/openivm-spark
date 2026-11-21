@@ -166,6 +166,12 @@ handles retain their existing locks, and the publisher joins all workers before
 packing or releasing the barrier, including after errors. Multi-process mode
 continues to capture serially. Publication, acknowledgement and restore are unchanged.
 
+`spark.openivm.cdf.preflight.parallelSources.enabled=true` enables an experimental,
+default-off source-availability preflight using at most two workers per refresh.
+It checks independent source ranges before applying refresh SQL; unavailable or
+missing-baseline sources retain the existing recovery decision. It does not
+parallelize refresh SQL or change publication and acknowledgment ordering.
+
 The experimental `spark.openivm.stateSync.checkpointReuse.enabled` setting defaults
 to `false`. When enabled, eligible unchanged, live single-process stores can reuse
 verified in-memory checkpoint bytes; other stores use the normal native checkpoint.

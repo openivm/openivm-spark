@@ -1,5 +1,8 @@
 package org.openivm.spark.parity
 
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Paths}
+
 import org.openivm.spark.common.{
   CdfChangeAvailability,
   CdfChangeBatch,
@@ -30,7 +33,7 @@ class CdfParallelSourcePreflightSpec extends IvmParitySpecBase("cdf-parallel-sou
     val expected = Map("missing_baseline" -> "cdf_watermark_missing")
     CdfChangeAvailability.unavailableReasons(spark, checks, parallel = false) shouldBe expected
     CdfChangeAvailability.unavailableReasons(spark, checks, parallel = true) shouldBe expected
-    val invalid = checks :+ CdfChangeBatch("cpsp_missing_table", 0, 1)
+    val invalid = checks :+ CdfChangeBatch("cpsp_!invalid", 0, 1)
     intercept[Exception] {
       CdfChangeAvailability.unavailableReasons(spark, invalid, parallel = false)
     }
@@ -52,6 +55,7 @@ class CdfParallelSourcePreflightSpec extends IvmParitySpecBase("cdf-parallel-sou
     }
     sql("INSERT INTO cpsp_join_a VALUES (2, 30)")
     sql("INSERT INTO cpsp_join_b VALUES (2, 40)")
+    val timings = scala.collection.mutable.ArrayBuffer.empty[String]
     try {
       Seq(false -> "cpsp_mv_off", true -> "cpsp_mv_on").foreach { case (enabled, mv) =>
         spark.conf.set(CdfChangeAvailability.ParallelSourcesKey, enabled.toString)
@@ -59,9 +63,16 @@ class CdfParallelSourcePreflightSpec extends IvmParitySpecBase("cdf-parallel-sou
         refreshMv(mv)
         val profile = RefreshProfileCatalog.scanAll(spark)
         profile.map(_.detail).mkString("\n") should include("outcome=incremental_executed")
-        profile.exists(row => row.stepName == "metadata_pre_sql" && row.detail.contains("cdf_change_availability")) shouldBe true
+        val preflight =
+          profile.filter(row => row.stepName == "metadata_pre_sql" && row.detail.contains("cdf_change_availability"))
+        preflight.size shouldBe 1
+        preflight.head.detail should include("source_count=2")
+        timings += s"""{"parallel":$enabled,"sourceCount":2,"durationMs":${preflight.head.durationMs}}"""
         assertMvCorrect(mv, query)
       }
     } finally spark.conf.unset(CdfChangeAvailability.ParallelSourcesKey)
+    sys.env.get("OPENIVM_CDF_PREFLIGHT_EVIDENCE").foreach { path =>
+      Files.write(Paths.get(path), (timings.mkString("\n") + "\n").getBytes(StandardCharsets.UTF_8))
+    }
   }
 }

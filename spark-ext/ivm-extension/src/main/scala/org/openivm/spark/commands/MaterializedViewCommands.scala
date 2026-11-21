@@ -5418,7 +5418,10 @@ case class RefreshMaterializedViewCommand(
         if (cdfChangeBatches.isEmpty || meta.refreshType == RefreshTypeCode.FullRefresh || stateLag.nonEmpty)
           Map.empty
         else
-          profile.timeStep("metadata_pre_sql", "phase=cdf_change_availability") {
+          profile.timeStep(
+            "metadata_pre_sql",
+            s"phase=cdf_change_availability;source_count=${cdfChangeBatches.map(_.baseTable).distinct.size}"
+          ) {
             RefreshPerf.timePhase(refreshId, viewLabel, "cdf_change_availability") {
               CdfChangeAvailability.unavailableReasons(
                 spark,
