@@ -266,8 +266,11 @@ class OpenIvmCompiler private (
           decodeJsonString(line, nextStringStart(line, line.indexOf(key) + key.length))._1
         }
         .getOrElse(req.viewName)
-      val restore: String => String = sql => markers.fold(sql)(_.restore(sql))
-      val initLoad                  = parseInitialLoadSql(resultDir, req, nativeViewName, restore)
+      val restore: String => String = sql => {
+        val unqualified = LptsSparkDialect.stripNativeBuiltinQualification(sql)
+        markers.fold(unqualified)(_.restore(unqualified))
+      }
+      val initLoad = parseInitialLoadSql(resultDir, req, nativeViewName, restore)
       if (initLoad.nonEmpty && partial.refreshTypeName != "FULL_REFRESH") markers.foreach(_.requireAllSeen())
       markers.foreach(_.clearSeen())
       val resultSql = restore(normalizeCompiledViewNames(partial.sql, nativeViewName, req.viewName))

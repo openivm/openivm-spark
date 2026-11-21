@@ -10,6 +10,24 @@ import org.scalatest.matchers.should.Matchers
   */
 class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
+  describe("DuckDB system builtin qualification") {
+    it("unqualifies function calls without changing literals, comments, columns, or other catalogs") {
+      val sql = """SELECT "system".main.sum(x), system."main".count_star(),
+        |"system".main.__openivm_spark_expression('id', NULL, x),
+        |"system".main.col, other.system.main.sum(x), 'system.main.sum(x)',
+        |`system.main.sum`(x) -- system.main.sum(x)
+        |/* "system".main.sum(x) */ FROM t""".stripMargin
+      val unqualified = LptsSparkDialect.stripNativeBuiltinQualification(sql)
+      unqualified should include("SELECT sum(x), count_star()")
+      unqualified should include("__openivm_spark_expression('id', NULL, x)")
+      unqualified should include("\"system\".main.col, other.system.main.sum(x), 'system.main.sum(x)'")
+      unqualified should include("`system.main.sum`(x) -- system.main.sum(x)")
+      unqualified should include("/* \"system\".main.sum(x) */")
+      LptsSparkDialect.stripNativeBuiltinQualification(unqualified) shouldBe unqualified
+      LptsSparkDialect.translate(sql) should include("SELECT sum(x), COUNT(*)")
+    }
+  }
+
   describe("native infinity and trim restoration") {
     it("restores infinity literals without rewriting identifiers or protected text") {
       val sql = """SELECT abs(q) != 1e1000, -1E1000, 1e10001, x1e1000, `1e1000`,

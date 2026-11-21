@@ -3,9 +3,9 @@ import sbt._
 object Dependencies {
   private val target = RuntimeTarget.current
 
-  val sparkV = target.sparkVersion
-  val deltaV = target.deltaVersion
-  val antlrV = target.antlrVersion
+  val sparkV  = target.sparkVersion
+  val deltaV  = target.deltaVersion
+  val antlrV  = target.antlrVersion
   val scalaTV = "3.2.18"
 
   val sparkCore = "org.apache.spark" %% "spark-core"         % sparkV   % Provided

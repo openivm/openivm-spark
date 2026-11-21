@@ -68,7 +68,6 @@ object OpenIvmStateSync {
 
   private val guardedBindings = new java.util.WeakHashMap[SparkContext, GuardedBinding]()
 
-
   private[rocksdb] final case class StateSyncRequestReceipt(
       requestId: String,
       requestedMutationGeneration: Long,
@@ -119,7 +118,7 @@ object OpenIvmStateSync {
     private val requests            = new ConcurrentLinkedQueue[AsyncRequest]()
     private val synchronousMonitor  = new Object
     private val synchronousRequests = scala.collection.mutable.ArrayBuffer.empty[SynchronousRequest]
-    private val candidateRequests = scala.collection.mutable.ArrayBuffer.empty[SynchronousCandidateRequest]
+    private val candidateRequests   = scala.collection.mutable.ArrayBuffer.empty[SynchronousCandidateRequest]
     private var synchronousRunning  = false
     private var candidateRunning    = false
     private var submittedRequests   = 0L
@@ -210,21 +209,31 @@ object OpenIvmStateSync {
               if (!request.completion.isDone && !candidateRunning) {
                 if (!sharedStateSyncUris.containsKey(uri)) {
                   publishedCoverage.foreach { coverage =>
-                    val reusable = candidateRequests.filter(req =>
-                      req.coverageEligible && req.requestedMutationGeneration <= coverage.capturedMutationGeneration
-                    ).toVector
+                    val reusable = candidateRequests
+                      .filter(req =>
+                        req.coverageEligible && req.requestedMutationGeneration <= coverage.capturedMutationGeneration
+                      )
+                      .toVector
                     candidateRequests --= reusable
                     reusable.foreach { req =>
-                      finish(req, CandidateCompletion(
+                      finish(
+                        req,
+                        CandidateCompletion(
                           StateSyncRequestReceipt(
-                            req.requestId, req.requestedMutationGeneration,
-                            Some(coverage.capturedMutationGeneration), Some(coverage.generation),
-                            published = false, reused = true, coverageProven = true,
-                            acknowledged = true, outcome = "reused_committed_coverage",
+                            req.requestId,
+                            req.requestedMutationGeneration,
+                            Some(coverage.capturedMutationGeneration),
+                            Some(coverage.generation),
+                            published = false,
+                            reused = true,
+                            coverageProven = true,
+                            acknowledged = true,
+                            outcome = "reused_committed_coverage",
                             archiveSha256 = Some(coverage.archiveSha256),
                             archiveBytes = Some(coverage.archiveBytes)
                           )
-                        ))
+                        )
+                      )
                     }
                   }
                 } else publishedCoverage = None
@@ -238,7 +247,7 @@ object OpenIvmStateSync {
 
             if (batch.nonEmpty) {
               var result: CandidatePassResult = null
-              var failure: Throwable = null
+              var failure: Throwable          = null
               try {
                 result = pass()
                 val hook = afterCandidatePublicationHookForTesting
@@ -248,27 +257,49 @@ object OpenIvmStateSync {
                     case _: InterruptedException => Thread.currentThread().interrupt()
                   }
                 }
-              }
-              catch { case error: Throwable => failure = error }
+              } catch { case error: Throwable => failure = error }
               synchronousMonitor.synchronized {
                 try {
                   if (failure != null) {
                     publishedCoverage = None
                     batch.foreach { req =>
-                      finish(req, CandidateCompletion(StateSyncRequestReceipt(
-                          req.requestId, req.requestedMutationGeneration, None, None,
-                          published = false, reused = false, coverageProven = false,
-                          acknowledged = false, outcome = "publication_failed"
-                        ), Some(failure)))
+                      finish(
+                        req,
+                        CandidateCompletion(
+                          StateSyncRequestReceipt(
+                            req.requestId,
+                            req.requestedMutationGeneration,
+                            None,
+                            None,
+                            published = false,
+                            reused = false,
+                            coverageProven = false,
+                            acknowledged = false,
+                            outcome = "publication_failed"
+                          ),
+                          Some(failure)
+                        )
+                      )
                     }
                   } else if (result.noState) {
                     publishedCoverage = None
                     batch.foreach { req =>
-                      finish(req, CandidateCompletion(StateSyncRequestReceipt(
-                          req.requestId, req.requestedMutationGeneration, None, None,
-                          published = false, reused = false, coverageProven = false,
-                          acknowledged = true, outcome = "no_local_state"
-                        )))
+                      finish(
+                        req,
+                        CandidateCompletion(
+                          StateSyncRequestReceipt(
+                            req.requestId,
+                            req.requestedMutationGeneration,
+                            None,
+                            None,
+                            published = false,
+                            reused = false,
+                            coverageProven = false,
+                            acknowledged = true,
+                            outcome = "no_local_state"
+                          )
+                        )
+                      )
                     }
                   } else if (result.publication.isEmpty) {
                     publishedCoverage = None
@@ -276,43 +307,78 @@ object OpenIvmStateSync {
                       "openivm state-sync: synchronous pass produced no committed publication"
                     )
                     batch.foreach { req =>
-                      finish(req, CandidateCompletion(StateSyncRequestReceipt(
-                          req.requestId, req.requestedMutationGeneration, None, None,
-                          published = false, reused = false, coverageProven = false,
-                          acknowledged = false, outcome = "publication_missing"
-                        ), Some(error)))
+                      finish(
+                        req,
+                        CandidateCompletion(
+                          StateSyncRequestReceipt(
+                            req.requestId,
+                            req.requestedMutationGeneration,
+                            None,
+                            None,
+                            published = false,
+                            reused = false,
+                            coverageProven = false,
+                            acknowledged = false,
+                            outcome = "publication_missing"
+                          ),
+                          Some(error)
+                        )
+                      )
                     }
                   } else {
                     val publication = result.publication.get
-                    val captured = publication.capturedMutationGeneration
-                    val shared = sharedStateSyncUris.containsKey(uri)
-                    val eligible = !shared && batch.forall(_.coverageEligible) && captured.isDefined
+                    val captured    = publication.capturedMutationGeneration
+                    val shared      = sharedStateSyncUris.containsKey(uri)
+                    val eligible    = !shared && batch.forall(_.coverageEligible) && captured.isDefined
                     publishedCoverage =
-                      if (eligible) Some(PublishedCoverage(
-                        publication.generation, captured.get, publication.archiveSha256, publication.archiveBytes
-                      ))
+                      if (eligible)
+                        Some(
+                          PublishedCoverage(
+                            publication.generation,
+                            captured.get,
+                            publication.archiveSha256,
+                            publication.archiveBytes
+                          )
+                        )
                       else None
                     batch.foreach { req =>
                       val proof = !shared && req.coverageEligible &&
                         captured.exists(_ >= req.requestedMutationGeneration)
                       if (shared || !req.coverageEligible || proof) {
-                        finish(req, CandidateCompletion(StateSyncRequestReceipt(
-                            req.requestId, req.requestedMutationGeneration, captured,
-                            Some(publication.generation), published = true, reused = false,
-                            coverageProven = proof, acknowledged = true,
-                            outcome = if (proof) "published_covered_generation" else "published_fresh_fallback",
+                        finish(
+                          req,
+                          CandidateCompletion(
+                            StateSyncRequestReceipt(
+                              req.requestId,
+                              req.requestedMutationGeneration,
+                              captured,
+                              Some(publication.generation),
+                              published = true,
+                              reused = false,
+                              coverageProven = proof,
+                              acknowledged = true,
+                              outcome = if (proof) "published_covered_generation" else "published_fresh_fallback",
+                              archiveSha256 = Some(publication.archiveSha256),
+                              archiveBytes = Some(publication.archiveBytes)
+                            )
+                          )
+                        )
+                      } else if (!req.completion.isDone) {
+                        recordReceipt(
+                          StateSyncRequestReceipt(
+                            req.requestId,
+                            req.requestedMutationGeneration,
+                            captured,
+                            Some(publication.generation),
+                            published = true,
+                            reused = false,
+                            coverageProven = false,
+                            acknowledged = false,
+                            outcome = "later_generation_requires_new_publication",
                             archiveSha256 = Some(publication.archiveSha256),
                             archiveBytes = Some(publication.archiveBytes)
-                          )))
-                      } else if (!req.completion.isDone) {
-                        recordReceipt(StateSyncRequestReceipt(
-                          req.requestId, req.requestedMutationGeneration, captured,
-                          Some(publication.generation), published = true, reused = false,
-                          coverageProven = false, acknowledged = false,
-                          outcome = "later_generation_requires_new_publication",
-                          archiveSha256 = Some(publication.archiveSha256),
-                          archiveBytes = Some(publication.archiveBytes)
-                        ))
+                          )
+                        )
                         candidateRequests += req
                       }
                     }
@@ -645,13 +711,13 @@ object OpenIvmStateSync {
       val path = new Path(value)
       if (backupPassHookForTesting != null) path.toString
       else {
-        val fs = path.getFileSystem(spark.sessionState.newHadoopConf())
+        val fs        = path.getFileSystem(spark.sessionState.newHadoopConf())
         val qualified = fs.makeQualified(path).toUri.normalize()
         if ("file".equalsIgnoreCase(qualified.getScheme))
           new Path(new File(qualified).getCanonicalFile.toURI).toString
         else new Path(qualified).toString
       }
-  }
+    }
 
   private[rocksdb] def guardedUri(spark: SparkSession): Option[String] =
     spark.sparkContext.getConf.getOption(FeatureGate.GuardedStateSyncUriKey)
@@ -869,7 +935,7 @@ object OpenIvmStateSync {
             val previousStamp = previous.map(_.value.take(19).toLong).getOrElse(0L)
             val stamp         = math.max(System.currentTimeMillis(), Math.addExact(previousStamp, 1L))
             val generation    = GuardedSnapshotDecisions.Generation(f"$stamp%019d-${UUID.randomUUID()}")
-            val trace = new BackupPassTrace(requests, "synchronous", UUID.randomUUID().toString)
+            val trace         = new BackupPassTrace(requests, "synchronous", UUID.randomUUID().toString)
             trace.markAdmitted(System.nanoTime())
             trace.setSnapshotGeneration(generation.value)
             var failure = Option.empty[Throwable]
@@ -895,10 +961,10 @@ object OpenIvmStateSync {
       .getOrElse(
         return
       )
-    val key = effectiveStateSyncKey(spark, uri)
+    val key               = effectiveStateSyncKey(spark, uri)
     val sharedDestination = registerRootForUri(uri, canonicalLocalRoot(spark))
-    val request = newBackupRequest(spark, "synchronous")
-    val started = System.nanoTime()
+    val request           = newBackupRequest(spark, "synchronous")
+    val started           = System.nanoTime()
     try {
       val state = backupStateFor(key)
       if (!FeatureGate.stateSyncCheckpointEnabled(spark) || request.captureTelemetry) {
@@ -936,13 +1002,13 @@ object OpenIvmStateSync {
       requests: Seq[BackupRequest],
       mode: String
   ): Unit = {
-    val operationId = if (requests.exists(_.captureTelemetry)) UUID.randomUUID().toString else ""
-    val trace       = new BackupPassTrace(requests, mode, operationId)
-    val destination = destinationLock(uri)
-    val lock        = backupStateFor(key).passLock
+    val operationId       = if (requests.exists(_.captureTelemetry)) UUID.randomUUID().toString else ""
+    val trace             = new BackupPassTrace(requests, mode, operationId)
+    val destination       = destinationLock(uri)
+    val lock              = backupStateFor(key).passLock
     var destinationLocked = false
-    var locked      = false
-    var failure     = Option.empty[Throwable]
+    var locked            = false
+    var failure           = Option.empty[Throwable]
     try {
       destination.lockInterruptibly()
       destinationLocked = true
@@ -1031,7 +1097,9 @@ object OpenIvmStateSync {
   private final case class PruneResult(deletedPaths: Long, failure: Option[Throwable])
 
   private def backupNowInternal(
-      spark: SparkSession, uri: String, trace: BackupPassTrace
+      spark: SparkSession,
+      uri: String,
+      trace: BackupPassTrace
   ): Option[SnapshotPublication] = {
     val local = localRoot(spark)
     if (!local.exists()) return None
@@ -1058,8 +1126,21 @@ object OpenIvmStateSync {
     var publication = Option.empty[SnapshotPublication]
     withPackedSnapshot(spark, local, generation, trace, allowReuse = true) {
       (archive, archiveBytes, checksum, captured, onCommitted) =>
-      publishLegacy(spark, uri, fs, controlRoot, commitRoot, remoteRoot, generation, archive, archiveBytes, checksum, trace, onCommitted)
-      publication = Some(SnapshotPublication(generation, captured, checksum, archiveBytes))
+        publishLegacy(
+          spark,
+          uri,
+          fs,
+          controlRoot,
+          commitRoot,
+          remoteRoot,
+          generation,
+          archive,
+          archiveBytes,
+          checksum,
+          trace,
+          onCommitted
+        )
+        publication = Some(SnapshotPublication(generation, captured, checksum, archiveBytes))
     }
     publication
   }
@@ -1074,10 +1155,10 @@ object OpenIvmStateSync {
       consume: (File, Long, String, Option[Long], () => Unit) => Unit
   ): Unit = {
     OpenIvmStateBarrier.register(spark)
-    val archive = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
-    val capture = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
-    val reuse = allowReuse && FeatureGate.stateSyncCheckpointReuseEnabled(spark)
-    var outcomes = Vector.empty[(String, OpenIvmCheckpointReuse.Capture)]
+    val archive   = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
+    val capture   = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
+    val reuse     = allowReuse && FeatureGate.stateSyncCheckpointReuseEnabled(spark)
+    var outcomes  = Vector.empty[(String, OpenIvmCheckpointReuse.Capture)]
     var published = false
     var capturedMutationGeneration = Option.empty[Long]
     try {
@@ -1190,47 +1271,47 @@ object OpenIvmStateSync {
       onCommitted: () => Unit
   ): Unit = {
     val remoteArchive = new Path(remoteRoot, "snapshot.zip")
-      val copyHook      = copyLocalFileHookForTesting
-      trace.measure("spark.backup.upload", "durability") {
-        if (copyHook != null) copyHook(fs, archive, remoteArchive)
-        else fs.copyFromLocalFile(false, true, new Path(archive.getAbsolutePath), remoteArchive)
-        OpenIvmSnapshotArchive.checkInterrupted()
-        val remoteBytes = fs.getFileStatus(remoteArchive).getLen
-        if (remoteBytes != archiveBytes)
-          throw new java.io.IOException("openivm state-sync: uploaded archive length mismatch")
-        trace.markUploaded(remoteBytes)
-      }
-      val pendingCommit = new Path(commitRoot, s".$generation.pending")
-      val committed     = new Path(commitRoot, s"$generation.commit")
-      trace.measure("spark.backup.commit", "durability") {
-        val output = fs.create(pendingCommit, false)
-        try
-          output.write(
-            s"OPENIVM_STATE_SNAPSHOT_V2\n$generation\n$archiveBytes\n${checksum}\n".getBytes(
-              StandardCharsets.UTF_8
-            )
+    val copyHook      = copyLocalFileHookForTesting
+    trace.measure("spark.backup.upload", "durability") {
+      if (copyHook != null) copyHook(fs, archive, remoteArchive)
+      else fs.copyFromLocalFile(false, true, new Path(archive.getAbsolutePath), remoteArchive)
+      OpenIvmSnapshotArchive.checkInterrupted()
+      val remoteBytes = fs.getFileStatus(remoteArchive).getLen
+      if (remoteBytes != archiveBytes)
+        throw new java.io.IOException("openivm state-sync: uploaded archive length mismatch")
+      trace.markUploaded(remoteBytes)
+    }
+    val pendingCommit = new Path(commitRoot, s".$generation.pending")
+    val committed     = new Path(commitRoot, s"$generation.commit")
+    trace.measure("spark.backup.commit", "durability") {
+      val output = fs.create(pendingCommit, false)
+      try
+        output.write(
+          s"OPENIVM_STATE_SNAPSHOT_V2\n$generation\n$archiveBytes\n${checksum}\n".getBytes(
+            StandardCharsets.UTF_8
           )
-        finally output.close()
-        val commitHook = beforeSnapshotCommitHookForTesting
-        if (commitHook != null) commitHook()
-        OpenIvmSnapshotArchive.checkInterrupted()
-        if (!fs.rename(pendingCommit, committed))
-          throw new java.io.IOException(s"openivm state-sync: cannot publish snapshot commit $committed")
-        trace.markPublished()
-      }
-      onCommitted()
-      log.info(
-        s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
-      )
-      val pruneStarted = trace.beginPhase("spark.backup.prune", "lifecycle")
-      val pruned       = pruneGenerations(fs, controlRoot, FeatureGate.stateSyncRetainGenerations(spark))
-      trace.markPruned(pruned.deletedPaths)
-      trace.endPhase(
-        pruneStarted,
-        if (pruned.failure.isDefined) "failed" else "success",
-        counts = Map("deleted_paths" -> pruned.deletedPaths),
-        error = pruned.failure
-      )
+        )
+      finally output.close()
+      val commitHook = beforeSnapshotCommitHookForTesting
+      if (commitHook != null) commitHook()
+      OpenIvmSnapshotArchive.checkInterrupted()
+      if (!fs.rename(pendingCommit, committed))
+        throw new java.io.IOException(s"openivm state-sync: cannot publish snapshot commit $committed")
+      trace.markPublished()
+    }
+    onCommitted()
+    log.info(
+      s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
+    )
+    val pruneStarted = trace.beginPhase("spark.backup.prune", "lifecycle")
+    val pruned       = pruneGenerations(fs, controlRoot, FeatureGate.stateSyncRetainGenerations(spark))
+    trace.markPruned(pruned.deletedPaths)
+    trace.endPhase(
+      pruneStarted,
+      if (pruned.failure.isDefined) "failed" else "success",
+      counts = Map("deleted_paths" -> pruned.deletedPaths),
+      error = pruned.failure
+    )
   }
 
   // Explicit guarded entry points; there is no configured OneLake transport or legacy fallback.

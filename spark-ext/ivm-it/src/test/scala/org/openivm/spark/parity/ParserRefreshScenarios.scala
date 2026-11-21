@@ -226,7 +226,7 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
         proof.getString(2) shouldBe "`ensure_mv_p15`"
         (3 to 5).foreach(i => proof.getString(i) should not be empty)
         assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
-        val meta           = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
+        val meta = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
         MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15")).get shouldBe meta
         val version        = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
         val oldBackend     = spark.conf.getOption("spark.openivm.catalog.backend")

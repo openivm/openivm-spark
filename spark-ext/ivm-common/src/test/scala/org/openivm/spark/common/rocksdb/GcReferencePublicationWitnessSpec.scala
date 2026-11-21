@@ -15,7 +15,8 @@ import scala.jdk.CollectionConverters._
 
 private[rocksdb] object GcReferencePublicationWitness {
   def session(warehouse: Path, destination: Path): SparkSession =
-    SparkSession.builder()
+    SparkSession
+      .builder()
       .master("local[1]")
       .appName("openivm-gc-reference-publication-witness")
       .config("spark.ui.enabled", "false")
@@ -29,7 +30,7 @@ private[rocksdb] object GcReferencePublicationWitness {
       .getOrCreate()
 
   def main(args: Array[String]): Unit = {
-    val spark = session(Paths.get(args(1)), Paths.get(args(2)))
+    val spark    = session(Paths.get(args(1)), Paths.get(args(2)))
     val location = args(3)
     try {
       OpenIvmStateSync.maybeRestore(spark)
@@ -63,12 +64,17 @@ private[rocksdb] object GcReferencePublicationWitness {
 class GcReferencePublicationWitnessSpec extends AnyFunSpec with Matchers {
   private def fingerprint(root: Path): Map[String, (Long, Seq[Byte])] = {
     val files = Files.walk(root)
-    try files.iterator().asScala.map { path =>
-      val digest =
-        if (Files.isRegularFile(path)) MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(path)).toSeq
-        else Seq.empty[Byte]
-      root.relativize(path).toString -> (Files.getLastModifiedTime(path).toMillis, digest)
-    }.toMap
+    try
+      files
+        .iterator()
+        .asScala
+        .map { path =>
+          val digest =
+            if (Files.isRegularFile(path)) MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(path)).toSeq
+            else Seq.empty[Byte]
+          root.relativize(path).toString -> (Files.getLastModifiedTime(path).toMillis, digest)
+        }
+        .toMap
     finally files.close()
   }
 
@@ -104,16 +110,16 @@ class GcReferencePublicationWitnessSpec extends AnyFunSpec with Matchers {
 
   describe("OneLake collector admission, with no deletion or remote requests") {
     it("cannot infer reference liveness from unchanged Delta object versions") {
-      val root = Files.createTempDirectory(Paths.get("target").toAbsolutePath, "gc-live-reference-")
+      val root        = Files.createTempDirectory(Paths.get("target").toAbsolutePath, "gc-live-reference-")
       val destination = Files.createDirectory(root.resolve("published"))
-      val warehouse = root.resolve("collector")
-      val payload = warehouse.resolve("_ivm/staging/default_witness_source/INSERT/witness")
-      val spark = GcReferencePublicationWitness.session(warehouse, destination)
+      val warehouse   = root.resolve("collector")
+      val payload     = warehouse.resolve("_ivm/staging/default_witness_source/INSERT/witness")
+      val spark       = GcReferencePublicationWitness.session(warehouse, destination)
       try {
         spark.range(1).write.format("delta").save(payload.toUri.toString)
-        val location = payload.toUri.toString
+        val location             = payload.toUri.toString
         val candidateFingerprint = fingerprint(payload)
-        val plan = OpenIvmGarbageCollector.prepare(spark).get
+        val plan                 = OpenIvmGarbageCollector.prepare(spark).get
         plan.referenced shouldBe empty
         plan.tombstoned shouldBe empty
 
@@ -126,55 +132,55 @@ class GcReferencePublicationWitnessSpec extends AnyFunSpec with Matchers {
         OpenIvmRocksDBRegistry.closeAll()
         spark.stop()
       }
-      }
+    }
 
-      it("cannot use generation age to retire an in-flight publisher's unchanged archive") {
-        val root = Files.createTempDirectory(Paths.get("target").toAbsolutePath, "gc-live-generation-")
-        val destination = Files.createDirectory(root.resolve("published"))
-        val comparison = Files.createDirectory(root.resolve("comparison"))
-        val spark = GcReferencePublicationWitness.session(root.resolve("local"), comparison)
-        val control = destination.resolve(".openivm-state-sync")
-        val commits = control.resolve("commits")
-        val snapshots = control.resolve("snapshots")
-        def names(path: Path): Seq[String] = {
-          val entries = Files.list(path)
-          try entries.iterator().asScala.map(_.getFileName.toString).toVector.sorted
-          finally entries.close()
-        }
-        var generation = ""
-        try {
-          StagingCatalog.record(
-            spark,
-            StagingDelta("default.witness_source", "INSERT", root.resolve("newer").toString, new Timestamp(2000L), Nil)
-          )
-          freshProcess("pending", root, destination, root.resolve("older").toString) {
-            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60)
-            while (!Files.exists(root.resolve("pending-ready")) && System.nanoTime() < deadline) Thread.sleep(25)
-            Files.exists(root.resolve("pending-ready")) shouldBe true
-            val pendingMarkers = names(commits).filter(_.endsWith(".pending"))
-            pendingMarkers.size shouldBe 1
-            val pending = pendingMarkers.head
-            generation = pending.stripPrefix(".").stripSuffix(".pending")
-            val original = fingerprint(snapshots.resolve(generation))
-            val stagedAt = generation.takeWhile(_ != '-').toLong
-            while (System.currentTimeMillis() <= stagedAt && System.nanoTime() < deadline) Thread.sleep(1)
-            (System.currentTimeMillis() > stagedAt) shouldBe true
-            OpenIvmStateSync.backupNow(spark)
-            OpenIvmStateSync.backupNow(spark)
-            val comparisonCommits = comparison.resolve(".openivm-state-sync").resolve("commits")
-            val oldestRetained =
-              names(comparisonCommits).filter(_.endsWith(".commit")).takeRight(2).head.stripSuffix(".commit")
-            (generation < oldestRetained) shouldBe true
-            (pending.stripPrefix(".") < oldestRetained) shouldBe true
-            fingerprint(snapshots.resolve(generation)) shouldBe original
-            Files.createFile(root.resolve("pending-release"))
-          }
-          Files.exists(commits.resolve(s"$generation.commit")) shouldBe true
-          Files.isRegularFile(snapshots.resolve(generation).resolve("snapshot.zip")) shouldBe true
-        } finally {
-          OpenIvmRocksDBRegistry.closeAll()
-          spark.stop()
-        }
+    it("cannot use generation age to retire an in-flight publisher's unchanged archive") {
+      val root        = Files.createTempDirectory(Paths.get("target").toAbsolutePath, "gc-live-generation-")
+      val destination = Files.createDirectory(root.resolve("published"))
+      val comparison  = Files.createDirectory(root.resolve("comparison"))
+      val spark       = GcReferencePublicationWitness.session(root.resolve("local"), comparison)
+      val control     = destination.resolve(".openivm-state-sync")
+      val commits     = control.resolve("commits")
+      val snapshots   = control.resolve("snapshots")
+      def names(path: Path): Seq[String] = {
+        val entries = Files.list(path)
+        try entries.iterator().asScala.map(_.getFileName.toString).toVector.sorted
+        finally entries.close()
       }
+      var generation = ""
+      try {
+        StagingCatalog.record(
+          spark,
+          StagingDelta("default.witness_source", "INSERT", root.resolve("newer").toString, new Timestamp(2000L), Nil)
+        )
+        freshProcess("pending", root, destination, root.resolve("older").toString) {
+          val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60)
+          while (!Files.exists(root.resolve("pending-ready")) && System.nanoTime() < deadline) Thread.sleep(25)
+          Files.exists(root.resolve("pending-ready")) shouldBe true
+          val pendingMarkers = names(commits).filter(_.endsWith(".pending"))
+          pendingMarkers.size shouldBe 1
+          val pending = pendingMarkers.head
+          generation = pending.stripPrefix(".").stripSuffix(".pending")
+          val original = fingerprint(snapshots.resolve(generation))
+          val stagedAt = generation.takeWhile(_ != '-').toLong
+          while (System.currentTimeMillis() <= stagedAt && System.nanoTime() < deadline) Thread.sleep(1)
+          (System.currentTimeMillis() > stagedAt) shouldBe true
+          OpenIvmStateSync.backupNow(spark)
+          OpenIvmStateSync.backupNow(spark)
+          val comparisonCommits = comparison.resolve(".openivm-state-sync").resolve("commits")
+          val oldestRetained =
+            names(comparisonCommits).filter(_.endsWith(".commit")).takeRight(2).head.stripSuffix(".commit")
+          (generation < oldestRetained) shouldBe true
+          (pending.stripPrefix(".") < oldestRetained) shouldBe true
+          fingerprint(snapshots.resolve(generation)) shouldBe original
+          Files.createFile(root.resolve("pending-release"))
+        }
+        Files.exists(commits.resolve(s"$generation.commit")) shouldBe true
+        Files.isRegularFile(snapshots.resolve(generation).resolve("snapshot.zip")) shouldBe true
+      } finally {
+        OpenIvmRocksDBRegistry.closeAll()
+        spark.stop()
+      }
+    }
   }
 }

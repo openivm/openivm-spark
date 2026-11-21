@@ -563,7 +563,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         "checkpoint-candidate-publication-lock",
         remote,
         Seq(
-          FeatureGate.StatePathKey -> stateRoot.getAbsolutePath,
+          FeatureGate.StatePathKey                  -> stateRoot.getAbsolutePath,
           FeatureGate.StateSyncRetainGenerationsKey -> "2"
         )
       )
@@ -573,10 +573,10 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       Files.write(marker.toPath, Array[Byte](1, 3, 5, 7))
       recordProfile(spark, s"candidate-lock-${UUID.randomUUID()}")
 
-      val candidatePublished = new CountDownLatch(1)
-      val releaseCandidate   = new CountDownLatch(1)
+      val candidatePublished  = new CountDownLatch(1)
+      val releaseCandidate    = new CountDownLatch(1)
       val asyncCaptureStarted = new CountDownLatch(1)
-      val watchAsyncCapture = new AtomicBoolean(false)
+      val watchAsyncCapture   = new AtomicBoolean(false)
       OpenIvmStateSync.setBeforeCaptureHookForTesting(() => {
         if (watchAsyncCapture.get()) asyncCaptureStarted.countDown()
       })
@@ -681,7 +681,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
       }
 
       var activeRequest: Future[Unit] = null
-      var waiterThread: Thread         = null
+      var waiterThread: Thread        = null
       try {
         val requestsBefore = OpenIvmStateSync.synchronousRequestCountForTesting(spark)
         activeRequest = request("active-candidate-capture")
@@ -691,21 +691,24 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         val waiterFailure     = new AtomicReference[Throwable]()
         val waiterInterrupted = new AtomicBoolean(false)
         val waiterStarted     = new CountDownLatch(1)
-        waiterThread = new Thread(new Runnable {
-          override def run(): Unit = {
-            waiterStarted.countDown()
-            setRequestId(spark, "cancelled-candidate-waiter")
-            try {
-              OpenIvmStateSync.backupNow(spark)
-              waiterFailure.set(new AssertionError("cancelled waiter unexpectedly returned successfully"))
-            } catch {
-              case error: Throwable => waiterFailure.set(error)
-            } finally {
-              waiterInterrupted.set(Thread.currentThread().isInterrupted)
-              setRequestId(spark, null)
+        waiterThread = new Thread(
+          new Runnable {
+            override def run(): Unit = {
+              waiterStarted.countDown()
+              setRequestId(spark, "cancelled-candidate-waiter")
+              try {
+                OpenIvmStateSync.backupNow(spark)
+                waiterFailure.set(new AssertionError("cancelled waiter unexpectedly returned successfully"))
+              } catch {
+                case error: Throwable => waiterFailure.set(error)
+              } finally {
+                waiterInterrupted.set(Thread.currentThread().isInterrupted)
+                setRequestId(spark, null)
+              }
             }
-          }
-        }, "checkpoint-cancelled-candidate-waiter")
+          },
+          "checkpoint-cancelled-candidate-waiter"
+        )
         waiterThread.start()
         waiterStarted.await(10, TimeUnit.SECONDS) shouldBe true
         awaitSynchronousRequestCount(spark, requestsBefore + 2)
@@ -756,14 +759,14 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         "checkpoint-telemetry-fresh-publication",
         remote,
         Seq(
-          FeatureGate.StatePathKey -> stateRoot.getAbsolutePath,
+          FeatureGate.StatePathKey           -> stateRoot.getAbsolutePath,
           FeatureGate.OneLakeTelemetryDirKey -> telemetryDir.toURI.toString
         )
       )
       OpenIvmStateBarrier.mutationCoverageEnabled(spark) shouldBe false
       recordProfile(spark, s"telemetry-fresh-${UUID.randomUUID()}")
       val mutationGeneration = OpenIvmStateBarrier.currentMutationGeneration(spark)
-      val evidence = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
+      val evidence           = new CopyOnWriteArrayList[OpenIvmExecutionSpan.StateSyncEvidence]()
       OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(value => { evidence.add(value); () })
       try {
         setRequestId(spark, "telemetry-fresh-first")
@@ -797,8 +800,9 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         receipts.asScala.exists(receipt => receipt.acknowledged && receipt.reused) shouldBe false
 
         val telemetryFiles = Files.walk(telemetryDir.toPath)
-        val hasReceipt = try telemetryFiles.iterator().asScala.exists(_.getFileName.toString.endsWith(".jsonl"))
-        finally telemetryFiles.close()
+        val hasReceipt =
+          try telemetryFiles.iterator().asScala.exists(_.getFileName.toString.endsWith(".jsonl"))
+          finally telemetryFiles.close()
         hasReceipt shouldBe true
       } finally {
         setRequestId(spark, null)
@@ -849,7 +853,7 @@ class OpenIvmStateSyncCheckpointCanarySpec extends AnyFunSpec with BeforeAndAfte
         "checkpoint-root-b",
         remote,
         Seq(
-          FeatureGate.StatePathKey -> stateB.getAbsolutePath,
+          FeatureGate.StatePathKey    -> stateB.getAbsolutePath,
           FeatureGate.StateSyncUriKey -> remote.getAbsolutePath
         )
       )

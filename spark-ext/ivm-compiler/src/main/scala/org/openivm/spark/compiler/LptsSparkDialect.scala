@@ -150,7 +150,11 @@ object LptsSparkDialect {
                                   rewriteToTimestampDoubleCast(
                                     SparkFunctionShimSql.restoreStructMaxBy(
                                       SparkFunctionShimSql.restoreWindowOffsetLiterals(
-                                        rewriteNowTimestamp(rewriteLikeOperators(rewriteQuotedCastTypes(sql)))
+                                        rewriteNowTimestamp(
+                                          rewriteLikeOperators(
+                                            rewriteQuotedCastTypes(stripNativeBuiltinQualification(sql))
+                                          )
+                                        )
                                       )
                                     )
                                   )
@@ -169,6 +173,21 @@ object LptsSparkDialect {
         )
       )
     )
+
+  private val NativeBuiltinQualifier =
+    """(?i)(?:"system"|system)\s*\.\s*(?:"main"|main)\s*\.\s*(?=(?:[a-z_][a-z0-9_$]*|"[a-z_][a-z0-9_$]*")\s*\()""".r.pattern
+
+  /** DuckDB 2 qualifies bound builtins with its private system catalog. */
+  private[compiler] def stripNativeBuiltinQualification(sql: String): String =
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true, protectDoubleQuotes = false) { index =>
+      var before = index - 1
+      while (before >= 0 && sql.charAt(before).isWhitespace) before -= 1
+      val boundary = (index == 0 || !(sql.charAt(index - 1).isLetterOrDigit ||
+        sql.charAt(index - 1) == '_' || sql.charAt(index - 1) == '$')) &&
+        (before < 0 || sql.charAt(before) != '.')
+      val matcher = NativeBuiltinQualifier.matcher(sql).region(index, sql.length)
+      if (boundary && matcher.lookingAt()) Some(matcher.end() -> "") else None
+    }
 
   private val NativeMainTrim = """(?i)main\s*\.\s*(`trim`|trim)\s*(?=\()""".r.pattern
 

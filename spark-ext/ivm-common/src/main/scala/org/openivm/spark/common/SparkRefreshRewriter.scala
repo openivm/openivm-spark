@@ -731,7 +731,7 @@ object SparkRefreshRewriter {
         )
       )
 
-      var viewDeltaMaterialized = false
+      var viewDeltaMaterialized   = false
       var hasRunningWindowProgram = false
       def rewriteOne(stmt: String): Seq[String] = {
         val kind = classify(stmt, viewLogicalName)
