@@ -359,6 +359,9 @@ object OpenIvmStateSync {
     OpenIvmStateBarrier.register(spark)
     val archive = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
     val capture = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
+    val reuse = FeatureGate.stateSyncCheckpointReuseEnabled(spark)
+    val outcomes = scala.collection.mutable.ArrayBuffer.empty[(String, String)]
+    var published = false
     try {
       val captureHook = beforeCaptureHookForTesting
       if (captureHook != null) captureHook()
@@ -374,7 +377,8 @@ object OpenIvmStateSync {
         databases.foreach { db =>
           val target = capture.toPath.resolve(localBase.relativize(db))
           Files.createDirectories(target.getParent)
-          OpenIvmRocksDBRegistry.checkpoint(spark, db.toString, target)
+          val outcome = OpenIvmRocksDBRegistry.checkpoint(spark, db.toString, target, reuse)
+          if (reuse) outcomes += db.toString -> outcome
         }
         files.filterNot(file => databases.exists(file.toPath.startsWith)).foreach { file =>
           OpenIvmSnapshotArchive.checkInterrupted()
@@ -414,11 +418,19 @@ object OpenIvmStateSync {
       OpenIvmSnapshotArchive.checkInterrupted()
       if (!fs.rename(pendingCommit, committed))
         throw new java.io.IOException(s"openivm state-sync: cannot publish snapshot commit $committed")
+      published = true
+      if (reuse) outcomes.foreach { case (path, outcome) =>
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+          .digest(path.getBytes(StandardCharsets.UTF_8)).map(byte => f"${byte & 0xff}%02x").mkString
+        log.info(s"openivm state-sync: checkpoint generation=$generation store=$digest outcome=$outcome")
+      }
       log.info(
         s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
       )
       pruneGenerations(fs, controlRoot, FeatureGate.stateSyncRetainGenerations(spark))
     } finally {
+      if (reuse && !published)
+        log.warn(s"openivm state-sync: checkpoint generation=$generation outcome=failed_publication")
       try Files.deleteIfExists(archive.toPath)
       finally deleteStagedTree(capture)
     }
