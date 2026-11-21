@@ -1348,7 +1348,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       merge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
       merge should include("WITH openivm_affected AS")
       merge should include("SELECT * FROM openivm_affected")
-      merge should include("ON _k <=> openivm_left_key OR _k <=> openivm_right_key")
+      merge should include("ON d._k <=> v.openivm_left_key OR d._k <=> v.openivm_right_key")
       merge should include("WHEN MATCHED THEN DELETE")
     }
 
@@ -1832,19 +1832,24 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           mvVersionBeforeRefresh = Some(3)
         )
         .statements
-      val dataInsert = rewritten
-        .find(_.startsWith("INSERT INTO `default`.`wradm_mv`"))
+      val markedDataInsert = rewritten
+        .find(_.contains("INSERT INTO `default`.`wradm_mv`"))
         .getOrElse(fail("materialized suffix data insert missing"))
+      markedDataInsert should include(SparkRefreshRewriter.RunningWindowSuffixMarker)
+      val dataInsert = SparkRefreshRewriter.stripExecutionMarker(markedDataInsert)
       dataInsert should include("(dm_s_symb, dm_date, dm_close, run_sum)")
       dataInsert should include("SELECT * FROM openivm_run_result_wradm_mv")
-      val append = rewritten
-        .find(_.startsWith("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`"))
+      val markedAppend = rewritten
+        .find(_.contains("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`"))
         .getOrElse(fail("materialized suffix cascade append missing"))
+      markedAppend should include(SparkRefreshRewriter.RunningWindowSuffixMarker)
+      val append = SparkRefreshRewriter.stripExecutionMarker(markedAppend)
       append should include("FROM openivm_run_result_wradm_mv")
       append should not include "openivm_timestamp"
       append should include("CURRENT_TIMESTAMP")
-      rewritten.count(_.startsWith("CACHE TABLE `openivm_run_result_wradm_mv`")) shouldBe 1
-      rewritten.count(_.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
+      val executable = rewritten.map(SparkRefreshRewriter.stripExecutionMarker)
+      executable.count(_.startsWith("CACHE TABLE `openivm_run_result_wradm_mv`")) shouldBe 1
+      executable.count(_.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
     }
 
     it("drops running-window helper objects as views") {
