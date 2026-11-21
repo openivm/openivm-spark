@@ -1,69 +1,83 @@
-name: devcontainer image
-
+name: temporary digest qualification
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.devcontainer/**'
-      - 'package.json'
-      - 'package-lock.json'
-      - 'nx.json'
-      - 'prettier.config.mjs'
-      - 'tsconfig.json'
-      - 'tsconfig.base.json'
-      - 'spark-ext/.sbtopts'
-      - 'spark-ext/build.sbt'
-      - 'spark-ext/dev/docker/entrypoint.sh'
-      - 'spark-ext/dev/pins.env'
-      - 'spark-ext/dev/targets/**'
-      - 'spark-ext/project/**'
-      - '.github/workflows/devcontainer-image.yaml'
   workflow_dispatch:
-
-concurrency:
-  group: devcontainer-image-${{ github.ref }}
-  cancel-in-progress: false
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
-  image:
+  qualify:
     runs-on: [self-hosted, openivm-spark-azure]
     timeout-minutes: 350
-    permissions:
-      contents: read
-      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [spark-3.5, spark-4.1]
+    container:
+      image: ghcr.io/openivm/openivm-spark-devcontainer@sha256:8f66308decb881f370ad5acb7217dda85cd121917a36f87f173d6222bd51ee40
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      NX_DAEMON: 'false'
+      NX_NO_CLOUD: 'true'
+      OPENIVM_TEST_FORKS: '4'
+      OPENIVM_NATIVE_DIR: /opt/openivm
     steps:
-      - name: Checkout
+      - name: Checkout exact keeper
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-
-      - name: Isolate registry credentials
-        run: |
-          config="$RUNNER_TEMP/openivm-image-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir -p "$config"
-          echo "DOCKER_CONFIG=$config" >> "$GITHUB_ENV"
-
-      - name: Use Node 24.11.1
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: 24.11.1
-          cache: npm
-
+          ref: d40c352727f12b992e2f38b44c8cb100a444135e
+          fetch-depth: 0
+      - name: Attest native runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = d40c352727f12b992e2f38b44c8cb100a444135e
+          source spark-ext/dev/pins.env
+          sha256sum /opt/openivm/duckdb /opt/openivm/openivm.duckdb_extension
+          /opt/openivm/duckdb --version
+          actual="$(/opt/openivm/duckdb -unsigned -noheader -csv -c "LOAD '/opt/openivm/openivm.duckdb_extension'; SELECT extension_version FROM duckdb_extensions() WHERE extension_name='openivm' AND loaded;")"
+          [[ "$actual" =~ ^[0-9a-f]{7,40}$ && "$OPENIVM_COMMIT" == "$actual"* ]]
+          echo "Native extension source: $actual"
+          ldd /opt/openivm/duckdb
+          ldd /opt/openivm/openivm.duckdb_extension
       - name: Install locked tooling
-        run: npm ci --no-audit --no-fund
-
-      - name: Validate Docker
-        run: ./contrib/bootstrap-ci.sh
-
-      - name: Synchronize candidate image reference
-        run: npx --no-install nx run devcontainer:tag -- --update-consumer
-
-      - name: Build, test, and publish immutable image
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx --no-install nx run devcontainer:publish
-
-      - name: Remove registry credentials
-        if: always()
-        run: docker logout ghcr.io || true
+        run: npm ci --prefer-offline --no-audit --no-fund
+      - name: Focused Spark and checkpoint regressions
+        run: >-
+          npx --no-install nx run spark-ext:test --configuration=${{ matrix.target }} --
+          'ivmCommon/testOnly org.openivm.spark.common.SparkRefreshRewriterSpec org.openivm.spark.common.rocksdb.OpenIvmStateSyncCheckpointCanarySpec org.openivm.spark.common.rocksdb.OpenIvmCheckpointReuseSpec'
+          'ivmCompiler/testOnly org.openivm.spark.compiler.OpenIvmCompilerSpec org.openivm.spark.compiler.CompilerRuntimeProbeSpec'
+          'ivmExtension/testOnly org.openivm.spark.commands.MaterializedViewCommandsSpec org.openivm.spark.commands.BundledCompilerAssetsSpec'
+          'ivmIt/testOnly org.openivm.spark.parity.AggregateHavingSpec org.openivm.spark.parity.AggregateHavingCdfSpec org.openivm.spark.parity.AggregateHavingJoinSpec org.openivm.spark.parity.AggregateHavingJoinCdfSpec'
+      - name: Build assembly
+        run: npx --no-install nx run spark-ext:assembly --configuration=${{ matrix.target }}
+      - name: Attest assembly resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t jars < <(find spark-ext/ivm-extension/target -name '*assembly*.jar' -type f)
+          test "${#jars[@]}" -eq 1
+          jar="${jars[0]}"
+          sha256sum "$jar"
+          for file in duckdb openivm.duckdb_extension; do
+            expected="$(sha256sum "/opt/openivm/$file" | cut -d' ' -f1)"
+            actual="$(unzip -p "$jar" "openivm-native/$file" | sha256sum | cut -d' ' -f1)"
+            test "$actual" = "$expected"
+            echo "$file $actual"
+          done
+          if unzip -Z1 "$jar" | grep -E '(^|/)org/duckdb/' >/dev/null; then
+            echo 'Unexpected DuckDB JDBC classes in assembly' >&2
+            exit 1
+          fi
+          echo 'DuckDB JDBC classes absent'
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-${{ matrix.target }}-${{ github.run_id }}
+          path: .logs/
+          if-no-files-found: ignore
+          include-hidden-files: true
