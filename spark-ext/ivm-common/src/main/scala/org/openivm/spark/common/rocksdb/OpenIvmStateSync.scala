@@ -94,7 +94,8 @@ object OpenIvmStateSync {
       requestId: String,
       requestedMutationGeneration: Long,
       coverageEligible: Boolean,
-      completion: CompletableFuture[CandidateCompletion]
+      completion: CompletableFuture[CandidateCompletion],
+      receiptRecorded: CompletableFuture[Unit]
   )
 
   private final case class CandidateCompletion(receipt: StateSyncRequestReceipt, failure: Option[Throwable] = None)
@@ -191,6 +192,12 @@ object OpenIvmStateSync {
         pass: () => CandidatePassResult,
         recordReceipt: StateSyncRequestReceipt => Unit
     ): Unit = {
+      def finish(req: SynchronousCandidateRequest, result: CandidateCompletion): Unit =
+        if (req.completion.complete(result)) {
+          try recordReceipt(result.receipt)
+          finally req.receiptRecorded.complete(())
+        }
+
       var completed: CandidateCompletion = null
       try {
         while (!request.completion.isDone) {
@@ -208,7 +215,7 @@ object OpenIvmStateSync {
                     ).toVector
                     candidateRequests --= reusable
                     reusable.foreach { req =>
-                      req.completion.complete(CandidateCompletion(
+                      finish(req, CandidateCompletion(
                           StateSyncRequestReceipt(
                             req.requestId, req.requestedMutationGeneration,
                             Some(coverage.capturedMutationGeneration), Some(coverage.generation),
@@ -248,7 +255,7 @@ object OpenIvmStateSync {
                   if (failure != null) {
                     publishedCoverage = None
                     batch.foreach { req =>
-                      req.completion.complete(CandidateCompletion(StateSyncRequestReceipt(
+                      finish(req, CandidateCompletion(StateSyncRequestReceipt(
                           req.requestId, req.requestedMutationGeneration, None, None,
                           published = false, reused = false, coverageProven = false,
                           acknowledged = false, outcome = "publication_failed"
@@ -257,7 +264,7 @@ object OpenIvmStateSync {
                   } else if (result.noState) {
                     publishedCoverage = None
                     batch.foreach { req =>
-                      req.completion.complete(CandidateCompletion(StateSyncRequestReceipt(
+                      finish(req, CandidateCompletion(StateSyncRequestReceipt(
                           req.requestId, req.requestedMutationGeneration, None, None,
                           published = false, reused = false, coverageProven = false,
                           acknowledged = true, outcome = "no_local_state"
@@ -269,7 +276,7 @@ object OpenIvmStateSync {
                       "openivm state-sync: synchronous pass produced no committed publication"
                     )
                     batch.foreach { req =>
-                      req.completion.complete(CandidateCompletion(StateSyncRequestReceipt(
+                      finish(req, CandidateCompletion(StateSyncRequestReceipt(
                           req.requestId, req.requestedMutationGeneration, None, None,
                           published = false, reused = false, coverageProven = false,
                           acknowledged = false, outcome = "publication_missing"
@@ -289,7 +296,7 @@ object OpenIvmStateSync {
                       val proof = !shared && req.coverageEligible &&
                         captured.exists(_ >= req.requestedMutationGeneration)
                       if (shared || !req.coverageEligible || proof) {
-                        req.completion.complete(CandidateCompletion(StateSyncRequestReceipt(
+                        finish(req, CandidateCompletion(StateSyncRequestReceipt(
                             req.requestId, req.requestedMutationGeneration, captured,
                             Some(publication.generation), published = true, reused = false,
                             coverageProven = proof, acknowledged = true,
@@ -330,7 +337,7 @@ object OpenIvmStateSync {
           if (cancelled || request.completion.isCompletedExceptionally) throw interrupted
           completed = request.completion.join()
       }
-      recordReceipt(completed.receipt)
+      request.receiptRecorded.join()
       completed.failure.foreach(error => throw error)
     }
 
@@ -893,7 +900,11 @@ object OpenIvmStateSync {
         var candidate: SynchronousCandidateRequest = null
         OpenIvmStateBarrier.withCurrentMutationGeneration(spark) { requestedGeneration =>
           candidate = SynchronousCandidateRequest(
-            requestId, requestedGeneration, coverageEligible, new CompletableFuture[CandidateCompletion]()
+            requestId,
+            requestedGeneration,
+            coverageEligible,
+            new CompletableFuture[CandidateCompletion](),
+            new CompletableFuture[Unit]()
           )
           state.submitCandidate(candidate)
         }
