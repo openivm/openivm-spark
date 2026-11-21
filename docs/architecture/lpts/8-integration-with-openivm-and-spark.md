@@ -1,5 +1,8 @@
 # 8. Integration with OpenIVM and Spark
 
+> [!IMPORTANT]
+> Native version and JDBC references below describe an earlier snapshot. For current pins, see `spark-ext/dev/pins.env`. The compiler loads the extension through the matching DuckDB CLI; the project does not depend on DuckDB JDBC.
+
 > Scope: how LPTS is used by OpenIVM, and how that OpenIVM output is consumed
 > by openivm-spark.
 >

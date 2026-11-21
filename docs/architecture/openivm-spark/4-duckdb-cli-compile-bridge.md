@@ -1,5 +1,8 @@
 # 4. DuckDB CLI compile bridge
 
+> [!IMPORTANT]
+> Native version and JDBC references below describe an earlier snapshot. For current pins, see `spark-ext/dev/pins.env`. The compiler loads the extension through the matching DuckDB CLI; the project does not depend on DuckDB JDBC.
+
 ## This chapter documents the compile bridge in `spark-ext/ivm-compiler/src/main/scala/org/openivm/spark/compiler/OpenIvmCompiler.scala`. The bridge is the Spark extension's boundary to OpenIVM's DuckDB-side compiler. It does not maintain a long-lived DuckDB connection. It does not execute refresh SQL. It does not mutate Spark tables. It turns one Spark materialized-view body into one `CompiledRefresh` value. That value contains the refresh classification and the DuckDB/OpenIVM-emitted SQL program that later Spark-side code rewrites and executes.
 
 ## 1. What it is
