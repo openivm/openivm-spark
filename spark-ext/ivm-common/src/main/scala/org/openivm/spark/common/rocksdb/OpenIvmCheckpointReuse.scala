@@ -83,7 +83,9 @@ private[rocksdb] object OpenIvmCheckpointReuse {
         }
       }
     } catch {
-      case interrupted: java.io.InterruptedIOException => throw interrupted
+      case _: java.io.InterruptedIOException =>
+        Thread.currentThread().interrupt()
+        log.info("openivm state-sync: interrupted after publication; checkpoint reuse retention skipped")
       case NonFatal(error) => log.warn("openivm state-sync: could not retain checkpoint for reuse", error)
     }
   }

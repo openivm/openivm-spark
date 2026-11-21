@@ -8,6 +8,26 @@ import scala.jdk.CollectionConverters._
 
 class OpenIvmCheckpointReuseSpec extends AnyFunSpec with Matchers {
   describe("checkpoint reuse") {
+    it("preserves interruption without failing optional retention after publication") {
+      val root = Files.createTempDirectory("openivm-checkpoint-retain-test-")
+      val db = new OpenIvmRocksDB(root.resolve("live").toString, OpenIvmRocksDBConf.default, Seq("meta"))
+      try {
+        db.load()
+        db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("k"), RocksDBCodec.utf8("v")))
+        val captured = OpenIvmCheckpointReuse.checkpoint(db, root.resolve("checkpoint"))
+        Thread.currentThread().interrupt()
+        captured.retain.get.apply()
+        Thread.currentThread().isInterrupted shouldBe true
+      } finally {
+        Thread.interrupted()
+        db.close()
+        OpenIvmCheckpointReuse.clearForTesting()
+        val paths = Files.walk(root)
+        try paths.iterator().asScala.toVector.sortBy(_.getNameCount).reverse.foreach(Files.delete(_))
+        finally paths.close()
+      }
+    }
+
     it("reuses unchanged live stores and falls back on changes, corruption, and replacement") {
       val root = Files.createTempDirectory("openivm-checkpoint-reuse-test-")
       val live = root.resolve("live")
