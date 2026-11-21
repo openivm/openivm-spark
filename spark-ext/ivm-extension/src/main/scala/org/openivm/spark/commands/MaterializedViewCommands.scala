@@ -3918,7 +3918,7 @@ case class RefreshMaterializedViewCommand(
         try {
           DriverHeavyOperationAdmission.withPermit(spark, "refresh") {
             org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
-              runUnderLock(cloned, lockAcqMs)
+              runUnderLock(cloned, lockAcqMs, spark)
             }
           }
         } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
@@ -4280,7 +4280,7 @@ case class RefreshMaterializedViewCommand(
     recovered
   }
 
-  private def runUnderLock(spark: SparkSession, lockAcqMs: Long): Seq[Row] = {
+  private def runUnderLock(spark: SparkSession, lockAcqMs: Long, compilerSession: SparkSession): Seq[Row] = {
     import MvCommandHelper._
     import org.openivm.spark.compiler.LptsSparkDialect
 
@@ -5587,7 +5587,9 @@ case class RefreshMaterializedViewCommand(
         sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
         facts = compileFacts
       )
-      lazy val sessionCompiler = OpenIvmCompilers.session(spark)
+      // The execution session is a fresh clone with its own temporary views.
+      // Compile programs belong to the caller's session so they survive across refreshes.
+      lazy val sessionCompiler = OpenIvmCompilers.session(compilerSession)
       val reuseInSession       = preparedSourceAdvance.isEmpty && refreshResolvedPins.isEmpty
 
       // Store the native program before rewriting it for this invocation's
