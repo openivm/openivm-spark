@@ -113,7 +113,15 @@ object CdfChangeAvailability {
         ).map(detail => source -> s"cdf_change_data_unavailable ($detail)")
     }
 
-    if (!parallel || sources.size <= 1) sources.flatMap(check).toMap
+    mapSources(spark, sources, parallel)(check).flatten.toMap
+  }
+
+  private[spark] def mapSources[A, B](
+      spark: SparkSession,
+      sources: Seq[A],
+      parallel: Boolean
+  )(check: A => B): Seq[B] = {
+    if (!parallel || sources.size <= 1) sources.map(check)
     else {
       val pool = Executors.newFixedThreadPool(
         2,
@@ -126,18 +134,18 @@ object CdfChangeAvailability {
           }
         }
       )
-      val tasks = scala.collection.mutable.ArrayBuffer.empty[Future[Option[(String, String)]]]
+      val tasks = scala.collection.mutable.ArrayBuffer.empty[Future[B]]
       try {
         sources.foreach { entry =>
-          tasks += pool.submit(new Callable[Option[(String, String)]] {
-            override def call(): Option[(String, String)] = {
+          tasks += pool.submit(new Callable[B] {
+            override def call(): B = {
               SparkSession.setActiveSession(spark)
               try check(entry)
               finally SparkSession.clearActiveSession()
             }
           })
         }
-        tasks.flatMap { task =>
+        tasks.map { task =>
           try task.get()
           catch {
             case interrupted: InterruptedException =>
@@ -145,10 +153,10 @@ object CdfChangeAvailability {
               throw interrupted
             case failure: ExecutionException if failure.getCause != null => throw failure.getCause
           }
-        }.toMap
+        }.toVector
       } finally {
-        tasks.foreach(_.cancel(true))
         pool.shutdownNow()
+        tasks.foreach(_.cancel(true))
       }
     }
   }

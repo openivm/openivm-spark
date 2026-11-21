@@ -2,6 +2,8 @@ package org.openivm.spark.parity
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
+import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 
 import org.openivm.spark.common.{
   CdfChangeAvailability,
@@ -17,6 +19,40 @@ import org.openivm.spark.parity.base.{CdfMode, IvmParitySpecBase}
 class CdfParallelSourcePreflightSpec extends IvmParitySpecBase("cdf-parallel-source-preflight") with CdfMode {
 
   override protected def extraSparkConf: Map[String, String] = Map(FeatureGate.ProfileRefreshKey -> "true")
+
+  it("bounds workers and interrupts outstanding checks when the caller is cancelled") {
+    val started            = new CountDownLatch(2)
+    val stopped            = new CountDownLatch(2)
+    val entered            = new AtomicInteger(0)
+    val failure            = new AtomicReference[Throwable]()
+    val preservedInterrupt = new AtomicBoolean(false)
+    val caller = new Thread(() => {
+      try {
+        CdfChangeAvailability.mapSources(spark, Seq(1, 2, 3), parallel = true) { _ =>
+          entered.incrementAndGet()
+          started.countDown()
+          try new CountDownLatch(1).await()
+          finally stopped.countDown()
+        }
+      } catch {
+        case error: InterruptedException =>
+          failure.set(error)
+          preservedInterrupt.set(Thread.currentThread().isInterrupted)
+      }
+    })
+    caller.start()
+    try {
+      started.await(10, TimeUnit.SECONDS) shouldBe true
+      entered.get() shouldBe 2
+    } finally {
+      caller.interrupt()
+      caller.join(10000)
+    }
+    caller.isAlive shouldBe false
+    stopped.await(10, TimeUnit.SECONDS) shouldBe true
+    failure.get() shouldBe a[InterruptedException]
+    preservedInterrupt.get() shouldBe true
+  }
 
   it("preserves source availability results and propagates invalid source failures") {
     sql("CREATE TABLE cpsp_a (k INT, v INT) USING DELTA")
