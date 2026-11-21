@@ -111,4 +111,29 @@ class CdfParallelSourcePreflightSpec extends IvmParitySpecBase("cdf-parallel-sou
       Files.write(Paths.get(path), (timings.mkString("\n") + "\n").getBytes(StandardCharsets.UTF_8))
     }
   }
+
+  it("keeps multi-source refresh incremental and bag-equivalent with watermark multi-get off and on") {
+    sql("CREATE TABLE cpsp_wm_a (k INT, v INT) USING DELTA")
+    sql("CREATE TABLE cpsp_wm_b (k INT, v INT) USING DELTA")
+    sql("INSERT INTO cpsp_wm_a VALUES (1, 10), (1, 10)")
+    sql("INSERT INTO cpsp_wm_b VALUES (1, 20)")
+    val query = "SELECT a.k, a.v AS av, b.v AS bv FROM cpsp_wm_a a JOIN cpsp_wm_b b ON a.k = b.k"
+    Seq("cpsp_wm_off", "cpsp_wm_on").foreach { mv =>
+      sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
+      val id = spark.sessionState.sqlParser.parseTableIdentifier(mv)
+      MvCatalog.lookup(spark, id).getOrElse(fail(s"Missing $mv")).refreshType should not be RefreshTypeCode.FullRefresh
+    }
+    sql("INSERT INTO cpsp_wm_a VALUES (2, 30), (2, 30)")
+    sql("INSERT INTO cpsp_wm_b VALUES (2, 40)")
+    val flag = "spark.openivm.cdf.watermarks.multiGet.enabled"
+    try {
+      Seq(false -> "cpsp_wm_off", true -> "cpsp_wm_on").foreach { case (enabled, mv) =>
+        spark.conf.set(flag, enabled.toString)
+        RefreshProfileCatalog.removeAll(spark)
+        refreshMv(mv)
+        RefreshProfileCatalog.scanAll(spark).map(_.detail).mkString("\n") should include("outcome=incremental_executed")
+        assertMvCorrect(mv, query)
+      }
+    } finally spark.conf.unset(flag)
+  }
 }

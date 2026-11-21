@@ -178,7 +178,7 @@ missing-baseline sources retain the existing recovery decision. It does not
 parallelize refresh SQL or change publication and acknowledgment ordering.
 
 `spark.openivm.cdf.watermarks.multiGet.enabled=true` enables experimental,
-default-off bulk reads of a view's existing watermark values. Missing values
+default-off bulk reads of a view's existing RocksDB watermark values. Missing values
 still use the existing per-source lookup and lazy legacy migration; durable
 writes are not buffered or grouped by this option.
 
