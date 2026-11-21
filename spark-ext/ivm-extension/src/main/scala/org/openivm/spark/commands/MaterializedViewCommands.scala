@@ -5420,22 +5420,11 @@ case class RefreshMaterializedViewCommand(
         else
           profile.timeStep("metadata_pre_sql", "phase=cdf_change_availability") {
             RefreshPerf.timePhase(refreshId, viewLabel, "cdf_change_availability") {
-              cdfChangeBatches
-                .groupBy(_.baseTable)
-                .toSeq
-                .flatMap { case (source, batches) =>
-                  if (!batches.forall(_.hasBaseline)) Some(source -> "cdf_watermark_missing")
-                  else
-                    CdfChangeAvailability
-                      .unavailableReason(
-                        spark,
-                        source,
-                        batches.map(_.startVersionExclusive).min,
-                        batches.map(_.endVersionInclusive).max
-                      )
-                      .map(detail => source -> s"cdf_change_data_unavailable ($detail)")
-                }
-                .toMap
+              CdfChangeAvailability.unavailableReasons(
+                spark,
+                cdfChangeBatches,
+                spark.conf.get(CdfChangeAvailability.ParallelSourcesKey, "false").toBoolean
+              )
             }
           }
       if (cdfRebaselineReasons.nonEmpty) {
