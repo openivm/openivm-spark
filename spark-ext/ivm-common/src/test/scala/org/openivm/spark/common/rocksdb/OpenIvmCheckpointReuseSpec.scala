@@ -3,7 +3,7 @@ package org.openivm.spark.common.rocksdb
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
-import java.nio.file.{Files, Path}
+import java.nio.file.Files
 import scala.jdk.CollectionConverters._
 
 class OpenIvmCheckpointReuseSpec extends AnyFunSpec with Matchers {

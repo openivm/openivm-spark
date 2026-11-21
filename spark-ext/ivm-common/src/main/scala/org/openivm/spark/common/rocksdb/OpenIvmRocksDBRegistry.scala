@@ -79,7 +79,11 @@ object OpenIvmRocksDBRegistry {
       }
     }
 
-    def checkpoint(spark: SparkSession, destination: java.nio.file.Path, reuse: Boolean): OpenIvmCheckpointReuse.Capture = {
+    def checkpoint(
+        spark: SparkSession,
+        destination: java.nio.file.Path,
+        reuse: Boolean
+    ): OpenIvmCheckpointReuse.Capture = {
       lock.lock()
       try {
         if (retired) throw SlotRetiredSignal
@@ -403,8 +407,8 @@ object OpenIvmRocksDBRegistry {
       destination: java.nio.file.Path,
       reuse: Boolean
   ): OpenIvmCheckpointReuse.Capture = {
-    val canonicalPath = canonicalLocalPath(dbPath)
-    var completed     = false
+    val canonicalPath                           = canonicalLocalPath(dbPath)
+    var completed                               = false
     var outcome: OpenIvmCheckpointReuse.Capture = null
     while (!completed) {
       val slot = slotFor(canonicalPath)

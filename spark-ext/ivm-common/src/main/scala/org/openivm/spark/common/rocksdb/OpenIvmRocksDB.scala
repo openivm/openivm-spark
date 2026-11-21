@@ -949,7 +949,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       else {
         val directoryKey = Files.readAttributes(dbDir, classOf[BasicFileAttributes]).fileKey()
         val identityPath = dbDir.resolve("IDENTITY")
-        val currentPath = dbDir.resolve("CURRENT")
+        val currentPath  = dbDir.resolve("CURRENT")
         val identityKey =
           if (Files.isRegularFile(identityPath) && !Files.isSymbolicLink(identityPath))
             Files.readAttributes(identityPath, classOf[BasicFileAttributes]).fileKey()
@@ -961,7 +961,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
         if (directoryKey == null || identityKey == null || currentKey == null) None
         else {
           val identityDigest = OpenIvmSnapshotArchive.sha256(identityPath.toFile)
-          val manifests = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
+          val manifests      = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
           val sidecars =
             try
               manifests.iterator().asScala.toVector.sortBy(_.getFileName.toString).map { manifest =>
