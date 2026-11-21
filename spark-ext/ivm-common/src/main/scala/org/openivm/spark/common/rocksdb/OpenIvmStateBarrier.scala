@@ -150,12 +150,15 @@ private[openivm] object OpenIvmStateBarrier {
 
   private[rocksdb] def captureDatabases(
       spark: SparkSession,
-      jobs: Vector[(String, NioPath)]
-  ): Unit = {
-    def capture(job: (String, NioPath)): Unit = {
+      jobs: Vector[(String, NioPath)],
+      reuse: Boolean
+  ): Vector[OpenIvmCheckpointReuse.Capture] = {
+    val outcomes = new Array[OpenIvmCheckpointReuse.Capture](jobs.size)
+    def capture(index: Int): Unit = {
+      val job = jobs(index)
       OpenIvmSnapshotArchive.checkInterrupted()
       Files.createDirectories(job._2.getParent)
-      OpenIvmRocksDBRegistry.checkpoint(spark, job._1, job._2)
+      outcomes(index) = OpenIvmRocksDBRegistry.checkpoint(spark, job._1, job._2, reuse)
     }
 
     val state = forRoot(root(spark))
@@ -163,7 +166,7 @@ private[openivm] object OpenIvmStateBarrier {
     val parallel = spark.conf.get(ParallelCaptureKey, "false").toBoolean &&
       !OpenIvmRocksDBConf.fromSpark(spark).multiProcess && jobs.size > 1 &&
       jobs.map(_._1).distinct.size == jobs.size && jobs.forall(job => forDbPath(job._1) eq state)
-    if (!parallel) jobs.foreach(capture)
+    if (!parallel) jobs.indices.foreach(capture)
     else {
       val count       = math.min(jobs.size, math.min(4, Runtime.getRuntime.availableProcessors()))
       val pool        = Executors.newFixedThreadPool(count)
@@ -179,7 +182,7 @@ private[openivm] object OpenIvmStateBarrier {
               while (index < jobs.size && !stop.get()) {
                 val job = jobs(index)
                 checkpointWorkerPath.set(job._1)
-                try capture(job)
+                try capture(index)
                 finally checkpointWorkerPath.remove()
                 index = next.getAndIncrement()
               }
@@ -202,6 +205,7 @@ private[openivm] object OpenIvmStateBarrier {
         if (interrupted) Thread.currentThread().interrupt()
       }
     }
+    outcomes.toVector
   }
 
   private[rocksdb] def mutationCoverageEnabled(spark: SparkSession): Boolean =

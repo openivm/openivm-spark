@@ -331,7 +331,7 @@ object OpenIvmStateSync {
           completed = request.completion.join()
       }
       recordReceipt(completed.receipt)
-      completed.failure.foreach(throw _)
+      completed.failure.foreach(error => throw error)
     }
 
     def capture(request: BackupRequest, afterPublish: () => Unit): Unit =
@@ -360,6 +360,7 @@ object OpenIvmStateSync {
   @volatile private var afterCandidatePublicationHookForTesting: () => Unit              = null
   @volatile private var copyLocalFileHookForTesting: (FileSystem, File, Path) => Unit    = null
   @volatile private var beforeSnapshotCommitHookForTesting: () => Unit                   = null
+  @volatile private var afterSnapshotCommitHookForTesting: () => Unit                    = null
 
   private final class BackupPassTrace(
       requests: Seq[BackupRequest],
@@ -1031,19 +1032,29 @@ object OpenIvmStateSync {
       throw new java.io.IOException(s"openivm state-sync: cannot create snapshot $remoteRoot")
     trace.setSnapshotGeneration(generation)
     var publication = Option.empty[SnapshotPublication]
-    withPackedSnapshot(spark, local, generation, trace) { (archive, archiveBytes, checksum, captured) =>
-      publishLegacy(spark, uri, fs, controlRoot, commitRoot, remoteRoot, generation, archive, archiveBytes, checksum, trace)
+    withPackedSnapshot(spark, local, generation, trace, allowReuse = true) {
+      (archive, archiveBytes, checksum, captured, onCommitted) =>
+      publishLegacy(spark, uri, fs, controlRoot, commitRoot, remoteRoot, generation, archive, archiveBytes, checksum, trace, onCommitted)
       publication = Some(SnapshotPublication(generation, captured, checksum, archiveBytes))
     }
     publication
   }
 
-  private def withPackedSnapshot(spark: SparkSession, local: File, generation: String, trace: BackupPassTrace)(
-      consume: (File, Long, String, Option[Long]) => Unit
+  private def withPackedSnapshot(
+      spark: SparkSession,
+      local: File,
+      generation: String,
+      trace: BackupPassTrace,
+      allowReuse: Boolean
+  )(
+      consume: (File, Long, String, Option[Long], () => Unit) => Unit
   ): Unit = {
     OpenIvmStateBarrier.register(spark)
     val archive = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
     val capture = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
+    val reuse = allowReuse && FeatureGate.stateSyncCheckpointReuseEnabled(spark)
+    var outcomes = Vector.empty[(String, OpenIvmCheckpointReuse.Capture)]
+    var published = false
     var capturedMutationGeneration = Option.empty[Long]
     try {
       val captureHook = beforeCaptureHookForTesting
@@ -1063,12 +1074,14 @@ object OpenIvmStateSync {
               .map(_.getParentFile.toPath)
               .distinct
               .sortBy(_.toString)
-            OpenIvmStateBarrier.captureDatabases(
+            val captures = OpenIvmStateBarrier.captureDatabases(
               spark,
               databases.iterator.map { db =>
                 db.toFile.getCanonicalPath -> capture.toPath.resolve(localBase.relativize(db))
-              }.toVector
+              }.toVector,
+              reuse
             )
+            if (reuse) outcomes = databases.map(_.toString).zip(captures).toVector
             files.filterNot(file => databases.exists(file.toPath.startsWith)).foreach { file =>
               OpenIvmSnapshotArchive.checkInterrupted()
               val target = capture.toPath.resolve(localBase.relativize(file.toPath))
@@ -1115,8 +1128,24 @@ object OpenIvmStateSync {
         trace.markArchive(archiveBytes)
         PackedArchive(checksum, archiveBytes, capturedMutationGeneration)
       }
-      consume(archive, packed.archiveBytes, packed.checksum, packed.mutationGeneration)
+      val onCommitted = () => {
+        published = true
+        val afterCommitHook = afterSnapshotCommitHookForTesting
+        if (afterCommitHook != null) afterCommitHook()
+        if (reuse) outcomes.foreach { case (path, outcome) =>
+          val digest = java.security.MessageDigest
+            .getInstance("SHA-256")
+            .digest(path.getBytes(StandardCharsets.UTF_8))
+            .map(byte => f"${byte & 0xff}%02x")
+            .mkString
+          log.info(s"openivm state-sync: checkpoint generation=$generation store=$digest outcome=${outcome.outcome}")
+        }
+        if (reuse) outcomes.foreach(_._2.retain.foreach(_()))
+      }
+      consume(archive, packed.archiveBytes, packed.checksum, packed.mutationGeneration, onCommitted)
     } finally {
+      if (reuse && !published)
+        log.warn(s"openivm state-sync: checkpoint generation=$generation outcome=failed_publication")
       try Files.deleteIfExists(archive.toPath)
       finally deleteStagedTree(capture)
     }
@@ -1133,7 +1162,8 @@ object OpenIvmStateSync {
       archive: File,
       archiveBytes: Long,
       checksum: String,
-      trace: BackupPassTrace
+      trace: BackupPassTrace,
+      onCommitted: () => Unit
   ): Unit = {
     val remoteArchive = new Path(remoteRoot, "snapshot.zip")
       val copyHook      = copyLocalFileHookForTesting
@@ -1163,6 +1193,7 @@ object OpenIvmStateSync {
         if (!fs.rename(pendingCommit, committed))
           throw new java.io.IOException(s"openivm state-sync: cannot publish snapshot commit $committed")
         trace.markPublished()
+        onCommitted()
       }
       log.info(
         s"openivm state-sync: published packed snapshot $generation ($archiveBytes bytes) at $uri"
@@ -1194,7 +1225,7 @@ object OpenIvmStateSync {
   ): Unit = {
     store.verifyNamespace()
     val local = localRoot(spark)
-    withPackedSnapshot(spark, local, generation.value, trace) { (archive, length, digest, _) =>
+    withPackedSnapshot(spark, local, generation.value, trace, allowReuse = false) { (archive, length, digest, _, _) =>
       val receipt = trace.measure("spark.backup.upload", "durability") {
         val uploaded = store.sealUpload(generation, archive, length, digest)
         trace.markUploaded(uploaded.bytes)
@@ -1311,6 +1342,9 @@ object OpenIvmStateSync {
 
   private[rocksdb] def setBeforeSnapshotCommitHookForTesting(hook: () => Unit): Unit =
     beforeSnapshotCommitHookForTesting = hook
+
+  private[rocksdb] def setAfterSnapshotCommitHookForTesting(hook: () => Unit): Unit =
+    afterSnapshotCommitHookForTesting = hook
 
   private[rocksdb] def setCopyLocalFileHookForTesting(hook: (FileSystem, File, Path) => Unit): Unit =
     copyLocalFileHookForTesting = hook
@@ -1442,6 +1476,7 @@ object OpenIvmStateSync {
     afterCandidatePublicationHookForTesting = null
     copyLocalFileHookForTesting = null
     beforeSnapshotCommitHookForTesting = null
+    afterSnapshotCommitHookForTesting = null
     OpenIvmExecutionSpan.resetStateSyncForTesting()
     stateSyncRequestReceiptHookForTesting = null
     restoreStates.clear()

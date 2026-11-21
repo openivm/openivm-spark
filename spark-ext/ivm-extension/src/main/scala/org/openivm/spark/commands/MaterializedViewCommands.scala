@@ -4160,11 +4160,70 @@ case class AdvanceMaterializedViewSourceVersionsCommand(
 
 final case class SourceVersionAdvanceRequest(versionsBySource: Map[String, Long])
 
+case class ShowRefreshEligibilityCommand(name: TableIdentifier, expectedQueryHash: String) extends LeafRunnableCommand {
+  override val output: Seq[Attribute] = Seq(
+    AttributeReference("status", StringType, nullable = false)(),
+    AttributeReference("query_hash", StringType, nullable = false)(),
+    AttributeReference("target", StringType, nullable = false)(),
+    AttributeReference("target_table_id", StringType, nullable = true)(),
+    AttributeReference("reason", StringType, nullable = true)()
+  )
+
+  override def run(spark: SparkSession): Seq[Row] = {
+    import MvCommandHelper._
+    val target = sqlIdent(name)
+    def decline(reason: String): Seq[Row] =
+      Seq(Row("lifecycle_required", expectedQueryHash, target, null, reason))
+
+    RefreshMutex.withReadLock(metaName(name)) {
+      MvCatalog.lookupReadOnly(spark, name) match {
+        case None => decline("registration_missing")
+        case Some(meta) =>
+          val ownership = MaterializedViewLifecycle.liveOwnership(spark, name, meta)
+          if (!ownership.dataOwned)
+            throw new IllegalStateException(s"Materialized view $target has unsafe backing: ${ownership.reason}")
+          val tableId = ownership.dataTableId.getOrElse {
+            throw new IllegalStateException(s"Materialized view $target has no physical Delta table ID")
+          }
+          val persistedId = meta.properties.get(MvMetadata.TargetDeltaTableIdKey)
+          persistedId.foreach { id =>
+            if (id.trim.isEmpty || id != tableId)
+              throw new IllegalStateException(s"Materialized view $target has a mismatched physical Delta table ID")
+          }
+          if (ownership.publicPresent && !ownership.publicOwned)
+            throw new IllegalStateException(
+              s"Materialized view $target is not the registered live target: ${ownership.reason}"
+            )
+          if (!ownership.publicPresent) {
+            if (persistedId.isEmpty)
+              throw new IllegalStateException(
+                s"Materialized view $target lacks identity for its missing public relation"
+              )
+            if (!meta.usesBackingDataTable)
+              throw new IllegalStateException(s"Materialized view $target has no verifiable backing registration")
+            validateCatalogRegistration(spark, dataTableId(name), meta.location, requireExists = true, Some(tableId))
+          }
+          if (persistedId.isEmpty) decline("legacy_identity_missing")
+          else if (!meta.properties.get(MaterializedViewLifecycle.QueryHashKey).contains(expectedQueryHash))
+            decline("query_hash_policy")
+          else if (!ownership.publicPresent) decline("public_relation_missing")
+          else if (!MaterializedViewLifecycle.liveQueryHash(spark, name).contains(expectedQueryHash))
+            decline("query_hash_policy")
+          else if (FeatureGate.stateSyncAsyncEnabled(spark)) decline("async_unsupported")
+          else Seq(Row("eligible", expectedQueryHash, target, tableId, null))
+      }
+    }
+  }
+}
+
 case class RefreshMaterializedViewCommand(
     name: TableIdentifier,
     sourceVersionAdvance: Option[SourceVersionAdvanceRequest] = None,
-    expectedQueryHash: Option[String] = None
+    expectedQueryHash: Option[String] = None,
+    expectedTableId: Option[String] = None
 ) extends LeafRunnableCommand {
+
+  require(expectedTableId.isEmpty || expectedQueryHash.isDefined, "A table ID pin requires an expected query hash")
 
   override val output: Seq[Attribute] =
     if (expectedQueryHash.isDefined)
@@ -4227,6 +4286,8 @@ case class RefreshMaterializedViewCommand(
       val rows = RefreshMutex.withLocks(upstreamMvSourceKeys, writeKeys) {
         val missing = expectedQueryHash.isDefined && MvCatalog.lookup(spark, name).isEmpty
         if (missing) {
+          if (expectedTableId.isDefined)
+            throw new IllegalStateException(s"Pinned materialized view ${sqlIdent(name)} is absent")
           if (spark.catalog.tableExists(sqlIdent(name)))
             throw new IllegalStateException(s"Relation ${sqlIdent(name)} exists but is not a managed materialized view")
           absent = true
@@ -4234,6 +4295,10 @@ case class RefreshMaterializedViewCommand(
         } else
           OpenIvmStateBarrier.withMutation(spark) {
             if (expectedQueryHash.isDefined) {
+              if (FeatureGate.stateSyncAsyncEnabled(spark))
+                throw new IllegalStateException(
+                  "Guarded refresh requires synchronous state synchronization"
+                )
               val (currentKeys, currentDeps) = resolveUpstreamMvDependencyLockKeys(spark, name)
               if (currentKeys != upstreamMvSourceKeys || currentDeps != upstreamMvDeps)
                 throw new IllegalStateException(
@@ -4832,14 +4897,8 @@ case class RefreshMaterializedViewCommand(
             throw new IllegalStateException(
               s"Materialized view ${sqlIdent(name)} is not the registered live target: ${ownership.reason}"
             )
-          val key  = "dbt.fabricspark.materialized_view.query_hash"
-          val rows = spark.sql(s"SHOW TBLPROPERTIES ${sqlIdent(name)} ('$key')").collect()
-          val liveHash =
-            if (
-              rows.length == 1 && rows.head.length == 2 && !rows.head.isNullAt(0) &&
-              rows.head.getString(0) == key && !rows.head.isNullAt(1)
-            ) Some(rows.head.getString(1))
-            else None
+          val key      = MaterializedViewLifecycle.QueryHashKey
+          val liveHash = MaterializedViewLifecycle.liveQueryHash(spark, name)
           if (!loadedMeta.properties.get(key).contains(hash) || !liveHash.contains(hash))
             throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} query hash mismatch")
           val tableId = ownership.dataTableId.getOrElse {
@@ -4850,6 +4909,10 @@ case class RefreshMaterializedViewCommand(
               s"Materialized view ${sqlIdent(name)} has no matching persisted physical Delta table ID; " +
                 "guarded refresh cannot verify this target"
             )
+          expectedTableId.foreach { expected =>
+            if (expected != tableId)
+              throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} expected table ID mismatch")
+          }
           recordTargetId(tableId)
         }
       }
@@ -9594,7 +9657,8 @@ private[spark] object MaterializedViewLifecycle extends org.apache.spark.interna
       dataOwned: Boolean,
       dataPresent: Boolean,
       dataTableId: Option[String],
-      reason: String
+      reason: String,
+      publicPresent: Boolean
   ) {
     def owned: Boolean = publicOwned && dataOwned
   }
@@ -9638,7 +9702,18 @@ private[spark] object MaterializedViewLifecycle extends org.apache.spark.interna
       else if (!publicOwned) s"relation $ident is not $expectedObject"
       else ""
     val dataTableId = if (dataPresent) Option(snapshot.metadata.id).filter(_.nonEmpty) else None
-    LiveOwnership(publicOwned, dataOwned, dataPresent, dataTableId, reason)
+    LiveOwnership(publicOwned, dataOwned, dataPresent, dataTableId, reason, publicExists)
+  }
+
+  val QueryHashKey = "dbt.fabricspark.materialized_view.query_hash"
+
+  def liveQueryHash(spark: SparkSession, name: TableIdentifier): Option[String] = {
+    val rows = spark.sql(s"SHOW TBLPROPERTIES ${MvCommandHelper.sqlIdent(name)} ('$QueryHashKey')").collect()
+    if (
+      rows.length == 1 && rows.head.length == 2 && !rows.head.isNullAt(0) &&
+      rows.head.getString(0) == QueryHashKey && !rows.head.isNullAt(1)
+    ) Some(rows.head.getString(1))
+    else None
   }
 
   /** Drop one registered materialized view and remove its OpenIVM state. Catalog objects and
