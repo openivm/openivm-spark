@@ -94,8 +94,10 @@ object OpenIvmStateSync {
       requestId: String,
       requestedMutationGeneration: Long,
       coverageEligible: Boolean,
-      completion: CompletableFuture[Unit]
+      completion: CompletableFuture[CandidateCompletion]
   )
+
+  private final case class CandidateCompletion(receipt: StateSyncRequestReceipt, failure: Option[Throwable] = None)
 
   private final case class PublishedCoverage(
       generation: String,
@@ -189,6 +191,7 @@ object OpenIvmStateSync {
         pass: () => CandidatePassResult,
         recordReceipt: StateSyncRequestReceipt => Unit
     ): Unit = {
+      var completed: CandidateCompletion = null
       try {
         while (!request.completion.isDone) {
           val destination = destinationLock(uri)
@@ -205,8 +208,7 @@ object OpenIvmStateSync {
                     ).toVector
                     candidateRequests --= reusable
                     reusable.foreach { req =>
-                      if (req.completion.complete(()))
-                        recordReceipt(
+                      req.completion.complete(CandidateCompletion(
                           StateSyncRequestReceipt(
                             req.requestId, req.requestedMutationGeneration,
                             Some(coverage.capturedMutationGeneration), Some(coverage.generation),
@@ -215,7 +217,7 @@ object OpenIvmStateSync {
                             archiveSha256 = Some(coverage.archiveSha256),
                             archiveBytes = Some(coverage.archiveBytes)
                           )
-                        )
+                        ))
                     }
                   }
                 } else publishedCoverage = None
@@ -230,29 +232,36 @@ object OpenIvmStateSync {
             if (batch.nonEmpty) {
               var result: CandidatePassResult = null
               var failure: Throwable = null
-              try result = pass()
+              try {
+                result = pass()
+                val hook = afterCandidatePublicationHookForTesting
+                if (result.publication.nonEmpty && hook != null) {
+                  try hook()
+                  catch {
+                    case _: InterruptedException => Thread.currentThread().interrupt()
+                  }
+                }
+              }
               catch { case error: Throwable => failure = error }
               synchronousMonitor.synchronized {
                 try {
                   if (failure != null) {
                     publishedCoverage = None
                     batch.foreach { req =>
-                      if (req.completion.completeExceptionally(failure))
-                        recordReceipt(StateSyncRequestReceipt(
+                      req.completion.complete(CandidateCompletion(StateSyncRequestReceipt(
                           req.requestId, req.requestedMutationGeneration, None, None,
                           published = false, reused = false, coverageProven = false,
                           acknowledged = false, outcome = "publication_failed"
-                        ))
+                        ), Some(failure)))
                     }
                   } else if (result.noState) {
                     publishedCoverage = None
                     batch.foreach { req =>
-                      if (req.completion.complete(()))
-                        recordReceipt(StateSyncRequestReceipt(
+                      req.completion.complete(CandidateCompletion(StateSyncRequestReceipt(
                           req.requestId, req.requestedMutationGeneration, None, None,
                           published = false, reused = false, coverageProven = false,
                           acknowledged = true, outcome = "no_local_state"
-                        ))
+                        )))
                     }
                   } else if (result.publication.isEmpty) {
                     publishedCoverage = None
@@ -260,12 +269,11 @@ object OpenIvmStateSync {
                       "openivm state-sync: synchronous pass produced no committed publication"
                     )
                     batch.foreach { req =>
-                      if (req.completion.completeExceptionally(error))
-                        recordReceipt(StateSyncRequestReceipt(
+                      req.completion.complete(CandidateCompletion(StateSyncRequestReceipt(
                           req.requestId, req.requestedMutationGeneration, None, None,
                           published = false, reused = false, coverageProven = false,
                           acknowledged = false, outcome = "publication_missing"
-                        ))
+                        ), Some(error)))
                     }
                   } else {
                     val publication = result.publication.get
@@ -281,15 +289,14 @@ object OpenIvmStateSync {
                       val proof = !shared && req.coverageEligible &&
                         captured.exists(_ >= req.requestedMutationGeneration)
                       if (shared || !req.coverageEligible || proof) {
-                        if (req.completion.complete(()))
-                          recordReceipt(StateSyncRequestReceipt(
+                        req.completion.complete(CandidateCompletion(StateSyncRequestReceipt(
                             req.requestId, req.requestedMutationGeneration, captured,
                             Some(publication.generation), published = true, reused = false,
                             coverageProven = proof, acknowledged = true,
                             outcome = if (proof) "published_covered_generation" else "published_fresh_fallback",
                             archiveSha256 = Some(publication.archiveSha256),
                             archiveBytes = Some(publication.archiveBytes)
-                          ))
+                          )))
                       } else if (!req.completion.isDone) {
                         recordReceipt(StateSyncRequestReceipt(
                           req.requestId, req.requestedMutationGeneration, captured,
@@ -311,18 +318,20 @@ object OpenIvmStateSync {
             }
           } finally destination.unlock()
         }
-        try request.completion.get()
+        try completed = request.completion.get()
         catch { case error: java.util.concurrent.ExecutionException => throw error.getCause }
       } catch {
         case interrupted: InterruptedException =>
           val cancelled = request.completion.completeExceptionally(interrupted)
-          val alreadyAcknowledged = !cancelled && !request.completion.isCompletedExceptionally
           synchronousMonitor.synchronized {
             candidateRequests -= request
           }
           Thread.currentThread().interrupt()
-          if (!alreadyAcknowledged) throw interrupted
+          if (cancelled || request.completion.isCompletedExceptionally) throw interrupted
+          completed = request.completion.join()
       }
+      recordReceipt(completed.receipt)
+      completed.failure.foreach(throw _)
     }
 
     def capture(request: BackupRequest, afterPublish: () => Unit): Unit =
@@ -348,6 +357,7 @@ object OpenIvmStateSync {
   @volatile private var stateSyncUriHookForTesting: SparkSession => Option[String]       = null
   @volatile private var beforeLocalFileCopyHookForTesting: File => Unit                  = null
   @volatile private var beforeCaptureHookForTesting: () => Unit                          = null
+  @volatile private var afterCandidatePublicationHookForTesting: () => Unit              = null
   @volatile private var copyLocalFileHookForTesting: (FileSystem, File, Path) => Unit    = null
   @volatile private var beforeSnapshotCommitHookForTesting: () => Unit                   = null
 
@@ -882,7 +892,7 @@ object OpenIvmStateSync {
         var candidate: SynchronousCandidateRequest = null
         OpenIvmStateBarrier.withCurrentMutationGeneration(spark) { requestedGeneration =>
           candidate = SynchronousCandidateRequest(
-            requestId, requestedGeneration, coverageEligible, new CompletableFuture[Unit]()
+            requestId, requestedGeneration, coverageEligible, new CompletableFuture[CandidateCompletion]()
           )
           state.submitCandidate(candidate)
         }
@@ -1296,6 +1306,9 @@ object OpenIvmStateSync {
   private[rocksdb] def setBeforeCaptureHookForTesting(hook: () => Unit): Unit =
     beforeCaptureHookForTesting = hook
 
+  private[rocksdb] def setAfterCandidatePublicationHookForTesting(hook: () => Unit): Unit =
+    afterCandidatePublicationHookForTesting = hook
+
   private[rocksdb] def setBeforeSnapshotCommitHookForTesting(hook: () => Unit): Unit =
     beforeSnapshotCommitHookForTesting = hook
 
@@ -1426,6 +1439,7 @@ object OpenIvmStateSync {
     stateSyncUriHookForTesting = null
     beforeLocalFileCopyHookForTesting = null
     beforeCaptureHookForTesting = null
+    afterCandidatePublicationHookForTesting = null
     copyLocalFileHookForTesting = null
     beforeSnapshotCommitHookForTesting = null
     OpenIvmExecutionSpan.resetStateSyncForTesting()
