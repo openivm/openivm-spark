@@ -55,7 +55,7 @@ final class OpenIvmCliWorker {
     private static int run(String[] args)
             throws IOException, InterruptedException, ExecutionException {
         OpenIvmCliLifecycle lifecycle = new OpenIvmCliLifecycle(Paths.get(args[1]).getParent());
-        ProcessBuilder builder = new ProcessBuilder(args[0], ":memory:", "-jsonlines")
+        ProcessBuilder builder = new ProcessBuilder(args[0], ":memory:", "-jsonlines", "-unsigned")
                 .redirectInput(Paths.get(args[1]).toFile());
         // Apply the native C++ runtime override to neither JVM.
         if (!args[5].isEmpty()) {
