@@ -315,21 +315,26 @@ class OpenIvmCompiler private (
           if (executable != configured)
             CacheOriginDiagnostic.observe(origin)(_.problem("native_executable_unverified"))
           val mapper = new com.fasterxml.jackson.databind.ObjectMapper()
-          val rows = result._1.linesIterator.filter(_.contains("\"refresh_type\"")).map { line =>
-            val row = mapper.readTree(line)
-            if (!row.has("stmt_order") || !row.get("stmt_order").isIntegralNumber || !row.has("sql"))
-              throw new IllegalStateException("Native compiler result lacks ordered SQL")
-            row.get("stmt_order").asInt() -> CacheOriginDiagnostic.sha256(row.get("sql").asText())
-          }.toVector
+          val rows = result._1.linesIterator
+            .filter(_.contains("\"refresh_type\""))
+            .map { line =>
+              val row = mapper.readTree(line)
+              if (!row.has("stmt_order") || !row.get("stmt_order").isIntegralNumber || !row.has("sql"))
+                throw new IllegalStateException("Native compiler result lacks ordered SQL")
+              row.get("stmt_order").asInt() -> CacheOriginDiagnostic.sha256(row.get("sql").asText())
+            }
+            .toVector
           if (rows.isEmpty || rows.map(_._1) != rows.indices)
             CacheOriginDiagnostic.observe(origin)(_.problem("native_statement_order_invalid"))
-          CacheOriginDiagnostic.observe(origin)(_.native(
-            CacheOriginDiagnostic.sha256(script),
-            CacheOriginDiagnostic.fileSha256(tmpDir.resolve("cli.stdout")),
-            executable,
-            CacheOriginDiagnostic.fileSha256(Paths.get(extensionPath)),
-            rows
-          ))
+          CacheOriginDiagnostic.observe(origin)(
+            _.native(
+              CacheOriginDiagnostic.sha256(script),
+              CacheOriginDiagnostic.fileSha256(tmpDir.resolve("cli.stdout")),
+              executable,
+              CacheOriginDiagnostic.fileSha256(Paths.get(extensionPath)),
+              rows
+            )
+          )
         } catch {
           case NonFatal(e) =>
             CacheOriginDiagnostic.observe(origin)(_.problem(s"native_receipt_unavailable:${e.getClass.getName}"))

@@ -13,13 +13,13 @@ import scala.util.control.NonFatal
 
 /** Request-owned diagnostic observations. This is not an attribution verdict. */
 object CacheOriginDiagnostic extends Logging {
-  private val mapper = new ObjectMapper()
+  private val mapper    = new ObjectMapper()
   private val completed = mutable.LinkedHashMap.empty[String, (String, String)]
-  private val active = mutable.Map.empty[String, mutable.Set[String]]
+  private val active    = mutable.Map.empty[String, mutable.Set[String]]
   private val ambiguous = mutable.Set.empty[String]
-  private val origins = mutable.LinkedHashMap.empty[String, String]
-  private val limit = 4096
-  val ConfigKey = "spark.openivm.diagnostics.cacheOrigin.enabled"
+  private val origins   = mutable.LinkedHashMap.empty[String, String]
+  private val limit     = 4096
+  val ConfigKey         = "spark.openivm.diagnostics.cacheOrigin.enabled"
 
   def observe(origin: Option[Recorder])(f: Recorder => Unit): Unit = origin.foreach { recorder =>
     try f(recorder)
@@ -32,13 +32,15 @@ object CacheOriginDiagnostic extends Logging {
   }
 
   def sha256(value: String): String =
-    MessageDigest.getInstance("SHA-256")
+    MessageDigest
+      .getInstance("SHA-256")
       .digest(value.getBytes(StandardCharsets.UTF_8))
-      .map("%02x".format(_)).mkString
+      .map("%02x".format(_))
+      .mkString
 
   def fileSha256(path: Path): String = {
     val digest = MessageDigest.getInstance("SHA-256")
-    val input = Files.newInputStream(path)
+    val input  = Files.newInputStream(path)
     val buffer = new Array[Byte](65536)
     try {
       var n = input.read(buffer)
@@ -102,16 +104,17 @@ object CacheOriginDiagnostic extends Logging {
   ) {
     private[CacheOriginDiagnostic] val ownerKey: String =
       Seq(applicationId, requestId.getOrElse(""), owner.getOrElse(""))
-        .map(s => s"${s.length}:$s").mkString
-    private val fields = mapper.createObjectNode()
-    private val invocations = mapper.createArrayNode()
-    private val executions = mapper.createArrayNode()
-    private val problems = mapper.createArrayNode()
-    private var boundIdentity = Option.empty[(String, String)]
+        .map(s => s"${s.length}:$s")
+        .mkString
+    private val fields         = mapper.createObjectNode()
+    private val invocations    = mapper.createArrayNode()
+    private val executions     = mapper.createArrayNode()
+    private val problems       = mapper.createArrayNode()
+    private var boundIdentity  = Option.empty[(String, String)]
     private var cacheSignature = Option.empty[String]
-    private var cacheHit = false
-    private var persisted = false
-    private var terminal = false
+    private var cacheHit       = false
+    private var persisted      = false
+    private var terminal       = false
     fields.put("operation_id", operationId)
     fields.put("application_id", applicationId)
     fields.put("target", target)
@@ -121,7 +124,7 @@ object CacheOriginDiagnostic extends Logging {
     if (owner.isEmpty) problems.add("missing_dbt_owner")
 
     def problem(value: String): Unit = synchronized { problems.add(value); () }
-    def profile(id: String): Unit = synchronized { fields.put("profile_id", id); () }
+    def profile(id: String): Unit    = synchronized { fields.put("profile_id", id); () }
 
     def bind(tableId: String, pathHash: String, queryHash: String, schema: String): Unit = synchronized {
       boundIdentity = Some(pathHash -> tableId)
@@ -157,13 +160,31 @@ object CacheOriginDiagnostic extends Logging {
         }
       }
 
-    def cache(hit: Boolean, tier: String, key: String, code: String, classification: String, sql: String, writeSucceeded: Boolean): Unit =
+    def cache(
+        hit: Boolean,
+        tier: String,
+        key: String,
+        code: String,
+        classification: String,
+        sql: String,
+        writeSucceeded: Boolean
+    ): Unit =
       synchronized {
         cacheHit = hit
         persisted = writeSucceeded
-        val parts = Seq(applicationId, target, fields.path("target_table_id").asText(),
-          fields.path("target_path_sha256").asText(), fields.path("query_sha256").asText(),
-          fields.path("source_schema_fingerprint").asText(), tier, key, code, classification, sha256(sql))
+        val parts = Seq(
+          applicationId,
+          target,
+          fields.path("target_table_id").asText(),
+          fields.path("target_path_sha256").asText(),
+          fields.path("query_sha256").asText(),
+          fields.path("source_schema_fingerprint").asText(),
+          tier,
+          key,
+          code,
+          classification,
+          sha256(sql)
+        )
         cacheSignature = Some(sha256(parts.map(s => s"${s.length}:$s").mkString))
         fields.put("tier", tier)
         fields.put("cache_key", key)

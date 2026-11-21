@@ -4153,7 +4153,7 @@ case class RefreshMaterializedViewCommand(
     // count-monoid aggregates.
     val viewMeta = metaName(name)
     OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
-    val origin = CacheOriginDiagnostic.start(spark, viewMeta)
+    val origin           = CacheOriginDiagnostic.start(spark, viewMeta)
     val lockT0           = System.nanoTime()
     var commandCompleted = false
     try {
@@ -4200,7 +4200,8 @@ case class RefreshMaterializedViewCommand(
             DriverHeavyOperationAdmission.withPermit(spark, "refresh") {
               org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
                 try runUnderLock(cloned, lockAcqMs, origin)
-                finally CacheOriginDiagnostic.observe(origin)(_.verifyIdentity(deltaPhysicalIdentity(cloned, sqlIdent(name))))
+                finally
+                  CacheOriginDiagnostic.observe(origin)(_.verifyIdentity(deltaPhysicalIdentity(cloned, sqlIdent(name))))
               }
             }
           } finally OpenIvmMetrics.RefreshInflight.decrementAndGet()
@@ -4703,7 +4704,7 @@ case class RefreshMaterializedViewCommand(
     val profile    = RefreshProfile.start(spark, viewMeta, RefreshProfile.Mode.Refresh)
     val refreshId  = profile.refreshId
     CacheOriginDiagnostic.observe(origin)(_.profile(refreshId))
-    val sqlLog     = RefreshSqlLog.start(spark, refreshId, viewMeta, RefreshSqlLog.ModeRefresh)
+    val sqlLog = RefreshSqlLog.start(spark, refreshId, viewMeta, RefreshSqlLog.ModeRefresh)
     // A query-log-only monotonic counter. Independent of the perf
     // `stmtCounter` so source-delta registrations, count-monoid cleanup,
     // post-cleanup, and drop-cleanup get clean sequential row ids.
@@ -4769,7 +4770,12 @@ case class RefreshMaterializedViewCommand(
       CacheOriginDiagnostic.observe(origin) { recorder =>
         deltaPhysicalIdentity(spark, sqlIdent(name)) match {
           case Some((path, id)) =>
-            recorder.bind(id, CacheOriginDiagnostic.sha256(path), CacheOriginDiagnostic.sha256(meta.querySql), meta.sourceSchemaFingerprint)
+            recorder.bind(
+              id,
+              CacheOriginDiagnostic.sha256(path),
+              CacheOriginDiagnostic.sha256(meta.querySql),
+              meta.sourceSchemaFingerprint
+            )
           case None => recorder.problem("target_identity_unreadable")
         }
       }
@@ -6017,7 +6023,7 @@ case class RefreshMaterializedViewCommand(
           )
         } else None
       val compileCacheHit = cachedCompiled.isDefined
-      var cachePersisted = false
+      var cachePersisted  = false
       OpenIvmMetrics.recordCompileCache(compileCacheHit)
       val compiled = profile.timeStep(
         "generate_refresh_sql.compile",
@@ -6059,15 +6065,17 @@ case class RefreshMaterializedViewCommand(
           }
         }
       }
-      CacheOriginDiagnostic.observe(origin)(_.cache(
-        compileCacheHit,
-        compileCacheTier,
-        MvMetadata.compileCacheSqlKey(meta.sourceSchemaFingerprint, compileCacheTier),
-        compiled.refreshType.toString,
-        compiled.refreshTypeName,
-        compiled.sql,
-        cachePersisted
-      ))
+      CacheOriginDiagnostic.observe(origin)(
+        _.cache(
+          compileCacheHit,
+          compileCacheTier,
+          MvMetadata.compileCacheSqlKey(meta.sourceSchemaFingerprint, compileCacheTier),
+          compiled.refreshType.toString,
+          compiled.refreshTypeName,
+          compiled.sql,
+          cachePersisted
+        )
+      )
       if (
         preparedSourceAdvance.nonEmpty &&
         (compiled.refreshType == RefreshTypeCode.FullRefresh ||
