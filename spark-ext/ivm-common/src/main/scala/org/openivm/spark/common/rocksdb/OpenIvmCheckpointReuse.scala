@@ -20,12 +20,12 @@ private[rocksdb] object OpenIvmCheckpointReuse {
 
   private final case class FileCopy(name: String, bytes: Array[Byte], digest: Vector[Byte])
   private final case class Entry(identity: Identity, files: Vector[FileCopy], bytes: Long)
-  private val log = LoggerFactory.getLogger(getClass)
-  private val maxBytes = 128L * 1024L * 1024L
-  private val maxEntries = 256
+  private val log           = LoggerFactory.getLogger(getClass)
+  private val maxBytes      = 128L * 1024L * 1024L
+  private val maxEntries    = 256
   private val maxStoreBytes = 16L * 1024L * 1024L
   private val maxStoreFiles = 1024
-  private val cache = mutable.LinkedHashMap.empty[OpenIvmRocksDB, Entry]
+  private val cache         = mutable.LinkedHashMap.empty[OpenIvmRocksDB, Entry]
   private var retainedBytes = 0L
 
   private def hash(bytes: Array[Byte]): Vector[Byte] = MessageDigest.getInstance("SHA-256").digest(bytes).toVector
@@ -41,7 +41,7 @@ private[rocksdb] object OpenIvmCheckpointReuse {
       if (files.exists(file => !Files.isDirectory(file) && !Files.isRegularFile(file)))
         throw new java.io.IOException("non-regular checkpoint entry")
       val regular = files.filter(Files.isRegularFile(_)).sortBy(_.toString)
-      val size = regular.map(Files.size(_)).sum
+      val size    = regular.map(Files.size(_)).sum
       if (regular.size > maxStoreFiles || size > maxStoreBytes) None
       else {
         val copies = regular.map { file =>
@@ -71,10 +71,12 @@ private[rocksdb] object OpenIvmCheckpointReuse {
   }
 
   private def copy(entry: Entry, destination: Path): Boolean = {
-    if (entry.files.exists { file =>
+    if (
+      entry.files.exists { file =>
         OpenIvmSnapshotArchive.checkInterrupted()
         hash(file.bytes) != file.digest
-      }) false
+      }
+    ) false
     else {
       Files.createDirectories(destination)
       entry.files.foreach { file =>
@@ -115,9 +117,11 @@ private[rocksdb] object OpenIvmCheckpointReuse {
   }
 
   private[rocksdb] def corruptForTesting(db: OpenIvmRocksDB): Unit = synchronized {
-    val file = cache(db).files.find(_.bytes.nonEmpty).getOrElse(
-      throw new IllegalStateException("cached checkpoint has no non-empty file")
-    )
+    val file = cache(db).files
+      .find(_.bytes.nonEmpty)
+      .getOrElse(
+        throw new IllegalStateException("cached checkpoint has no non-empty file")
+      )
     file.bytes(0) = (file.bytes(0) ^ 1).toByte
   }
 }

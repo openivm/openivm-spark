@@ -357,10 +357,10 @@ object OpenIvmStateSync {
     if (!fs.mkdirs(remoteRoot))
       throw new java.io.IOException(s"openivm state-sync: cannot create snapshot $remoteRoot")
     OpenIvmStateBarrier.register(spark)
-    val archive = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
-    val capture = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
-    val reuse = FeatureGate.stateSyncCheckpointReuseEnabled(spark)
-    val outcomes = scala.collection.mutable.ArrayBuffer.empty[(String, String)]
+    val archive   = new File(local.getParentFile, s".openivm-state-snapshot-$generation.zip")
+    val capture   = Files.createTempDirectory(local.getParentFile.toPath, ".openivm-state-capture-").toFile
+    val reuse     = FeatureGate.stateSyncCheckpointReuseEnabled(spark)
+    val outcomes  = scala.collection.mutable.ArrayBuffer.empty[(String, String)]
     var published = false
     try {
       val captureHook = beforeCaptureHookForTesting
@@ -420,8 +420,11 @@ object OpenIvmStateSync {
         throw new java.io.IOException(s"openivm state-sync: cannot publish snapshot commit $committed")
       published = true
       if (reuse) outcomes.foreach { case (path, outcome) =>
-        val digest = java.security.MessageDigest.getInstance("SHA-256")
-          .digest(path.getBytes(StandardCharsets.UTF_8)).map(byte => f"${byte & 0xff}%02x").mkString
+        val digest = java.security.MessageDigest
+          .getInstance("SHA-256")
+          .digest(path.getBytes(StandardCharsets.UTF_8))
+          .map(byte => f"${byte & 0xff}%02x")
+          .mkString
         log.info(s"openivm state-sync: checkpoint generation=$generation store=$digest outcome=$outcome")
       }
       log.info(

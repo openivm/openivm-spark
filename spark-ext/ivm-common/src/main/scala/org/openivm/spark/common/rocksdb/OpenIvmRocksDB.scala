@@ -951,20 +951,25 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
         if (directoryKey == null) None
         else {
           val manifests = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
-          val sidecars = try
-            manifests.iterator().asScala.toVector.sortBy(_.getFileName.toString).map { manifest =>
-              if (Files.isSymbolicLink(manifest) || !Files.isRegularFile(manifest))
-                throw new java.io.IOException(s"Invalid OpenIVM transaction manifest: $manifest")
-              manifest.getFileName.toString -> OpenIvmSnapshotArchive.sha256(manifest.toFile)
-            }
-          finally manifests.close()
-          Some(body(OpenIvmCheckpointReuse.Identity(
-            dbHandle,
-            directoryKey,
-            dbHandle.getLatestSequenceNumber,
-            columnFamilyHandles.keySet,
-            sidecars
-          )))
+          val sidecars =
+            try
+              manifests.iterator().asScala.toVector.sortBy(_.getFileName.toString).map { manifest =>
+                if (Files.isSymbolicLink(manifest) || !Files.isRegularFile(manifest))
+                  throw new java.io.IOException(s"Invalid OpenIVM transaction manifest: $manifest")
+                manifest.getFileName.toString -> OpenIvmSnapshotArchive.sha256(manifest.toFile)
+              }
+            finally manifests.close()
+          Some(
+            body(
+              OpenIvmCheckpointReuse.Identity(
+                dbHandle,
+                directoryKey,
+                dbHandle.getLatestSequenceNumber,
+                columnFamilyHandles.keySet,
+                sidecars
+              )
+            )
+          )
         }
       }
     }

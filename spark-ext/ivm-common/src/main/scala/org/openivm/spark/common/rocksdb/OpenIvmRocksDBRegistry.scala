@@ -89,8 +89,7 @@ object OpenIvmRocksDBRegistry {
             entry.db.checkpointTo(destination)
             "fresh"
           }
-        }
-        else {
+        } else {
           val db = new OpenIvmRocksDB(canonicalPath, OpenIvmRocksDBConf.fromSpark(spark), Seq.empty)
           try db.checkpointTo(destination)
           finally db.close()

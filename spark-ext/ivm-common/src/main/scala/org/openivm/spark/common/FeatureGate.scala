@@ -53,7 +53,7 @@ object FeatureGate {
   /** Return from MV commands before remote backup completes (default true).
     * Local commits remain synchronous; driver loss can restore an older remote generation.
     */
-  val StateSyncAsyncEnabledKey: String = "spark.openivm.stateSync.async.enabled"
+  val StateSyncAsyncEnabledKey: String           = "spark.openivm.stateSync.async.enabled"
   val StateSyncCheckpointReuseEnabledKey: String = "spark.openivm.stateSync.checkpointReuse.enabled"
 
   /** Number of newest published state-sync snapshot generations kept under [[StateSyncUriKey]];
