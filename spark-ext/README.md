@@ -33,6 +33,14 @@ generations are pruned according to the configured retention. Archives are bound
 100,000 entries and 64 GiB compressed/expanded bytes; links and unsafe paths are
 rejected.
 
+The experimental `spark.openivm.stateSync.checkpointReuse.enabled` setting defaults
+to `false`. When enabled, eligible unchanged, live single-process stores can reuse
+verified in-memory checkpoint bytes; other stores use the normal native checkpoint.
+Each backup still publishes an independently restorable V2 generation. The cache
+is bounded to 128 MiB, 256 stores, 16 MiB and 1,024 files per store. Successful
+generation logs report `fresh`, `reuse`, or `fallback` per hashed store path;
+failed publication logs are reported separately.
+
 ## Cross-thread query-hash annotations
 
 When an event callback began capture on a different Java thread, append

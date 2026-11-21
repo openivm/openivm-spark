@@ -24,6 +24,7 @@ private[rocksdb] object OpenIvmCheckpointReuse {
   private val maxBytes = 128L * 1024L * 1024L
   private val maxEntries = 256
   private val maxStoreBytes = 16L * 1024L * 1024L
+  private val maxStoreFiles = 1024
   private val cache = mutable.LinkedHashMap.empty[OpenIvmRocksDB, Entry]
   private var retainedBytes = 0L
 
@@ -41,7 +42,7 @@ private[rocksdb] object OpenIvmCheckpointReuse {
         throw new java.io.IOException("non-regular checkpoint entry")
       val regular = files.filter(Files.isRegularFile(_)).sortBy(_.toString)
       val size = regular.map(Files.size(_)).sum
-      if (size > maxStoreBytes) None
+      if (regular.size > maxStoreFiles || size > maxStoreBytes) None
       else {
         val copies = regular.map { file =>
           OpenIvmSnapshotArchive.checkInterrupted()
