@@ -3,7 +3,8 @@ package org.openivm.spark.parity
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.openivm.spark.common.{MvCatalog, MvMetadata}
+import org.openivm.spark.common.{CdfWatermarkCatalog, MvCatalog, MvMetadata, StagingCatalog}
+import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 
 /** Slice of `ParserSpec` covering REFRESH idempotency, INSERT+DELETE-in-the-
   * same-window net-zero deltas, DROP+recreate with a different body, and
@@ -134,10 +135,24 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
     val hash = "0123456789abcdef0123456789abcdef"
     def guarded(target: String, expected: String = hash) =
       sql(s"REFRESH MATERIALIZED VIEW $target EXPECT QUERY HASH '$expected' IF EXISTS").collect()
+    def pinned(target: String, tableId: String) =
+      sql(s"REFRESH MATERIALIZED VIEW $target EXPECT QUERY HASH '$hash' EXPECT TABLE ID '$tableId' IF EXISTS").collect()
+    def eligibility(target: String, expected: String = hash) =
+      sql(s"SHOW OPENIVM REFRESH ELIGIBILITY $target EXPECT QUERY HASH '$expected'").collect().head
+    def decline(target: String, reason: String, expected: String = hash): Unit = {
+      val row = eligibility(target, expected)
+      row.getString(0) shouldBe "lifecycle_required"
+      row.getString(1) shouldBe expected
+      row.getString(2) shouldBe target
+      row.isNullAt(3) shouldBe true
+      row.getString(4) shouldBe reason
+    }
 
     it("reports only truly absent names as absent") {
       val capability = sql("SET spark.openivm.capabilities").collect().head
       capability.getString(1) should include("ensure_refresh_v2")
+      capability.getString(1) should include("ensure_refresh_eligibility_v1")
+      capability.getString(1) should include("ensure_refresh_table_id_v1")
       spark.conf.set("spark.openivm.enabled", "false")
       try {
         sql("SET spark.openivm.capabilities").collect().head.getString(1) should include("ensure_refresh_v2")
@@ -152,36 +167,316 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       qualified.getString(2) shouldBe "`spark_catalog`.`default`.`ensure_absent_p14`"
       sql("CREATE TABLE ensure_unmanaged_p14 (id INT) USING DELTA")
       intercept[Exception](guarded("ensure_unmanaged_p14"))
+      decline("`ensure_unmanaged_p14`", "registration_missing")
+      MvCatalog.prepareCreate(spark, TableIdentifier("ensure_corrupt_p14", Some("default")))
+      intercept[Exception](eligibility("`default`.`ensure_corrupt_p14`"))
     }
 
     it("validates the live definition before writing and returns refresh proof") {
-      val key = "dbt.fabricspark.materialized_view.query_hash"
+      val key    = "dbt.fabricspark.materialized_view.query_hash"
+      val target = "`spark_catalog`.`default`.`ensure_mv_p15`"
       sql("CREATE TABLE ensure_src_p15 (id INT) USING DELTA")
       sql("INSERT INTO ensure_src_p15 VALUES (1)")
-      sql(s"CREATE MATERIALIZED VIEW ensure_mv_p15 TBLPROPERTIES ('$key' = '$hash') AS SELECT id FROM ensure_src_p15")
+      sql(
+        s"CREATE MATERIALIZED VIEW default.ensure_mv_p15 TBLPROPERTIES ('$key' = '$hash') AS SELECT id FROM ensure_src_p15"
+      )
       sql("INSERT INTO ensure_src_p15 VALUES (2)")
-      intercept[Exception](guarded("ensure_mv_p15", "ffffffffffffffffffffffffffffffff"))
-      spark.table("ensure_mv_p15").count() shouldBe 1L
-      val proof = guarded("ensure_mv_p15").head
-      proof.getString(0) shouldBe "refreshed"
-      proof.getString(1) shouldBe hash
-      proof.getString(2) shouldBe "`ensure_mv_p15`"
-      (3 to 5).foreach(i => proof.getString(i) should not be empty)
-      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
-      val meta = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15")).get
+      val originalAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
+      spark.conf.set("spark.openivm.stateSync.async.enabled", "true")
+      decline(target, "async_unsupported")
+      val asyncFailure = intercept[Exception](guarded(target))
+      Iterator
+        .iterate[Throwable](asyncFailure)(_.getCause)
+        .takeWhile(_ != null)
+        .exists(e =>
+          Option(e.getMessage).exists(_.contains("requires synchronous state synchronization"))
+        ) shouldBe true
+      assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id = 1")
+      spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
       try {
-        val identityKey = MvMetadata.TargetDeltaTableIdKey
-        MvCatalog.upsert(spark, meta.copy(properties = meta.properties - identityKey))
-        intercept[Exception](guarded("ensure_mv_p15"))
-        MvCatalog.upsert(spark, meta.copy(properties = meta.properties + (identityKey -> "different-table-id")))
-        intercept[Exception](guarded("ensure_mv_p15"))
+        val beforeMeta    = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
+        val beforeVersion = io.delta.tables.DeltaTable.forPath(spark, beforeMeta.location).history(1).head().getLong(0)
+        var probeBackups  = 0
+        OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/guard-v2-probe-backup"))
+        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) => probeBackups += 1 }
+        try {
+          val result = eligibility(target)
+          result.getString(0) shouldBe "eligible"
+          result.getString(1) shouldBe hash
+          result.getString(2) shouldBe target
+          result.getString(3) should not be empty
+          result.isNullAt(4) shouldBe true
+          decline(target, "query_hash_policy", "ffffffffffffffffffffffffffffffff")
+          probeBackups shouldBe 0
+        } finally {
+          OpenIvmStateSync.setBackupPassHookForTesting(null)
+          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        }
+        MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get shouldBe beforeMeta
+        io.delta.tables.DeltaTable
+          .forPath(spark, beforeMeta.location)
+          .history(1)
+          .head()
+          .getLong(0) shouldBe beforeVersion
+        intercept[Exception](guarded(target, "ffffffffffffffffffffffffffffffff"))
+        spark.table("ensure_mv_p15").count() shouldBe 1L
+        val proof = guarded("ensure_mv_p15").head
+        proof.getString(0) shouldBe "refreshed"
+        proof.getString(1) shouldBe hash
+        proof.getString(2) shouldBe "`ensure_mv_p15`"
+        (3 to 5).foreach(i => proof.getString(i) should not be empty)
+        assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
+        val meta           = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15", Some("default"))).get
+        MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p15")).get shouldBe meta
+        val version        = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+        val oldBackend     = spark.conf.getOption("spark.openivm.catalog.backend")
+        val oldCatalogPath = spark.conf.getOption("spark.openivm.catalog.path")
+        val warehouse      = new java.io.File(new java.net.URI(spark.conf.get("spark.sql.warehouse.dir")))
+        val catalogRoot    = new java.io.File(warehouse, "eligibility_existing_catalog")
+        spark.conf.set("spark.openivm.catalog.backend", "delta")
+        spark.conf.set("spark.openivm.catalog.path", catalogRoot.toString)
+        try {
+          MvCatalog.upsert(spark, meta)
+          val catalog = io.delta.tables.DeltaTable.forPath(spark, new java.io.File(catalogRoot, "mv_metadata").toString)
+          val catalogVersion = catalog.history(1).head().getLong(0)
+          eligibility(target).getString(0) shouldBe "eligible"
+          catalog.history(1).head().getLong(0) shouldBe catalogVersion
+        } finally {
+          oldBackend match {
+            case Some(value) => spark.conf.set("spark.openivm.catalog.backend", value)
+            case None        => spark.conf.unset("spark.openivm.catalog.backend")
+          }
+          oldCatalogPath match {
+            case Some(value) => spark.conf.set("spark.openivm.catalog.path", value)
+            case None        => spark.conf.unset("spark.openivm.catalog.path")
+          }
+        }
+        sql("INSERT INTO ensure_src_p15 VALUES (3)")
+        try {
+          val identityKey = MvMetadata.TargetDeltaTableIdKey
+          MvCatalog.upsert(spark, meta.copy(properties = meta.properties - identityKey))
+          decline(target, "legacy_identity_missing")
+          intercept[Exception](guarded(target))
+          MvCatalog.upsert(spark, meta.copy(properties = meta.properties + (identityKey -> "different-table-id")))
+          intercept[Exception](eligibility(target))
+          intercept[Exception](guarded(target))
+        } finally {
+          MvCatalog.upsert(spark, meta)
+        }
+        io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe version
+        assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id <= 2")
+        sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = 'ffffffffffffffffffffffffffffffff')")
+        val changedPropertyVersion =
+          io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+        decline(target, "query_hash_policy")
+        intercept[Exception](guarded(target))
+        io.delta.tables.DeltaTable
+          .forPath(spark, meta.location)
+          .history(1)
+          .head()
+          .getLong(0) shouldBe changedPropertyVersion
+        assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15 WHERE id <= 2")
+        sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = '$hash')")
+        sql("REFRESH MATERIALIZED VIEW default.ensure_mv_p15")
+        assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
+        sql("INSERT INTO ensure_src_p15 VALUES (4)")
+        var attempts = 0
+        OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/guard-v2-backup-failure"))
+        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+          attempts += 1
+          throw new java.io.IOException("guarded backup failure")
+        }
+        try {
+          val failure = intercept[Exception](guarded(target))
+          Iterator
+            .iterate[Throwable](failure)(_.getCause)
+            .takeWhile(_ != null)
+            .exists(_.getMessage == "guarded backup failure") shouldBe true
+          attempts shouldBe 1
+        } finally {
+          OpenIvmStateSync.setBackupPassHookForTesting(null)
+          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        }
+        assertMvCorrect("ensure_mv_p15", "SELECT id FROM ensure_src_p15")
+        val finalVersion = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+        MvCatalog.remove(spark, meta.name)
+        decline(target, "registration_missing")
+        intercept[Exception](guarded(target))
+        io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe finalVersion
       } finally {
-        MvCatalog.upsert(spark, meta)
+        originalAsync match {
+          case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
+          case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
+        }
       }
-      sql(s"ALTER TABLE ensure_mv_p15 SET TBLPROPERTIES ('$key' = 'ffffffffffffffffffffffffffffffff')")
-      sql("INSERT INTO ensure_src_p15 VALUES (3)")
-      intercept[Exception](guarded("ensure_mv_p15"))
-      spark.table("ensure_mv_p15").count() shouldBe 2L
+    }
+
+    it("does not create a missing Delta catalog and rejects an invalid catalog") {
+      val warehouse = new java.io.File(new java.net.URI(spark.conf.get("spark.sql.warehouse.dir")))
+      val root      = new java.io.File(warehouse, "eligibility_catalog")
+      val metadata  = new java.io.File(root, "mv_metadata")
+      metadata.exists() shouldBe false
+      val oldBackend = spark.conf.getOption("spark.openivm.catalog.backend")
+      val oldPath    = spark.conf.getOption("spark.openivm.catalog.path")
+      spark.conf.set("spark.openivm.catalog.backend", "delta")
+      spark.conf.set("spark.openivm.catalog.path", root.toString)
+      try {
+        decline("`default`.`ensure_delta_absent_p18`", "registration_missing")
+        metadata.exists() shouldBe false
+        metadata.mkdirs() shouldBe true
+        intercept[Exception](eligibility("`default`.`ensure_delta_absent_p18`"))
+      } finally {
+        oldBackend match {
+          case Some(value) => spark.conf.set("spark.openivm.catalog.backend", value)
+          case None        => spark.conf.unset("spark.openivm.catalog.backend")
+        }
+        oldPath match {
+          case Some(value) => spark.conf.set("spark.openivm.catalog.path", value)
+          case None        => spark.conf.unset("spark.openivm.catalog.path")
+        }
+      }
+    }
+
+    it("only routes a missing public view when its backing identity is intact") {
+      val key      = "dbt.fabricspark.materialized_view.query_hash"
+      val target   = "`spark_catalog`.`default`.`ensure_mv_p16`"
+      val oldAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
+      spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
+      try {
+        sql("CREATE TABLE ensure_src_p16 (grp INT, val INT) USING DELTA")
+        sql("INSERT INTO ensure_src_p16 VALUES (1, 2)")
+        sql(
+          s"CREATE MATERIALIZED VIEW default.ensure_mv_p16 TBLPROPERTIES ('$key' = '$hash') AS " +
+            "SELECT grp, SUM(val) AS total FROM ensure_src_p16 GROUP BY grp HAVING SUM(val) > 0"
+        )
+        val meta = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p16", Some("default"))).get
+        meta.usesBackingDataTable shouldBe true
+        val version = io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0)
+        eligibility(target).getString(0) shouldBe "eligible"
+        sql("DROP VIEW default.ensure_mv_p16")
+        decline(target, "public_relation_missing")
+        MvCatalog.upsert(
+          spark,
+          meta.copy(properties = meta.properties + (MvMetadata.TargetDeltaTableIdKey -> "foreign"))
+        )
+        intercept[Exception](eligibility(target))
+        MvCatalog.upsert(spark, meta)
+        sql("CREATE VIEW default.ensure_mv_p16 AS SELECT grp, CAST(val AS BIGINT) AS total FROM ensure_src_p16")
+        intercept[Exception](eligibility(target))
+        intercept[Exception](guarded(target))
+        io.delta.tables.DeltaTable.forPath(spark, meta.location).history(1).head().getLong(0) shouldBe version
+      } finally {
+        oldAsync match {
+          case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
+          case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
+        }
+      }
+    }
+
+    it("reports strict results after managed replacement or disappearance following eligibility") {
+      val key      = "dbt.fabricspark.materialized_view.query_hash"
+      val target   = "`spark_catalog`.`default`.`ensure_mv_p17`"
+      val oldAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
+      spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
+      try {
+        sql("CREATE TABLE ensure_src_p17 (id INT) USING DELTA")
+        sql("INSERT INTO ensure_src_p17 VALUES (1)")
+        val create = s"CREATE MATERIALIZED VIEW default.ensure_mv_p17 TBLPROPERTIES ('$key' = '$hash') AS " +
+          "SELECT id FROM ensure_src_p17"
+        sql(create)
+        val first = eligibility(target)
+        first.getString(0) shouldBe "eligible"
+        sql("DROP MATERIALIZED VIEW default.ensure_mv_p17")
+        sql(create)
+        val second = eligibility(target)
+        second.getString(0) shouldBe "eligible"
+        second.getString(3) should not be first.getString(3)
+        val replacement   = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p17", Some("default"))).get
+        val versionBefore = io.delta.tables.DeltaTable.forPath(spark, replacement.location).history(1).head().getLong(0)
+        sql("INSERT INTO ensure_src_p17 VALUES (2)")
+        assertMvCorrect("ensure_mv_p17", "SELECT id FROM ensure_src_p17 WHERE id = 1")
+        val refreshed = guarded(target).head
+        refreshed.getString(0) shouldBe "refreshed"
+        refreshed.getString(3) shouldBe second.getString(3)
+        io.delta.tables.DeltaTable
+          .forPath(spark, replacement.location)
+          .history(1)
+          .head()
+          .getLong(0) should be > versionBefore
+        assertMvCorrect("ensure_mv_p17", "SELECT id FROM ensure_src_p17")
+        eligibility(target).getString(0) shouldBe "eligible"
+        sql("DROP MATERIALIZED VIEW default.ensure_mv_p17")
+        guarded(target).head.getString(0) shouldBe "absent"
+      } finally {
+        oldAsync match {
+          case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
+          case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
+        }
+      }
+    }
+
+    it("rejects a stale table ID before advancing the replacement") {
+      val key      = "dbt.fabricspark.materialized_view.query_hash"
+      val target   = "`spark_catalog`.`default`.`ensure_mv_p18`"
+      val metaName = "default.ensure_mv_p18"
+      val ident    = TableIdentifier("ensure_mv_p18", Some("default"))
+      val oldAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
+      spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
+      try {
+        sql("CREATE TABLE ensure_src_p18 (id INT) USING DELTA")
+        sql("INSERT INTO ensure_src_p18 VALUES (1)")
+        val create = s"CREATE MATERIALIZED VIEW default.ensure_mv_p18 TBLPROPERTIES ('$key' = '$hash') AS " +
+          "SELECT id FROM ensure_src_p18"
+        sql(create)
+        val firstId = eligibility(target).getString(3)
+        sql("DROP MATERIALIZED VIEW default.ensure_mv_p18")
+        sql(create)
+        val secondId = eligibility(target).getString(3)
+        secondId should not be firstId
+        sql("INSERT INTO ensure_src_p18 VALUES (2)")
+        val before  = MvCatalog.lookup(spark, ident).get
+        val delta   = io.delta.tables.DeltaTable.forPath(spark, before.location)
+        val version = delta.history(1).head().getLong(0)
+        val cdf     = CdfWatermarkCatalog.getAll(spark, metaName, before.sourceTables)
+        val staging = StagingCatalog.collectFor(spark, metaName, before.sourceTables, before.sourceWatermarks)
+        var backups = 0
+        OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some("file:/guard-id-pin-test"))
+        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) => backups += 1 }
+        try {
+          val failure = intercept[Exception](pinned(target, firstId))
+          Iterator
+            .iterate[Throwable](failure)(_.getCause)
+            .takeWhile(_ != null)
+            .exists(e => Option(e.getMessage).exists(_.contains("expected table ID mismatch"))) shouldBe true
+          backups shouldBe 0
+        } finally {
+          OpenIvmStateSync.setBackupPassHookForTesting(null)
+          OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+        }
+        MvCatalog.lookup(spark, ident).get shouldBe before
+        CdfWatermarkCatalog.getAll(spark, metaName, before.sourceTables) shouldBe cdf
+        StagingCatalog.collectFor(spark, metaName, before.sourceTables, before.sourceWatermarks) shouldBe staging
+        delta.history(1).head().getLong(0) shouldBe version
+        eligibility(target).getString(3) shouldBe secondId
+        assertMvCorrect("ensure_mv_p18", "SELECT id FROM ensure_src_p18 WHERE id = 1")
+        val result = pinned(target, secondId).head
+        result.getString(0) shouldBe "refreshed"
+        result.getString(3) shouldBe secondId
+        delta.history(1).head().getLong(0) should be > version
+        assertMvCorrect("ensure_mv_p18", "SELECT id FROM ensure_src_p18")
+        sql("DROP MATERIALIZED VIEW default.ensure_mv_p18")
+        val absentFailure = intercept[Exception](pinned(target, secondId))
+        Iterator
+          .iterate[Throwable](absentFailure)(_.getCause)
+          .takeWhile(_ != null)
+          .exists(e => Option(e.getMessage).exists(_.contains("is absent"))) shouldBe true
+        guarded(target).head.getString(0) shouldBe "absent"
+      } finally {
+        oldAsync match {
+          case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
+          case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
+        }
+      }
     }
   }
 }
