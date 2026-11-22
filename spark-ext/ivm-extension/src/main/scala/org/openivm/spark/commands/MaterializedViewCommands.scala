@@ -6967,7 +6967,8 @@ case class RefreshMaterializedViewCommand(
                       ) ++
                         (if (FeatureGate.scd2RangeAccelEnabled(spark))
                            Seq(RewriteLineage.RewriteRule("scd2-range-acceleration", "1", RewriteLineage.Unknown))
-                         else Seq.empty)
+                         else Seq.empty) ++
+                        Seq(RewriteLineage.RewriteRule("expression-marker-restore", "1", RewriteLineage.Unknown))
                     )
                   else None
               )
