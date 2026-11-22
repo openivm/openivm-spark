@@ -123,8 +123,8 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         |lag(ts, CAST(n AS BIGINT)) OVER (ORDER BY ts),
         |'lag(ts, CAST(1 AS BIGINT))' FROM t""".stripMargin
       val translated = LptsSparkDialect.translate(sql)
-      translated should include("lag(ts,1, CAST(NULL AS TIMESTAMP))")
-      translated should include("lead(ts,2)")
+      translated should include("lag(ts, 1, CAST(NULL AS TIMESTAMP))")
+      translated should include("lead(ts, 2)")
       translated should include("lag(ts, CAST(n AS BIGINT))")
       translated should include("'lag(ts, CAST(1 AS BIGINT))'")
       LptsSparkDialect.translate(translated) shouldBe translated
@@ -187,8 +187,8 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         |other.lead(a, CAST(2 AS BIGINT)) OVER (ORDER BY a),
         |'lead(a, CAST(2 AS BIGINT)) OVER (ORDER BY a)' FROM t""".stripMargin
       val restored = LptsSparkDialect.translate(sql)
-      restored should include("lead(coalesce(a, b),2, 0) OVER")
-      restored should include("lag(a,-3) OVER")
+      restored should include("lead(coalesce(a, b), 2, 0) OVER")
+      restored should include("lag(a, -3) OVER")
       restored should include("lead(a, CAST(2147483648 AS BIGINT)) OVER")
       restored should include("lead(a, CAST(x AS BIGINT)) OVER")
       restored should include("other.lead(a, CAST(2 AS BIGINT)) OVER")

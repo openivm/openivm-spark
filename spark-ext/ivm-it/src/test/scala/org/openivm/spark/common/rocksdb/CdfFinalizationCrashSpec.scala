@@ -24,8 +24,9 @@ private[rocksdb] object CdfFinalizationCrashProbe {
   private val query = s"SELECT k, COUNT(*) AS n FROM $base GROUP BY k"
 
   def main(args: Array[String]): Unit = {
-    val root  = Paths.get(args(0))
-    val phase = args(1)
+    val root         = Paths.get(args(0))
+    val phase        = args(1)
+    val firstRefresh = args(2).toBoolean
     if (phase == "classpath") {
       Seq(
         "org.openivm.spark.common.rocksdb.CdfFinalizationCrashProbe",
@@ -89,15 +90,18 @@ private[rocksdb] object CdfFinalizationCrashProbe {
         sql(s"INSERT INTO $base VALUES (1), (2)")
         sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
         require(metadata.refreshType != RefreshTypeCode.FullRefresh)
-        sql(s"INSERT INTO $base VALUES (1)")
-        sql(s"REFRESH MATERIALIZED VIEW $mv")
+        if (!firstRefresh) {
+          sql(s"INSERT INTO $base VALUES (1)")
+          sql(s"REFRESH MATERIALIZED VIEW $mv")
+        }
         parity()
         val source = metadata.sourceTables match {
           case Seq(single) => single
           case other       => sys.error(s"Expected one source, got $other")
         }
-        val beforeOffset = CdfWatermarkCatalog.get(spark, mv, source).get
-        require(beforeOffset == version(base))
+        val beforeOffset   = version(base)
+        val expectedBefore = if (firstRefresh) None else Some(beforeOffset)
+        require(CdfWatermarkCatalog.get(spark, mv, source) == expectedBefore)
         val beforeMv = version(mv)
         require(metadata.lastVersion == beforeMv)
         sql(s"INSERT INTO $base VALUES (1), (1), (3)")
@@ -184,11 +188,13 @@ private[rocksdb] object CdfFinalizationCrashProbe {
         require(liveMv > oldMv, "refresh did not commit MV data before the crash")
         require(metadata.refreshType != RefreshTypeCode.FullRefresh)
         require(metadata.lastVersion == liveMv, "catalog advance was not durable after the crash")
-        require(CdfWatermarkCatalog.get(spark, mv, source).contains(oldOffset), "watermark advanced before the crash")
+        val expectedBefore = if (firstRefresh) None else Some(oldOffset)
+        require(CdfWatermarkCatalog.get(spark, mv, source) == expectedBefore, "watermark advanced before the crash")
         parity()
         sql(s"REFRESH MATERIALIZED VIEW $mv")
         parity()
-        require(CdfWatermarkCatalog.get(spark, mv, source).contains(pendingOffset))
+        val expectedAfter = if (firstRefresh) None else Some(pendingOffset)
+        require(CdfWatermarkCatalog.get(spark, mv, source) == expectedAfter)
         val afterRetry = version(mv)
         sql(s"REFRESH MATERIALIZED VIEW $mv")
         require(version(mv) == afterRetry, "a no-change retry modified the MV")
@@ -228,7 +234,7 @@ class CdfFinalizationCrashSpec extends AnyFunSpec with Matchers {
       case Failure(error)  => s"probe diagnostics unavailable (${error.getClass.getSimpleName})"
     }
 
-  it("reuses local CDF state correctly after death between catalog advance and watermark put") {
+  private def checkRecovery(firstRefresh: Boolean): Unit = {
     val root = Paths.get("target").toAbsolutePath.resolve(s"cdf-finalization-crash-${UUID.randomUUID()}")
     Files.createDirectories(root)
     val java = Paths.get(System.getProperty("java.home"), "bin", "java").toString
@@ -242,7 +248,8 @@ class CdfFinalizationCrashSpec extends AnyFunSpec with Matchers {
           System.getProperty("java.class.path"),
           "org.openivm.spark.common.rocksdb.CdfFinalizationCrashProbe",
           root.toString,
-          phase
+          phase,
+          firstRefresh.toString
         )): _*
       ).redirectErrorStream(true).redirectOutput(log.toFile).start()
       try {
@@ -254,6 +261,14 @@ class CdfFinalizationCrashSpec extends AnyFunSpec with Matchers {
           actual.get shouldBe exit
         }
       } finally if (process.isAlive) process.destroyForcibly()
+    }
+
+    it("reuses local CDF state correctly after death between catalog advance and watermark put") {
+      checkRecovery(firstRefresh = false)
+    }
+
+    it("does not replay the first refresh when its watermark entry was never written") {
+      checkRecovery(firstRefresh = true)
     }
   }
 }
