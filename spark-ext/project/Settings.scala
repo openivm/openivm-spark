@@ -205,9 +205,11 @@ object Settings {
     // so any shaded callsite would fail at runtime with
     // `UnsatisfiedLinkError`. Each Spark target pins the `rocksdbjni` version
     // shipped by that Spark release so the unshaded classpath is consistent.
+    // Scope shading to project code and ANTLR so RocksDB class bytes remain intact.
     assembly / assemblyShadeRules := Seq(
-      ShadeRule.rename("org.duckdb.**" -> "org.openivm.shaded.duckdb.@1").inAll,
-      ShadeRule.rename("org.antlr.v4.runtime.**" -> "org.openivm.shaded.antlr.@1").inAll
+      ShadeRule.rename("org.duckdb.**" -> "org.openivm.shaded.duckdb.@1").inProject,
+      ShadeRule.rename("org.antlr.v4.runtime.**" -> "org.openivm.shaded.antlr.@1").inProject,
+      ShadeRule.rename("org.antlr.v4.runtime.**" -> "org.openivm.shaded.antlr.@1").inLibrary(Dependencies.antlr)
     ),
     assembly / test := {}
   )
