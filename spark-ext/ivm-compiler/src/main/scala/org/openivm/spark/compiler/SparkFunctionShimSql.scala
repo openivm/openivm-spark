@@ -1122,6 +1122,44 @@ private[compiler] object SparkFunctionShimSql {
     hasRightIdentifierBoundary(sql, overStart + "OVER".length)
   }
 
+  private[compiler] def rewriteStructExtract(sql: String): String = {
+    val segment  = """(?:[A-Za-z_][A-Za-z0-9_$]*|`(?:[^`]|``)+`|"(?:[^"]|"")+")"""
+    val path     = (s"(?s)$segment(?:\\s*\\.\\s*$segment)*").r
+    var previous = '\u0000'
+    rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      val qualified = previous == '.'
+      if (!sql.charAt(i).isWhitespace) previous = sql.charAt(i)
+      if (qualified) None
+      else
+        parseFunctionCallAt(sql, i, "struct_extract")
+          .filter(_.topLevelCommaCount == 1)
+          .flatMap(call =>
+            splitTopLevelArgs(sql, call).flatMap {
+              case Seq(exprRange, fieldRange) =>
+                val rawExpr = sql.substring(exprRange._1, exprRange._2)
+                val expr    = rawExpr.trim
+                val literal = sql.substring(fieldRange._1, fieldRange._2).trim
+                if (expr.isEmpty || !literal.matches("(?s)'(?:''|[^'])*'")) None
+                else {
+                  val field     = literal.substring(1, literal.length - 1).replace("''", "'")
+                  val rewritten = rewriteStructExtract(expr)
+                  val base =
+                    if (
+                      path.pattern.matcher(rewritten).matches() && !Set("NULL", "TRUE", "FALSE")
+                        .contains(rewritten.toUpperCase(Locale.ROOT))
+                    ) rewritten
+                    else s"($rewritten${rawExpr.reverse.takeWhile(_.isWhitespace).reverse})"
+                  val rendered =
+                    if (field.matches("[A-Za-z_][A-Za-z0-9_]*")) field
+                    else s"`${field.replace("`", "``")}`"
+                  Some(call.closeParen + 1 -> s"$base.$rendered")
+                }
+              case _ => None
+            }
+          )
+    }
+  }
+
   private def splitTopLevelArgs(sql: String, call: FunctionCall): Option[Seq[(Int, Int)]] = {
     val args     = scala.collection.mutable.ArrayBuffer.empty[(Int, Int)]
     var depth    = 1
@@ -1136,6 +1174,7 @@ private[compiler] object SparkFunctionShimSql {
         sql.charAt(i) match {
           case '\'' => i = consumeSingleQuoted(sql, i).min(call.closeParen)
           case '"'  => i = consumeDoubleQuoted(sql, i).min(call.closeParen)
+          case '`'  => i = consumeBacktickQuoted(sql, i).min(call.closeParen)
           case '(' =>
             depth += 1
             i += 1
@@ -1265,6 +1304,7 @@ private[compiler] object SparkFunctionShimSql {
         sql.charAt(i) match {
           case '\'' => i = consumeSingleQuoted(sql, i)
           case '"'  => i = consumeDoubleQuoted(sql, i)
+          case '`'  => i = consumeBacktickQuoted(sql, i)
           case '(' =>
             depth += 1
             i += 1
@@ -1445,6 +1485,19 @@ private[compiler] object SparkFunctionShimSql {
     while (i < sql.length) {
       if (sql.charAt(i) == '"') {
         if (i + 1 < sql.length && sql.charAt(i + 1) == '"') i += 2
+        else return i + 1
+      } else {
+        i += 1
+      }
+    }
+    sql.length
+  }
+
+  private def consumeBacktickQuoted(sql: String, start: Int): Int = {
+    var i = start + 1
+    while (i < sql.length) {
+      if (sql.charAt(i) == '`') {
+        if (i + 1 < sql.length && sql.charAt(i + 1) == '`') i += 2
         else return i + 1
       } else {
         i += 1

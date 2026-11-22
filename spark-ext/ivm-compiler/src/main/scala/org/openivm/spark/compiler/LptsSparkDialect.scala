@@ -69,6 +69,9 @@ object LptsSparkDialect {
     */
   private val IntervalRe = """(?i)INTERVAL\s+'(\d+)\s+(\w+)'""".r
 
+  private val NativeMicrosecondInterval =
+    """(?i)(?:"add"|add)\s*\(\s*(?:"add"|add)\s*\(\s*to_months\s*\(\s*0\s*\)\s*,\s*to_days\s*\(\s*0\s*\)\s*\)\s*,\s*to_microseconds\s*\(\s*CAST\s*\(\s*([+-]?\d+)\s+AS\s+BIGINT\s*\)\s*\)\s*\)""".r.pattern
+
   /** `count_star()` — DuckDB's count-star spelling. Rewritten to Spark's
     * standard `COUNT(*)` form.
     */
@@ -140,19 +143,21 @@ object LptsSparkDialect {
               rewriteCountStar(
                 rewriteIntervalLiterals(
                   rewriteToTemporalUnit(
-                    rewriteGenerateSeries(
-                      rewriteBareHugeIntCast(
-                        rewriteBareVarcharCast(
-                          rewritePostfixCasts(
-                            rewriteStructExtract(
-                              rewriteTimestampWithTimeZone(
-                                rewriteSparkFunctionInlinings(
-                                  rewriteToTimestampDoubleCast(
-                                    SparkFunctionShimSql.restoreStructMaxBy(
-                                      SparkFunctionShimSql.restoreWindowOffsetLiterals(
-                                        rewriteNowTimestamp(
-                                          rewriteLikeOperators(
-                                            rewriteQuotedCastTypes(stripNativeBuiltinQualification(sql))
+                    rewriteNativeMicrosecondInterval(
+                      rewriteGenerateSeries(
+                        rewriteBareHugeIntCast(
+                          rewriteBareVarcharCast(
+                            rewritePostfixCasts(
+                              rewriteStructExtract(
+                                rewriteTimestampWithTimeZone(
+                                  rewriteSparkFunctionInlinings(
+                                    rewriteToTimestampDoubleCast(
+                                      SparkFunctionShimSql.restoreStructMaxBy(
+                                        SparkFunctionShimSql.restoreWindowOffsetLiterals(
+                                          rewriteNowTimestamp(
+                                            rewriteLikeOperators(
+                                              rewriteQuotedCastTypes(stripNativeBuiltinQualification(sql))
+                                            )
                                           )
                                         )
                                       )
@@ -434,55 +439,33 @@ object LptsSparkDialect {
     * SQL parser does not recognise `struct_extract`, so the openivm-emitted
     * initial-load and refresh SQL fails with PARSE_SYNTAX_ERROR otherwise.
     *
-    * The rewrite handles arbitrarily-nested calls (e.g.
-    * `struct_extract(struct_extract(s, 'a'), 'b')` →  `s.a.b`) by iterating
-    * the innermost-first regex until no more matches remain.
+    * Nested calls and complex expressions are rewritten using balanced
+    * parsing outside quoted text and comments.
     *
     * Field names go through Spark backtick quoting if they contain anything
     * other than a leading letter/underscore + alphanumerics/underscores,
-    * so DuckDB names like `'_c_id'` (leading underscore — legal in Spark
-    * but Spark's parser sometimes balks at sequences like `x._c_id`
-    * depending on tokenisation; backticks are always safe).
+    * including escaped backticks in field names.
     */
-  private[compiler] def rewriteStructExtract(sql: String): String = {
-    // Match struct_extract(<expr>, '<field>') where <expr> contains NO
-    // unmatched parens (i.e. is the innermost call). The negated character
-    // class for the first argument allows literal-paren-free expressions:
-    // identifiers, dotted names, backtick-wrapped names, and dotted chains
-    // of struct_extract output (after a prior pass).
-    //
-    // We do not match across a struct_extract( ... ( ... ) ... ) — the
-    // inner struct_extract is rewritten first, then the outer call is
-    // exposed and rewritten on the next pass.
-    val re = """(?i)struct_extract\s*\(\s*([^(),]+?)\s*,\s*'([^']*)'\s*\)""".r
+  private[compiler] def rewriteStructExtract(sql: String): String =
+    SparkFunctionShimSql.rewriteStructExtract(sql)
 
-    def needsBackticks(name: String): Boolean = {
-      // Conservative: any character outside [A-Za-z0-9_] (including leading
-      // digit) forces quoting. Even a leading underscore is fine without
-      // quotes in Spark, but matching DuckDB's exact case-sensitive name
-      // requires backticks if the source schema name was case-mixed.
-      name.isEmpty || !name.matches("[A-Za-z_][A-Za-z0-9_]*")
+  private[compiler] def rewriteNativeMicrosecondInterval(sql: String): String = {
+    var previous = '\u0000'
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true, protectDoubleQuotes = false) { i =>
+      val qualified = previous == '.'
+      if (!sql.charAt(i).isWhitespace) previous = sql.charAt(i)
+      val boundary = i == 0 || !(sql.charAt(i - 1).isLetterOrDigit || sql.charAt(i - 1) == '_')
+      if (!boundary || qualified || (sql.charAt(i) != '"' && !sql.regionMatches(true, i, "add", 0, 3))) None
+      else {
+        val matcher = NativeMicrosecondInterval.matcher(sql).region(i, sql.length)
+        if (!matcher.lookingAt()) None
+        else
+          scala.util.Try(matcher.group(1).toLong).toOption.map { micros =>
+            val seconds = java.math.BigDecimal.valueOf(micros, 6).toPlainString
+            matcher.end() -> s"INTERVAL '$seconds' SECOND"
+          }
+      }
     }
-
-    var s          = sql
-    var prev       = ""
-    var iterations = 0
-    while (s != prev && iterations < 64) {
-      prev = s
-      s = re.replaceAllIn(
-        s,
-        m => {
-          val expr  = m.group(1).trim
-          val field = m.group(2)
-          val rendered =
-            if (needsBackticks(field)) s".`${field.replace("`", "``")}`"
-            else s".$field"
-          java.util.regex.Matcher.quoteReplacement(expr + rendered)
-        }
-      )
-      iterations += 1
-    }
-    s
   }
 
   /** Rewrites `now()::timestamp` (any case) to `current_timestamp()`.

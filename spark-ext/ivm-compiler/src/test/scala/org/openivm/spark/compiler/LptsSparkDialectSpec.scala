@@ -1,5 +1,6 @@
 package org.openivm.spark.compiler
 
+import org.apache.spark.sql.SparkSession
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -528,10 +529,88 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       ) shouldBe "t4_Customer.name.c_l_name"
     }
 
+    it("extracts fields from nested aggregate expressions and escaped identifiers") {
+      LptsSparkDialect.rewriteStructExtract(
+        "struct_extract(max_by(named_struct('a', `x,)`), named_struct('b', y)), 'odd`name')"
+      ) shouldBe "(max_by(named_struct('a', `x,)`), named_struct('b', y))).`odd``name`"
+      LptsSparkDialect.rewriteStructExtract("struct_extract(s, 'it''s')") shouldBe "s.`it's`"
+      LptsSparkDialect.rewriteStructExtract("struct_extract(NULL, 'key')") shouldBe "(NULL).key"
+      LptsSparkDialect.rewriteStructExtract("struct_extract(coalesce(s, t) -- comment\n, 'k')") shouldBe
+        "(coalesce(s, t) -- comment\n).k"
+    }
+
+    it("leaves qualified calls and protected text alone") {
+      val sql = """other.struct_extract(s, 'a'), other. /* comment */ struct_extract(s, 'a'),
+        |other. -- comment
+        |struct_extract(s, 'a'), 'struct_extract(s, ''a'')',
+        |`struct_extract(s, 'a')` -- struct_extract(s, 'a')
+        |/* struct_extract(s, 'a') */ struct_extract(s, dynamic_field)""".stripMargin
+      LptsSparkDialect.rewriteStructExtract(sql) shouldBe sql
+    }
+
     it("rewrites triple-nested struct_extract") {
       LptsSparkDialect.rewriteStructExtract(
         "struct_extract(struct_extract(struct_extract(c, 'contactinfo'), 'c_phone_1'), 'c_local')"
       ) shouldBe "c.contactinfo.c_phone_1.c_local"
+    }
+
+    describe("native microsecond interval") {
+      it("restores only the native zero-month zero-day interval constructor") {
+        val native   = """add(add(to_months(0), to_days(0)), to_microseconds(CAST(1000 AS BIGINT)))"""
+        val second   = native.replace("1000", "1000000")
+        val negative = native.replace("1000", "-1")
+        LptsSparkDialect.rewriteNativeMicrosecondInterval(native) shouldBe "INTERVAL '0.001000' SECOND"
+        LptsSparkDialect.rewriteNativeMicrosecondInterval(second) shouldBe "INTERVAL '1.000000' SECOND"
+        LptsSparkDialect.rewriteNativeMicrosecondInterval(negative) shouldBe "INTERVAL '-0.000001' SECOND"
+        val qualified =
+          """"system".main."add"("system".main."add"("system".main.to_months(0), "system".main.to_days(0)), "system".main.to_microseconds(CAST(1000 AS BIGINT)))"""
+        LptsSparkDialect.translate(qualified) shouldBe "INTERVAL '0.001000' SECOND"
+      }
+
+      describe("translated expression execution") {
+        it("preserves microsecond precision, interval type, and struct field values") {
+          val spark = SparkSession.builder().master("local[1]").appName("DialectExpressionSpec").getOrCreate()
+          try {
+            spark.conf.set("spark.sql.session.timeZone", "UTC")
+            val intervalType = spark.sql("SELECT INTERVAL '1' SECOND").schema.head.dataType
+            Seq(Long.MinValue, -1L, 0L, 1000L, 1000000L, 1000001L, Long.MaxValue).foreach { micros =>
+              val native   = s"add(add(to_months(0), to_days(0)), to_microseconds(CAST($micros AS BIGINT)))"
+              val interval = LptsSparkDialect.translate(native)
+              spark.sql(s"SELECT $interval").schema.head.dataType shouldBe intervalType
+              spark
+                .sql(s"SELECT unix_micros(TIMESTAMP '1970-01-01 00:00:00' + $interval)")
+                .head()
+                .getLong(0) shouldBe micros
+            }
+            val extract = LptsSparkDialect.rewriteStructExtract(
+              "struct_extract(named_struct('odd`name', CAST(NULL AS INT)), 'odd`name')"
+            )
+            val actual   = spark.sql(s"SELECT $extract AS field")
+            val expected = spark.sql("SELECT CAST(NULL AS INT) AS field")
+            actual.schema.head.dataType shouldBe expected.schema.head.dataType
+            actual.collect().toSeq shouldBe expected.collect().toSeq
+            val nested = LptsSparkDialect.rewriteStructExtract(
+              "struct_extract(coalesce(CAST(NULL AS STRUCT<k: INT>), named_struct('k', 7)), 'k')"
+            )
+            spark.sql(s"SELECT $nested").head().getInt(0) shouldBe 7
+          } finally spark.stop()
+        }
+      }
+
+      it("does not rewrite dynamic, null, nonzero-month, overflow, or qualified constructors") {
+        val base = "add(add(to_months(0), to_days(0)), to_microseconds(CAST(1000 AS BIGINT)))"
+        val inputs = Seq(
+          base.replace("1000", "x"),
+          base.replace("1000", "NULL"),
+          base.replace("to_months(0)", "to_months(1)"),
+          base.replace("1000", "9223372036854775808"),
+          "custom." + base,
+          "custom. /* comment */ " + base,
+          "custom. -- comment\n" + base,
+          s"'$base' -- $base\n/* $base */"
+        )
+        inputs.foreach(sql => LptsSparkDialect.rewriteNativeMicrosecondInterval(sql) shouldBe sql)
+      }
     }
 
     it("rewrites struct_extract embedded inside a CAST expression") {
