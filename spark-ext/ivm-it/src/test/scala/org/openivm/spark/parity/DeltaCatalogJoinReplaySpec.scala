@@ -2,40 +2,48 @@ package org.openivm.spark.parity
 
 import java.io.File
 
-import org.openivm.spark.common.{MvCatalog, RefreshProfileCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{MvCatalog, RefreshProfileCatalog, RefreshTypeCode, StagingCatalog}
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
 
 abstract class DeltaCatalogJoinReplayScenarios extends IvmParitySpecBase("delta-catalog-join-replay") {
   self: IvmParityMode =>
 
+  protected def catalogBackend: String = "delta"
+
   override protected def extraSparkConf: Map[String, String] = Map(
-    "spark.openivm.catalog.backend"                   -> "delta",
-    "spark.openivm.catalog.path"                      -> new File(warehouseDir, "catalog").getAbsolutePath,
-    "spark.openivm.statePath"                         -> new File(warehouseDir, "state").getAbsolutePath,
-    "spark.openivm.stateSync.uri"                     -> new File(warehouseDir, "state-sync").toURI.toString,
-    "spark.openivm.stateSync.async.enabled"           -> "false",
-    "spark.openivm.profile.refresh"                  -> "true",
-    "spark.openivm.queryLog.enabled"                 -> "true",
+    "spark.openivm.catalog.backend"                          -> catalogBackend,
+    "spark.openivm.catalog.path"                             -> new File(warehouseDir, "catalog").getAbsolutePath,
+    "spark.openivm.statePath"                                -> new File(warehouseDir, "state").getAbsolutePath,
+    "spark.openivm.stateSync.uri"                            -> new File(warehouseDir, "state-sync").toURI.toString,
+    "spark.openivm.stateSync.async.enabled"                  -> "false",
+    "spark.openivm.profile.refresh"                          -> "true",
+    "spark.openivm.queryLog.enabled"                         -> "true",
     "spark.openivm.refresh.windowRunningIncremental.enabled" -> "true",
-    "spark.sql.session.timeZone"                     -> "UTC",
-    "spark.sql.shuffle.partitions"                    -> "4"
+    "spark.sql.session.timeZone"                             -> "UTC",
+    "spark.sql.shuffle.partitions"                           -> "4"
   )
 
   it("does not replay a previous insert after updating and deleting joined rows") {
-    val schema = "join_replay_lab"
+    val schema     = "join_replay_lab"
     val securities = s"$schema.securities"
-    val trades = s"$schema.trades"
-    val mv = s"$schema.joined_trades"
+    val trades     = s"$schema.trades"
+    val mv         = s"$schema.joined_trades"
     val body = s"SELECT s.symbol, SUM(t.notional) AS total FROM $securities s JOIN $trades t " +
       "ON s.symbol = t.symbol GROUP BY s.symbol"
     sql(s"CREATE DATABASE $schema")
-    sql(s"CREATE TABLE $securities(symbol STRING, company STRING) USING DELTA " +
-      s"LOCATION '${new File(warehouseDir, "securities").toURI}'")
-    sql(s"CREATE TABLE $trades(trade_id INT, symbol STRING, notional INT) USING DELTA " +
-      s"LOCATION '${new File(warehouseDir, "trades").toURI}'")
+    sql(
+      s"CREATE TABLE $securities(symbol STRING, company STRING) USING DELTA " +
+        s"LOCATION '${new File(warehouseDir, "securities").toURI}'"
+    )
+    sql(
+      s"CREATE TABLE $trades(trade_id INT, symbol STRING, notional INT) USING DELTA " +
+        s"LOCATION '${new File(warehouseDir, "trades").toURI}'"
+    )
     sql(s"INSERT INTO $securities VALUES ('AAA','Alpha Co'),('BBB','Beta Co'),('CCC','Gamma Co')")
-    sql(s"INSERT INTO $trades VALUES (1,'AAA',10),(2,'BBB',11),(3,'CCC',12)," +
-      "(4,'AAA',13),(5,'BBB',14),(6,'CCC',15)")
+    sql(
+      s"INSERT INTO $trades VALUES (1,'AAA',10),(2,'BBB',11),(3,'CCC',12)," +
+        "(4,'AAA',13),(5,'BBB',14),(6,'CCC',15)"
+    )
     sql(s"CREATE MATERIALIZED VIEW $mv AS $body")
     val id = spark.sessionState.sqlParser.parseTableIdentifier(mv)
     MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.AggregateGroup
@@ -56,7 +64,46 @@ abstract class DeltaCatalogJoinReplayScenarios extends IvmParitySpecBase("delta-
     refreshMv(mv)
     assertMvCorrect(mv, body)
   }
+
+  itIntercept("clears a dropped view's consumed markers without losing another view's pending changes") {
+    val schema = "join_replay_drop"
+    val source = s"$schema.trades"
+    val first  = s"$schema.first_mv"
+    val second = s"$schema.second_mv"
+    val body   = s"SELECT id, amount FROM $source"
+    sql(s"CREATE DATABASE $schema")
+    sql(s"CREATE TABLE $source(id INT, amount INT) USING DELTA")
+    sql(s"INSERT INTO $source VALUES (1, 10)")
+    sql(s"CREATE MATERIALIZED VIEW $first AS $body")
+    sql(s"CREATE MATERIALIZED VIEW $second AS $body")
+    sql(s"INSERT INTO $source VALUES (2, 20)")
+    refreshMv(first)
+    assertMvCorrect(first, body)
+
+    val id      = spark.sessionState.sqlParser.parseTableIdentifier(first)
+    val sources = MvCatalog.lookup(spark, id).get.sourceTables
+    StagingCatalog.collectFor(spark, first, sources) shouldBe empty
+    val pending = StagingCatalog.collectFor(spark, second, sources).map(_.stagingPath)
+    pending should not be empty
+    sql(s"DROP MATERIALIZED VIEW $first")
+    StagingCatalog.collectFor(spark, first, sources).map(_.stagingPath) should contain allElementsOf pending
+    StagingCatalog.collectFor(spark, second, sources).map(_.stagingPath) should contain allElementsOf pending
+
+    sql(s"CREATE MATERIALIZED VIEW $first AS $body")
+    assertMvCorrect(first, body)
+    sql(s"INSERT INTO $source VALUES (3, 30)")
+    refreshMv(first)
+    refreshMv(second)
+    assertMvCorrect(first, body)
+    assertMvCorrect(second, body)
+  }
 }
 
-class DeltaCatalogJoinReplaySpec extends DeltaCatalogJoinReplayScenarios with InterceptMode
+class DeltaCatalogJoinReplaySpec    extends DeltaCatalogJoinReplayScenarios with InterceptMode
 class DeltaCatalogJoinReplayCdfSpec extends DeltaCatalogJoinReplayScenarios with CdfMode
+class RocksCatalogJoinReplaySpec extends DeltaCatalogJoinReplayScenarios with InterceptMode {
+  override protected def catalogBackend: String = "rocksdb"
+}
+class RocksCatalogJoinReplayCdfSpec extends DeltaCatalogJoinReplayScenarios with CdfMode {
+  override protected def catalogBackend: String = "rocksdb"
+}

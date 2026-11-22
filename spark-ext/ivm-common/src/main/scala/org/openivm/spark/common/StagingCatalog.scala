@@ -270,14 +270,21 @@ object StagingCatalog {
   def markConsumed(spark: SparkSession, viewName: String, paths: Seq[String]): Unit = {
     if (paths.isEmpty) return
 
-    openTrackedMvDb(spark, viewName).foreach { mvDb =>
-      mvDb.withBatch { batch =>
-        paths.distinct.foreach { path =>
-          OpenIvmRocksDBBatchOps.put(mvDb, batch, ConsumedCf, RocksDBCodec.utf8(path), Array.emptyByteArray)
-        }
+    val mvDb =
+      OpenIvmRocksDBRegistry.getOrOpen(spark, OpenIvmStatePaths.perMvDbPath(spark, viewName), MvDbColumnFamilies)
+    mvDb.withBatch { batch =>
+      paths.distinct.foreach { path =>
+        OpenIvmRocksDBBatchOps.put(mvDb, batch, ConsumedCf, RocksDBCodec.utf8(path), Array.emptyByteArray)
       }
     }
   }
+
+  private[common] def removeConsumedForView(spark: SparkSession, viewName: String): Unit =
+    openTrackedMvDb(spark, viewName).foreach { mvDb =>
+      val keys = mvDb.prefixScan(ConsumedCf, Array.emptyByteArray).map { case (key, _) => key.clone() }.toList
+      if (keys.nonEmpty)
+        mvDb.withBatch(batch => keys.foreach(key => OpenIvmRocksDBBatchOps.delete(mvDb, batch, ConsumedCf, key)))
+    }
 
   def pruneFullyConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = {
     if (viewsByTable.isEmpty) return
