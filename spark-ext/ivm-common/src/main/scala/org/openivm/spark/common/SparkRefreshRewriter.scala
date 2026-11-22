@@ -3218,7 +3218,7 @@ object SparkRefreshRewriter {
         val closeIdx = findMatchingCloseParen(stmt, openIdx)
         if (closeIdx < 0) return stmt
         val afterSubquery = stmt.substring(closeIdx + 1)
-        val aliasRe       = """(?is)^\s+(\w+)\b(.*)$""".r
+        val aliasRe       = """(?is)^\s+(?:AS\s+)?((?!AS\b|WHERE\b)(?:`(?:``|[^`])+`|"(?:[a-zA-Z0-9_]+)"|\w+))(.*)$""".r
         aliasRe.findFirstMatchIn(afterSubquery) match {
           case None => stmt
           case Some(aliasMatch) =>
