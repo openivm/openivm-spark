@@ -971,7 +971,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         OpenIvmStateSync.backupAsync(session)
         entered.await(5, TimeUnit.SECONDS) shouldBe true
         val synchronous = Future(OpenIvmStateSync.backupNow(session))
-        waitUntil(5.seconds) { OpenIvmStateSync.queuedPassCountForTesting(session) == 1 }
+        waitUntil(5.seconds) { OpenIvmStateSync.destinationQueueLengthForTesting(session) == 1 }
         (1 to 64).foreach(_ => OpenIvmStateSync.backupAsync(session))
         release.countDown()
         Await.result(synchronous, RegistryRaceTimeout)
@@ -1373,19 +1373,35 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       } finally release.countDown()
     }
 
-    it("allows different synchronous namespaces to publish concurrently") {
+    it("allows different synchronous destinations to publish concurrently") {
+      val stateRoot   = newDir("state-sync-independent-local")
+      val leftRemote  = newDir("state-sync-independent-left")
+      val rightRemote = newDir("state-sync-independent-right")
       val spark = newSpark(
         "state-sync-synchronous-namespaces",
-        Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> leftRemote.toURI.toString
+        )
       )
-      val left    = newStateSyncSession(spark, "sync-left")
-      val right   = newStateSyncSession(spark, "sync-right")
+      val left  = newStateSyncSession(spark, "sync-left")
+      val right = newStateSyncSession(spark, "sync-right")
+      val root  = OpenIvmStateBarrier.root(spark)
+      Files.createDirectories(root)
+      Files.write(root.resolve("marker"), Array[Byte](1))
       val entered = new CountDownLatch(2)
       val release = new CountDownLatch(1)
       OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
-      OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+      OpenIvmStateSync.setStateSyncUriHookForTesting { session =>
+        Some(
+          if (session.conf.get(TestStateSyncKey) == "sync-left") leftRemote.toURI.toString
+          else rightRemote.toURI.toString
+        )
+      }
+      OpenIvmStateSync.setCopyLocalFileHookForTesting { (fs, file, remote) =>
         entered.countDown()
         release.await(10, TimeUnit.SECONDS) shouldBe true
+        fs.copyFromLocalFile(false, true, new org.apache.hadoop.fs.Path(file.getAbsolutePath), remote)
       }
       try {
         val pending = Seq(left, right).map(session => Future(OpenIvmStateSync.backupNow(session)))
@@ -1393,6 +1409,56 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
         pending.forall(!_.isCompleted) shouldBe true
         release.countDown()
         Await.result(Future.sequence(pending), RegistryRaceTimeout)
+        Seq(leftRemote, rightRemote).foreach { dir =>
+          val remote = new org.apache.hadoop.fs.Path(dir.toURI)
+          val fs     = remote.getFileSystem(spark.sessionState.newHadoopConf())
+          OpenIvmStateSync.latestCommittedSnapshot(fs, remote) should not be empty
+        }
+      } finally release.countDown()
+    }
+
+    it("serializes real publications to the same destination across state-sync keys") {
+      val stateRoot  = newDir("state-sync-shared-destination-local")
+      val remoteRoot = newDir("state-sync-shared-destination-remote")
+      val spark = newSpark(
+        "state-sync-shared-destination",
+        Seq(
+          FeatureGate.StatePathKey    -> stateRoot.getAbsolutePath,
+          FeatureGate.StateSyncUriKey -> remoteRoot.toURI.toString
+        )
+      )
+      val left  = newStateSyncSession(spark, "shared-left")
+      val right = newStateSyncSession(spark, "shared-right")
+      val root  = OpenIvmStateBarrier.root(spark)
+      Files.createDirectories(root)
+      Files.write(root.resolve("marker"), Array[Byte](1))
+      val entered = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      val uploads = new AtomicInteger(0)
+      OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
+      OpenIvmStateSync.setCopyLocalFileHookForTesting { (fs, file, remote) =>
+        if (uploads.incrementAndGet() == 1) {
+          entered.countDown()
+          release.await(10, TimeUnit.SECONDS) shouldBe true
+        }
+        fs.copyFromLocalFile(false, true, new org.apache.hadoop.fs.Path(file.getAbsolutePath), remote)
+      }
+      try {
+        val first = Future(OpenIvmStateSync.backupNow(left))
+        entered.await(5, TimeUnit.SECONDS) shouldBe true
+        val second = Future(OpenIvmStateSync.backupNow(right))
+        waitUntil(5.seconds) { OpenIvmStateSync.destinationQueueLengthForTesting(right) == 1 }
+        uploads.get() shouldBe 1
+        second.isCompleted shouldBe false
+        release.countDown()
+        Await.result(Future.sequence(Seq(first, second)), RegistryRaceTimeout)
+        uploads.get() shouldBe 2
+        val remote  = new org.apache.hadoop.fs.Path(remoteRoot.toURI)
+        val fs      = remote.getFileSystem(spark.sessionState.newHadoopConf())
+        val commits = new org.apache.hadoop.fs.Path(remote, ".openivm-state-sync/commits")
+        fs.listStatus(commits).count(_.getPath.getName.endsWith(".commit")) shouldBe 2
+        val latest = OpenIvmStateSync.latestCommittedSnapshot(fs, remote).get
+        fs.exists(new org.apache.hadoop.fs.Path(latest, "snapshot.zip")) shouldBe true
       } finally release.countDown()
     }
 
@@ -2191,7 +2257,7 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       }
     }
 
-    it("allows different state-sync keys to overlap and eventually returns both to idle") {
+    it("allows different state-sync destinations to overlap and eventually returns both to idle") {
       val spark = newSpark(
         "state-sync-overlap",
         Seq(FeatureGate.StateSyncUriKey -> "abfss://state-sync@onelake/lh/_openivm")
@@ -2206,6 +2272,9 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       val maxActive    = new AtomicInteger(0)
 
       OpenIvmStateSync.setStateSyncKeyHookForTesting((session, _) => session.conf.get(TestStateSyncKey))
+      OpenIvmStateSync.setStateSyncUriHookForTesting(session =>
+        Some(s"abfss://state-sync@onelake/lh/_openivm/${session.conf.get(TestStateSyncKey)}")
+      )
       OpenIvmStateSync.setBackupPassHookForTesting { (key, _, _) =>
         val current = active.incrementAndGet()
         maxActive.updateAndGet(existing => math.max(existing, current))
