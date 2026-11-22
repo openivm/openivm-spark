@@ -150,7 +150,8 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       }
       org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { cloned =>
         OpenIvmCompilers.forSession(cloned) should be theSameInstanceAs compiler
-        val key = "spark.openivm.compiler.cliLibraryPath"
+        val key      = "spark.openivm.compiler.cliLibraryPath"
+        val original = cloned.conf.getOption(key)
         val current = spark.conf
           .getOption(key)
           .map(_.trim)
@@ -163,7 +164,13 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         val alternate = OpenIvmCompilers.forSession(cloned)
         alternate should not be theSameInstanceAs(compiler)
         alternate.cacheGeneration should not equal compiler.cacheGeneration
+        cloned.conf.set(key, s"  $current${File.pathSeparator}$current  ")
         OpenIvmCompilers.forSession(cloned) should be theSameInstanceAs alternate
+        original match {
+          case Some(value) => cloned.conf.set(key, value)
+          case None        => cloned.conf.unset(key)
+        }
+        OpenIvmCompilers.forSession(cloned) should be theSameInstanceAs compiler
       }
       OpenIvmCompilers.forSession(spark) should be theSameInstanceAs compiler
     }
