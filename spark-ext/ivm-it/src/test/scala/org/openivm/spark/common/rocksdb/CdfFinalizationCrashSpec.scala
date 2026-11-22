@@ -99,7 +99,7 @@ private[rocksdb] object CdfFinalizationCrashProbe {
           case Seq(single) => single
           case other       => sys.error(s"Expected one source, got $other")
         }
-        val beforeOffset = version(base)
+        val beforeOffset   = version(base)
         val expectedBefore = if (firstRefresh) None else Some(beforeOffset)
         require(CdfWatermarkCatalog.get(spark, mv, source) == expectedBefore)
         val beforeMv = version(mv)
