@@ -175,6 +175,8 @@ In CDF mode, CREATE reads its initial rows from the captured Delta source
 versions and records their physical identities with the CREATE watermarks.
 Concurrent source commits are left for a subsequent refresh; explicit snapshot
 pins remain part of the stored query.
+An interrupted legacy CDF CREATE without recorded snapshot identities is
+refused rather than reusing data with an unproved baseline.
 
 `spark.openivm.cdf.preflight.parallelSources.enabled=true` enables an experimental,
 default-off source-availability preflight using at most two workers per refresh.

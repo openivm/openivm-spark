@@ -3578,7 +3578,6 @@ case class CreateMaterializedViewCommand(
       )
       recoverCreateWatermarkProperties(spark, dataLocation) match {
         case Some(recovered) =>
-          CdfCreateSnapshots.verifyRecovered(spark, recovered, qualNames)
           pinnedWatermarks.foreach { case (key, expected) =>
             if (!recovered.get(key).contains(expected))
               throw new IllegalStateException(
@@ -3587,6 +3586,11 @@ case class CreateMaterializedViewCommand(
                   "refusing to reuse data from an unproved snapshot"
               )
           }
+          if (propagation.mode == ChangeFeedMode.Cdf && !recovered.contains(CdfCreateSnapshots.Property))
+            throw new IllegalStateException(
+              s"Existing Delta path $dataLocation lacks a verified CREATE source snapshot; refusing CDF recovery"
+            )
+          CdfCreateSnapshots.verifyRecovered(spark, recovered, qualNames)
           recovered
         case None =>
           if (propagation.mode == ChangeFeedMode.Cdf) {

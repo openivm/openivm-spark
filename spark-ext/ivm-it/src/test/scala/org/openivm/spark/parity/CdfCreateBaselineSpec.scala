@@ -158,6 +158,31 @@ class CdfCreateBaselineSpec extends IvmParitySpecBase("cdf-create-baseline-race"
     )
   }
 
+  it("refuses legacy CDF CREATE data whose initial snapshot cannot be proved") {
+    val source = "default.cdf_create_legacy_src"
+    val mv     = "default.cdf_create_legacy_mv"
+    sql(s"CREATE TABLE $source (k INT) USING DELTA").collect()
+    sql(s"INSERT INTO $source VALUES (1)").collect()
+    val version = sql(s"DESCRIBE HISTORY $source LIMIT 1").head().getLong(0)
+    sql(s"INSERT INTO $source VALUES (2)").collect()
+    val root     = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
+    val location = s"$root/_ivm/views/default/cdf_create_legacy_mv"
+    sql(
+      s"CREATE TABLE delta.`$location` USING DELTA " +
+        s"TBLPROPERTIES ('_ivm_create_watermarks_v1'='true', '_ivm_watermark:$source'='v:$version') " +
+        s"AS SELECT k FROM $source"
+    ).collect()
+    val error = intercept[IllegalStateException] {
+      sql(s"CREATE MATERIALIZED VIEW $mv AS SELECT k FROM $source").collect()
+    }
+    assert(error.getMessage.contains("lacks a verified CREATE source snapshot"))
+    assert(!spark.catalog.tableExists(mv))
+    val actual   = spark.read.format("delta").load(location)
+    val expected = spark.sql(s"SELECT k FROM $source")
+    assert(actual.exceptAll(expected).count() == 0L)
+    assert(expected.exceptAll(actual).count() == 0L)
+  }
+
   it("does not publish recovered CREATE data if its source is rebound during recovery") {
     val source                        = "default.cdf_create_recover_rebind_src"
     val (query, _, location)          = createRecoverablePath(source, "cdf_create_recover_rebind_mv")
