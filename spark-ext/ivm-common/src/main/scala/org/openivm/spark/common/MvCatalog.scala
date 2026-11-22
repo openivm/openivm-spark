@@ -1014,13 +1014,13 @@ object MvCatalog {
     OpenIvmStateBarrier.withMutation(spark) { removeUnderBarrier(spark, name) }
 
   private def removeUnderBarrier(spark: SparkSession, name: TableIdentifier): Unit = {
-    val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
-    StagingCatalog.consumptionLifecycleLock(spark, viewName).synchronized {
-      backend(spark).remove(spark, name)
-      if (FeatureGate.deltaCatalogEnabled(spark)) {
+    if (FeatureGate.deltaCatalogEnabled(spark)) {
+      val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
+      StagingCatalog.consumptionLifecycleLock(spark, viewName).synchronized {
+        backend(spark).remove(spark, name)
         StagingCatalog.removeConsumedForView(spark, viewName)
       }
-    }
+    } else backend(spark).remove(spark, name)
   }
 
   def schemaFingerprint(
