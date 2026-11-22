@@ -3,6 +3,7 @@ package org.openivm.spark.commands
 import com.fasterxml.jackson.databind.ObjectMapper
 import io.delta.tables.DeltaTable
 import org.apache.hadoop.fs.Path
+import org.apache.spark.SparkContext
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
@@ -41,7 +42,13 @@ import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StringType, Str
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.{OpenIvmStateBarrier, OpenIvmStateSync}
-import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
+import org.openivm.spark.compiler.{
+  CompiledRefresh,
+  CompileRequest,
+  OpenIvmCompiler,
+  SparkExpressionPrepass,
+  SparkTimeTravelSql
+}
 import org.openivm.spark.insights.OpenIvmInsightsBroker
 import org.openivm.spark.streaming.{
   StreamingInsightEvents,
@@ -64,7 +71,8 @@ import java.util.concurrent.locks.{Condition, ReentrantLock}
 import scala.util.control.NonFatal
 
 // ---------------------------------------------------------------------------
-// Compiler singleton — one OpenIvmCompiler per SparkSession, lazily created.
+// Compiler runtimes are shared by SparkContext/loader configuration; request
+// caches remain scoped to each SparkSession.
 // ---------------------------------------------------------------------------
 private[commands] object OpenIvmCompilers {
 
@@ -90,24 +98,52 @@ private[commands] object OpenIvmCompilers {
       }
   }
 
-  private val cache: java.util.Map[SparkSession, SessionCompiler] =
+  private val sessions: java.util.Map[SparkSession, SessionCompiler] =
     Collections.synchronizedMap(new java.util.WeakHashMap[SparkSession, SessionCompiler]())
+  private val runtimes: java.util.Map[SparkContext, Map[Option[String], OpenIvmCompiler]] =
+    Collections.synchronizedMap(new java.util.WeakHashMap[SparkContext, Map[Option[String], OpenIvmCompiler]]())
 
   def forSession(spark: SparkSession): OpenIvmCompiler = session(spark).compiler
 
   def session(spark: SparkSession): SessionCompiler = {
-    val existing = cache.get(spark)
+    val existing = sessions.get(spark)
     if (existing != null) return existing
     val waitStarted = System.nanoTime()
-    cache.synchronized {
+    sessions.synchronized {
       OpenIvmMetrics.updateTimer("compiler.cache.lock.wait", System.nanoTime() - waitStarted)
-      val existing2 = cache.get(spark)
+      val existing2 = sessions.get(spark)
       if (existing2 != null) return existing2
-      val compiler = buildForSession(spark)
-      val session  = new SessionCompiler(compiler)
-      cache.put(spark, session)
-      Runtime.getRuntime.addShutdownHook(new Thread(() => compiler.close()))
+      val session = new SessionCompiler(sharedRuntime(spark))
+      sessions.put(spark, session)
       session
+    }
+  }
+
+  private def sharedRuntime(spark: SparkSession): OpenIvmCompiler = {
+    val context = spark.sparkContext
+    val cliLibraryPath = spark.conf
+      .getOption("spark.openivm.compiler.cliLibraryPath")
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .orElse(sys.env.get("OPENIVM_CLI_LD_LIBRARY_PATH").map(_.trim).filter(_.nonEmpty))
+    val existing = Option(runtimes.get(context)).flatMap(_.get(cliLibraryPath))
+    if (existing.isDefined) return existing.get
+    runtimes.synchronized {
+      val contextRuntimes = Option(runtimes.get(context)).getOrElse(Map.empty)
+      contextRuntimes.get(cliLibraryPath) match {
+        case Some(compiler) => compiler
+        case None =>
+          val compiler = buildForSession(spark, cliLibraryPath)
+          try compiler.verifyRuntime()
+          catch {
+            case NonFatal(e) =>
+              compiler.close()
+              throw e
+          }
+          runtimes.put(context, contextRuntimes + (cliLibraryPath -> compiler))
+          Runtime.getRuntime.addShutdownHook(new Thread(() => compiler.close()))
+          compiler
+      }
     }
   }
 
@@ -122,7 +158,7 @@ private[commands] object OpenIvmCompilers {
     *     on the driver classpath (`spark.jars`), so the compile bridge stays
     *     self-contained with no OneLake round-trip.
     */
-  private def buildForSession(spark: SparkSession): OpenIvmCompiler = {
+  private def buildForSession(spark: SparkSession, cliLibraryPath: Option[String]): OpenIvmCompiler = {
     val extEnv = sys.env.getOrElse(
       "OPENIVM_EXTENSION_PATH",
       "/opt/openivm/openivm.duckdb_extension"
@@ -138,11 +174,6 @@ private[commands] object OpenIvmCompilers {
     // compile script and every view falls back to FULL_REFRESH. This conf
     // prepends directories carrying a sufficient C++ runtime to the CLI
     // subprocess only.
-    val cliLibraryPath = spark.conf
-      .getOption("spark.openivm.compiler.cliLibraryPath")
-      .map(_.trim)
-      .filter(_.nonEmpty)
-      .orElse(sys.env.get("OPENIVM_CLI_LD_LIBRARY_PATH").map(_.trim).filter(_.nonEmpty))
     if (new java.io.File(extEnv).exists() && new java.io.File(cliEnv).exists())
       OpenIvmCompiler.build(
         extensionPath = extEnv,
@@ -3296,7 +3327,7 @@ case class CreateMaterializedViewCommand(
       )
     }
     val compiler = OpenIvmCompilers.forSession(spark)
-    val createCompileRequest = CompileRequest(
+    val originalCreateCompileRequest = CompileRequest(
       viewName = name.table,
       viewSql = originalQueryText,
       sources = compileSchemas,
@@ -3304,12 +3335,19 @@ case class CreateMaterializedViewCommand(
       sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(pinBinding),
       facts = workloadFacts
     )
+    val expressionBridge = SparkExpressionPrepass.prepare(
+      originalQueryText,
+      spark.sessionState.conf.caseSensitiveAnalysis,
+      Some(compiler.compileCacheTier(originalCreateCompileRequest).split(":").last),
+      Some(analyzed)
+    )
+    val createCompileRequest = originalCreateCompileRequest.copy(viewSql = expressionBridge.sql)
     var authoritativeClassification = Option.empty[EffectiveClassification]
     val compiled = profile.timeStep(
       "create_compile_classification",
       s"sources=${qualNames.size};group_cols=${groupKeys.size}"
     ) {
-      try compiler.compile(createCompileRequest)
+      try compiler.compile(createCompileRequest, profile.compilerTrace)
       catch {
         case e: org.openivm.spark.compiler.OpenIvmCompileException =>
           val compileCause = Option(e.getMessage).getOrElse(e.toString).replace('\n', ' ').take(512)
@@ -3574,11 +3612,16 @@ case class CreateMaterializedViewCommand(
           qualNames,
           pinBinding.resolvedPins
         )
-      else
-        compiled.initialLoadSql
-    val physicalOutput = profile.timeStep("create_analyze_physical_schema") {
-      spark.sql(viewBodySql).queryExecution.analyzed.output
+      else {
+        val translated = org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
+        val restored   = expressionBridge.markers.restore(translated)
+        expressionBridge.markers.requireAllSeen()
+        OpenIvmCompiler.reattachBareInitialLoadSources(restored, originalCreateCompileRequest)
+      }
+    val physicalInitialPlan = profile.timeStep("create_analyze_physical_schema") {
+      spark.sql(viewBodySql).queryExecution.analyzed
     }
+    val physicalOutput = physicalInitialPlan.output
     val requiresPublicProjection =
       physicalOutput.size != analyzed.output.size ||
         physicalOutput.zip(analyzed.output).exists { case (physical, logical) =>
@@ -3660,27 +3703,32 @@ case class CreateMaterializedViewCommand(
     // cache gate.  The cached SQL is shape-stable only: REFRESH still invokes
     // SparkRefreshRewriter every time, so per-refresh snapshot temp views and
     // scratch Delta paths are always recreated.
-    val createCompileTier = MvMetadata.compileCacheTier(workloadFacts)
+    val createCompileTier = compiler.compileCacheTier(createCompileRequest)
     // The compiled initial-load SQL is ALWAYS persisted at CREATE: the FULL_REFRESH
     // arity fix (count-monoid MVs re-routed to FULL_REFRESH) reads
     // `CompiledInitialLoadSqlKey` to reproduce hidden bookkeeping columns,
     // independent of the compile-cache feature flag. Only the per-(fingerprint,tier)
     // cache properties are gated by the flag.
     val initialLoadProps =
-      if (compiled.initialLoadSql.nonEmpty) Map(MvMetadata.CompiledInitialLoadSqlKey -> compiled.initialLoadSql)
+      if (compiled.initialLoadSql.nonEmpty)
+        Map(MvMetadata.CompiledInitialLoadSqlKey -> compiled.initialLoadSql) ++
+          (if (effectiveRefreshType != RefreshTypeCode.FullRefresh)
+             Map(SparkExpressionPrepass.RestoredInitialLoadProperty -> viewBodySql)
+           else Map.empty[String, String])
       else Map.empty[String, String]
     val cacheCompiledProps =
       if (!FeatureGate.compileClassificationCacheEnabled(spark) || effectiveRefreshType == RefreshTypeCode.FullRefresh)
         Map.empty[String, String]
       else
-        MvMetadata.compiledProperties(
-          fingerprint,
-          createCompileTier,
-          compiled.sql,
-          compiled.initialLoadSql,
-          compiled.refreshType,
-          compiled.refreshTypeName
-        )
+        MvMetadata.withCompileCacheGeneration(Map.empty, compiler.cacheGeneration) ++
+          MvMetadata.compiledProperties(
+            fingerprint,
+            createCompileTier,
+            compiled.sql,
+            compiled.initialLoadSql,
+            compiled.refreshType,
+            compiled.refreshTypeName
+          )
     val compiledProps = initialLoadProps ++ cacheCompiledProps
     // Capture per-source watermarks BEFORE the MV's initial CTAS so the first
     // REFRESH ignores any staging rows / Delta versions that pre-date this MV
@@ -5987,7 +6035,7 @@ case class RefreshMaterializedViewCommand(
       lazy val compiler = profile.timeStep("generate_refresh_sql.compiler_context", "native_session_compiler") {
         OpenIvmCompilers.forSession(compilerSession)
       }
-      lazy val compileRequest = CompileRequest(
+      lazy val originalCompileRequest = CompileRequest(
         viewName = name.table,
         viewSql = meta.querySql,
         sources = compileSchemas,
@@ -5995,6 +6043,14 @@ case class RefreshMaterializedViewCommand(
         sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
         facts = cacheTierFacts
       )
+      lazy val originalCompileTier = compiler.compileCacheTier(originalCompileRequest)
+      lazy val expressionBridge = SparkExpressionPrepass.prepare(
+        meta.querySql,
+        spark.sessionState.conf.caseSensitiveAnalysis,
+        Some(originalCompileTier.split(":").last),
+        Some(spark.sql(meta.querySql).queryExecution.analyzed)
+      )
+      lazy val compileRequest = originalCompileRequest.copy(viewSql = expressionBridge.sql)
 
       // -----------------------------------------------------------------------
       // FullRefresh path — recompute INSERT OVERWRITE from the live tables.
@@ -6040,39 +6096,51 @@ case class RefreshMaterializedViewCommand(
           val persistedInitialLoad = meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).filter(_.nonEmpty)
           val cachedInitialLoad    = MvMetadata.anyCachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint)
           val initialLoad          = persistedInitialLoad.orElse(cachedInitialLoad).getOrElse("")
+          val restoredInitialLoad = meta.properties.get(SparkExpressionPrepass.RestoredInitialLoadProperty)
           // ADVANCE SOURCE VERSIONS changes the pinned query but not CREATE's stored initial load.
-          val recompileInitialLoad =
-            meta.refreshType != RefreshTypeCode.FullRefresh && refreshResolvedPins.nonEmpty
-          if (recompileInitialLoad) {
-            val compiled = compiler.compile(compileRequest)
-            if (compiled.refreshType != meta.refreshType || compiled.initialLoadSql.isEmpty)
-              throw new IllegalStateException(
-                s"Cannot rebaseline ${sqlIdent(name)}: recompiled initial load is incompatible with its refresh type"
-              )
-            val bound        = compiled.initialLoadSql
-            val resultSchema = spark.sql(bound).schema
-            val targetSchema = spark.read.format("delta").load(meta.location).schema
+          val recompileBridge =
             if (
-              resultSchema.fieldNames.toSeq != targetSchema.fieldNames.toSeq ||
-              !org.apache.spark.sql.types.DataType.equalsIgnoreNullability(resultSchema, targetSchema)
+              meta.refreshType != RefreshTypeCode.FullRefresh &&
+              (restoredInitialLoad.isEmpty || refreshResolvedPins.nonEmpty) &&
+              (expressionBridge.sql != meta.querySql || refreshResolvedPins.nonEmpty)
             )
-              throw new IllegalStateException(
-                s"Cannot rebaseline ${sqlIdent(name)}: recompiled initial load does not match the stored data schema"
+              Some(expressionBridge)
+            else None
+          recompileBridge match {
+            case Some(bridge) =>
+              val compiled = compiler.compile(compileRequest, profile.compilerTrace)
+              if (compiled.refreshType != meta.refreshType || compiled.initialLoadSql.isEmpty)
+                throw new IllegalStateException(
+                  s"Cannot rebaseline ${sqlIdent(name)}: recompiled initial load is incompatible with its refresh type"
+                )
+              val restored = bridge.markers.restore(
+                org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
               )
-            bound
-          } else if (meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty) {
-            initialLoad
-          } else {
-            // UserFullQuery surface at REFRESH: path-bind the user body's pinned
-            // reads to their verified Delta paths so the recompute reads the frozen
-            // snapshot directly rather than re-resolving the alias.
-            MvCommandHelper.pathBindUserFullQuery(
-              name,
-              meta.querySql,
-              refreshBinding,
-              meta.sourceTables,
-              refreshResolvedPins
-            )
+              bridge.markers.requireAllSeen()
+              val bound = OpenIvmCompiler.reattachBareInitialLoadSources(restored, compileRequest)
+              val resultSchema = spark.sql(bound).schema
+              val targetSchema = spark.read.format("delta").load(meta.location).schema
+              if (
+                resultSchema.fieldNames.toSeq != targetSchema.fieldNames.toSeq ||
+                !org.apache.spark.sql.types.DataType.equalsIgnoreNullability(resultSchema, targetSchema)
+              )
+                throw new IllegalStateException(
+                  s"Cannot rebaseline ${sqlIdent(name)}: recompiled initial load does not match the stored data schema"
+                )
+              bound
+            case None if meta.refreshType != RefreshTypeCode.FullRefresh && initialLoad.nonEmpty =>
+              restoredInitialLoad.getOrElse(org.openivm.spark.compiler.LptsSparkDialect.translate(initialLoad))
+            case None =>
+              // UserFullQuery surface at REFRESH: path-bind the user body's pinned
+              // reads to their verified Delta paths so the recompute reads the frozen
+              // snapshot directly rather than re-resolving the alias.
+              MvCommandHelper.pathBindUserFullQuery(
+                name,
+                meta.querySql,
+                refreshBinding,
+                meta.sourceTables,
+                refreshResolvedPins
+              )
           }
         }
         val fullRefreshTarget =
@@ -6318,43 +6386,22 @@ case class RefreshMaterializedViewCommand(
       // Incremental path — recompile, register source temp views, rewrite the
       // openivm-emitted multi-statement program, execute it.
       // -----------------------------------------------------------------------
-      val compileSchemas: Map[String, StructType] = freshSchemas.map { case (q, schema) =>
-        q.split("\\.").last -> schema
-      }
-      val shortToQual: Map[String, String] = MvCommandHelper.friendlyShortToQual(
-        refreshResolvedPins,
-        freshSchemas.map { case (q, _) => q.split("\\.").last -> q }
-      )
-      val compileCacheEnabled      = FeatureGate.compileClassificationCacheEnabled(spark)
-      val constraintFacts          = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
-      val runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark)
-      val compileFacts = WorkloadFacts(
-        forceViewDeltaCascade = !terminalInsertOnlyAggregate,
-        assumeInsertOnly = insertOnlyAggregate ||
-          (runningWindowIncremental && meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
-        runningWindowIncremental = runningWindowIncremental,
-        deltaShape = sourceDeltaShape,
-        fkRelations = constraintFacts.fkRelations,
-        uniqueKeys = constraintFacts.uniqueKeys,
-        declareRelyFk = FeatureGate.declareRelyFkEnabled(spark)
-      )
+      val compileCacheEnabled = FeatureGate.compileClassificationCacheEnabled(spark)
+      val compileCacheTier    = compiler.compileCacheTier(compileRequest)
+      var refreshProperties =
+        if (compileCacheEnabled) MvMetadata.withCompileCacheGeneration(meta.properties, compiler.cacheGeneration)
+        else meta.properties
       // Quantitative statistics are consumed by Spark's cost model. The native
       // compiler receives shape and constraint facts, so row counts do not
       // invalidate a reusable SQL program.
       lazy val refreshCostFacts = {
         val stats = SparkDeltaStatsService.forRefresh().workloadFactsFor(spark, meta.sourceTables, changeBatches)
-        compileFacts.copy(tableStats = stats.tableStats, columnStats = stats.columnStats, deltaStats = stats.deltaStats)
+        cacheTierFacts.copy(
+          tableStats = stats.tableStats,
+          columnStats = stats.columnStats,
+          deltaStats = stats.deltaStats
+        )
       }
-      val compileCacheTier  = MvMetadata.compileCacheTier(compileFacts)
-      var refreshProperties = meta.properties
-      val compileRequest = CompileRequest(
-        viewName = name.table,
-        viewSql = meta.querySql,
-        sources = compileSchemas,
-        sourceQualifiedNames = shortToQual,
-        sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
-        facts = compileFacts
-      )
       // The execution session is a fresh clone with its own temporary views.
       // Compile programs belong to the caller's session so they survive across refreshes.
       lazy val sessionCompiler = OpenIvmCompilers.session(compilerSession)
@@ -6364,11 +6411,21 @@ case class RefreshMaterializedViewCommand(
       // Delta versions, temporary views, and output paths.
       val persisted =
         if (compileCacheEnabled)
-          MvMetadata.cachedCompiledSql(refreshProperties, meta.sourceSchemaFingerprint, compileCacheTier).map { sql =>
-            val initialLoad =
-              MvMetadata.cachedInitialLoadSql(refreshProperties, meta.sourceSchemaFingerprint, compileCacheTier)
-            CompiledRefresh(meta.refreshType, meta.refreshTypeName, sql, initialLoad.getOrElse(""))
-          }
+          for {
+            sql <- MvMetadata.cachedCompiledSql(refreshProperties, meta.sourceSchemaFingerprint, compileCacheTier)
+            classification <- MvMetadata.cachedCompiledClassification(
+              refreshProperties,
+              meta.sourceSchemaFingerprint,
+              compileCacheTier
+            )
+          } yield CompiledRefresh(
+            refreshType = classification._1,
+            refreshTypeName = classification._2,
+            sql = sql,
+            initialLoadSql = MvMetadata
+              .cachedInitialLoadSql(refreshProperties, meta.sourceSchemaFingerprint, compileCacheTier)
+              .getOrElse("")
+          )
         else None
       val cached = persisted.orElse(if (reuseInSession) sessionCompiler.cachedRefresh(compileRequest) else None)
       val compileCacheHit = cached.isDefined
@@ -6384,7 +6441,7 @@ case class RefreshMaterializedViewCommand(
           s"compile_cache_hit=$compileCacheHit compile_cache_tier=$compileCacheTier"
         ) {
           cached.getOrElse {
-            val fresh = sessionCompiler.compiler.compile(compileRequest)
+            val fresh = sessionCompiler.compiler.compile(compileRequest, profile.compilerTrace)
             if (reuseInSession) sessionCompiler.rememberRefresh(compileRequest, fresh)
             if (compileCacheEnabled && fresh.sql.nonEmpty) {
               val backfilled = refreshProperties ++
@@ -6409,6 +6466,19 @@ case class RefreshMaterializedViewCommand(
             }
             fresh
           }
+        }
+      }
+      if (profile.isActive && sqlLog.isActive) {
+        compiled.nativeSql.foreach { nativeSql =>
+          sqlLog.record(
+            category = "compiler_program_native",
+            stmtOrder = -3,
+            attemptIdx = 0,
+            stmtKind = "compiler_program",
+            sql = nativeSql,
+            durationMs = -1L,
+            emitInsight = false
+          )
         }
       }
       if (profile.isActive && sqlLog.isActive) {
@@ -6784,7 +6854,7 @@ case class RefreshMaterializedViewCommand(
                 SparkRefreshRewriter.injectScd2RangeAcceleration(withSkewFanout)
               else
                 withSkewFanout
-            processed
+            expressionBridge.markers.restore(processed)
           }
 
           val uniqueJoinSimplifyEnabled = FeatureGate.uniqueJoinSimplifyEnabled(spark)
@@ -6863,7 +6933,7 @@ case class RefreshMaterializedViewCommand(
                 sourceSnapshotRelations = snapshotRelations,
                 lineageCapture =
                   if (profile.isActive || FeatureGate.generatedActionOwnershipEnabled(spark))
-                    Some(RewriteLineage.captureCompilerOutput(compiled.sql, None))
+                    Some(RewriteLineage.captureCompilerOutput(compiled.sql, compiled.nativeSql))
                   else None,
                 lineagePostProcessRules =
                   if (profile.isActive)
@@ -6881,6 +6951,7 @@ case class RefreshMaterializedViewCommand(
               )
             }
           }
+          expressionBridge.markers.requireAllSeen()
           var literalPruneApplied = false
           val rewritten =
             if (FeatureGate.regularNtermLiteralPruneEnabled(spark)) {
