@@ -3,7 +3,7 @@ package org.openivm.spark.telemetry
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.util.{Locale, UUID}
-import java.util.concurrent.{ConcurrentLinkedQueue, Semaphore}
+import java.util.concurrent.{ConcurrentLinkedQueue, Semaphore, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
 import java.util.concurrent.locks.ReentrantLock
 
@@ -104,6 +104,21 @@ final class BoundedTelemetryQueue private[telemetry] (
       )
     }.toMap
   )
+
+  /** Wait for records accepted before this call to finish export, without stopping the queue. */
+  def awaitDrain(timeoutMs: Long): Boolean = {
+    require(timeoutMs >= 0L)
+    gate.lock()
+    val target = try accepted.get()
+    finally gate.unlock()
+    val started = System.nanoTime()
+    val timeout = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+    while (published.get() + failures.get() < target && worker.isAlive && System.nanoTime() - started < timeout) {
+      val remaining = timeout - (System.nanoTime() - started)
+      if (remaining > 0L) TimeUnit.NANOSECONDS.sleep(math.min(remaining, TimeUnit.MILLISECONDS.toNanos(25L)))
+    }
+    published.get() + failures.get() >= target
+  }
 
   /** Stop accepting and wait at most timeoutMs; a false return means the worker is still draining. */
   def shutdown(timeoutMs: Long): Boolean = {

@@ -48,6 +48,24 @@ private[commands] final class PhaseTimeline(
   def time[A](phase: String, detail: String)(body: => A): A = {
     val ancestors = Option(stack.get()).getOrElse(Nil)
     val frame     = new Frame(sequence.incrementAndGet(), nanoTime(), epochMillis(), ancestors.headOption.map(_.id))
+    emit(
+      OpenIvmInsightJson.obj(
+        "event_type"         -> "phase_started",
+        "refresh_id"         -> refreshId,
+        "request_id"         -> requestId,
+        "materialized_view"  -> viewName,
+        "operation"          -> operation,
+        "phase"              -> phase,
+        "detail"             -> detail,
+        "phase_id"           -> frame.id,
+        "parent_phase_id"    -> frame.parent,
+        "thread_name"        -> Thread.currentThread().getName,
+        "clock_domain_id"    -> MonotonicClockDomain.id,
+        "started_at"         -> Instant.ofEpochMilli(frame.startEpochMs).toString,
+        "start_monotonic_ns" -> frame.startNs,
+        "outcome"            -> "running"
+      )
+    )
     stack.set(frame :: ancestors)
     var outcome = "failed"
     try {

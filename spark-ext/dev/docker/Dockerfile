@@ -30,7 +30,7 @@ ARG JDK_VERSION=17
 # -----------------------------------------------------------------------------
 # Stage 1: openivm-builder
 # -----------------------------------------------------------------------------
-FROM eclipse-temurin:21-jdk-noble@sha256:1afee26c547e1aa89f47404854dd09203b8bd35a2be269e16bdfd69c4a2c2b50 AS openivm-builder
+FROM ubuntu:22.04@sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f7667021c0e6 AS openivm-builder
 
 ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
 ARG OPENIVM_REPO
@@ -53,8 +53,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \
         sed -i "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g; s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
-            /etc/apt/sources.list.d/ubuntu.sources; \
+            /etc/apt/sources.list; \
     fi && \
+    apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=60 && \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg && \
+    curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xC8EC952E2A0E1FBDC5090F6A2C277A0A352154E5' -o /tmp/toolchain-key && \
+    test "$(gpg --show-keys --with-colons /tmp/toolchain-key | awk -F: '$1 == "fpr" { print $10; exit }')" = C8EC952E2A0E1FBDC5090F6A2C277A0A352154E5 && \
+    gpg --dearmor -o /usr/share/keyrings/ubuntu-toolchain.gpg /tmp/toolchain-key && \
+    rm /tmp/toolchain-key && \
+    echo 'deb [signed-by=/usr/share/keyrings/ubuntu-toolchain.gpg] https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu jammy main' > /etc/apt/sources.list.d/ubuntu-toolchain.list && \
     apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=60 && \
     apt-get install -y --no-install-recommends \
         build-essential gcc-13 g++-13 cmake ninja-build git ca-certificates \
@@ -67,7 +74,8 @@ WORKDIR /src
 # repository and revision selected by pins.env.
 RUN --mount=type=cache,target=/root/.gitcache \
     git clone --branch "${OPENIVM_BRANCH}" --depth 50 "${OPENIVM_REPO}" . && \
-    git checkout "${OPENIVM_COMMIT}" && \
+    git fetch --depth 1 origin "${OPENIVM_COMMIT}" && \
+    git checkout --detach "${OPENIVM_COMMIT}" && \
     test "$(git rev-parse HEAD)" = "${OPENIVM_COMMIT}" && \
     git config --global url."https://github.com/".insteadOf "git@github.com:" && \
     git config -f .gitmodules submodule.third_party/lpts.url "${LPTS_REPO}" && \
@@ -110,10 +118,10 @@ RUN mkdir -p /artifacts /opt/downloads && \
     sha256sum openivm.duckdb_extension duckdb > SHA256SUMS && \
     rm -rf /opt/downloads
 
-FROM eclipse-temurin:21-jdk-noble@sha256:1afee26c547e1aa89f47404854dd09203b8bd35a2be269e16bdfd69c4a2c2b50 AS native-runtime-check
+FROM ubuntu:22.04@sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f7667021c0e6 AS native-runtime-check
 COPY --from=openivm-builder /artifacts/ /artifacts/
 RUN glibc_version="$(getconf GNU_LIBC_VERSION | cut -d" " -f2)" && \
-    test "$(printf '%s\n' "${glibc_version}" 2.38 | sort -V | head -n1)" = 2.38 && \
+    test "${glibc_version}" = 2.35 && \
     grep -aq 'GLIBCXX_3.4.30' /usr/lib/x86_64-linux-gnu/libstdc++.so.6 && \
     /artifacts/duckdb --version | grep -E '^v2\.0\.0([[:space:]]|$)' && \
     mkdir -p /artifacts/runtime && \

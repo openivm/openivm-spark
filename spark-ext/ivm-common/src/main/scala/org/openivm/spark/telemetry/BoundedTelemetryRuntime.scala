@@ -24,6 +24,7 @@ object BoundedTelemetryRuntime {
   }
 
   def health: Option[BoundedTelemetryQueue.Health] = Option(last.get()).map(_.health)
+  def awaitDrain(timeoutMs: Long): Boolean          = Option(active.get()).exists(_.awaitDrain(timeoutMs))
   def configurationFailureCount: Long              = configurationFailures.get()
   def registrationFailureCount: Long               = registrationFailures.get()
 

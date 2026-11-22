@@ -34,6 +34,11 @@ for space on the caller thread and writes standalone
 JSONL objects. `BoundedTelemetryRuntime.health` exposes the most recent queue's
 health, including after shutdown. The lower-level `offer` returns false on
 rejection. A shutdown timeout or hard JVM termination can lose records.
+`BoundedTelemetryRuntime.awaitDrain(timeoutMs)` waits without shutdown for
+records accepted before the call to finish export to all destinations, and
+returns false on timeout or when no queue is active. A true result includes
+failed exports, so inspect health for failures and drops; later offers are not
+part of the barrier.
 
 Each destination uses a random run prefix and publishes unique objects by
 writing a partial object then renaming it. One bounded queue and worker fan out
@@ -60,6 +65,10 @@ inclusive and exclusive nanoseconds, refresh ID, optional request ID and a
 parent phase ID. Exclusive time subtracts only directly nested instrumented
 phases on the same thread; it does not subtract uninstrumented or asynchronous
 work. This is not a complete exclusive-query-time accounting.
+An instrumented phase first emits a `phase_started` record with the same
+refresh ID and phase ID before its body runs; its later `phase` record reports
+the outcome and measured durations. External intervals observed only after
+completion emit just a `phase` record. Queue drops can leave either side absent.
 
 Generated SQL and collect boundaries carry an explicit Spark local property.
 The driver listener records job-to-stage links, stage attempts and Spark SQL

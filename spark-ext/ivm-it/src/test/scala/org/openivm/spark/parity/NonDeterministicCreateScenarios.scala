@@ -4,11 +4,8 @@ import org.apache.spark.sql.AnalysisException
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{IvmParityMode, IvmParitySpecBase}
 
-/** CREATE MATERIALIZED VIEW rejects an incrementally maintained query whose result depends on
-  * evaluation time or randomness: maintaining it incrementally re-evaluates the expression only for
-  * changed rows, so the view would diverge from a recompute of its query. Views recomputed on every
-  * refresh stay accepted. Detection of each random expression is covered by `MvDeterminismSpec`;
-  * Spark itself rejects them inside aggregate arguments, and OpenIVM recomputes them elsewhere.
+/** Time-dependent queries must use full refresh, so results are reevaluated for every source row.
+  * Spark's expression-level rejection of unsafe incremental plans is covered by `MvDeterminismSpec`.
   */
 abstract class NonDeterministicCreateScenarios extends IvmParitySpecBase("non-deterministic-create") {
   self: IvmParityMode =>
@@ -19,19 +16,29 @@ abstract class NonDeterministicCreateScenarios extends IvmParitySpecBase("non-de
       .map(_.refreshType)
       .getOrElse(fail(s"MV $name not found in catalog"))
 
+  private def assertRecomputed(mv: String, query: String, insert: String): Unit = {
+    sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
+    refreshType(mv) shouldBe RefreshTypeCode.FullRefresh
+    assertMvCorrect(mv, query)
+    sql(insert)
+    refreshMv(mv)
+    assertMvCorrect(mv, query)
+  }
+
   describe("CREATE MATERIALIZED VIEW determinism guard") {
 
     it("fully recomputes a grouped current_date expression") {
       sql("CREATE TABLE nd_date_src (k INT, d DATE, v BIGINT) USING DELTA")
-      sql("INSERT INTO nd_date_src VALUES (1, current_date(), 10), (1, DATE '2020-01-01', 20), (2, current_date(), 5)")
-      val query =
+      sql(
+        "INSERT INTO nd_date_src VALUES (1, current_date(), 10), " +
+          "(1, DATE '2020-01-01', 20), (2, current_date(), 5)"
+      )
+      assertRecomputed(
+        "nd_date_mv",
         "SELECT k, SUM(CASE WHEN d >= current_date() THEN v ELSE 0 END) AS today_total, COUNT(*) AS n " +
-          "FROM nd_date_src GROUP BY k"
-      sql(s"CREATE MATERIALIZED VIEW nd_date_mv AS $query")
-      refreshType("nd_date_mv") shouldBe RefreshTypeCode.FullRefresh
-      sql("INSERT INTO nd_date_src VALUES (3, DATE '2000-01-01', 2)")
-      refreshMv("nd_date_mv")
-      assertMvCorrect("nd_date_mv", query)
+          "FROM nd_date_src GROUP BY k",
+        "INSERT INTO nd_date_src VALUES (3, DATE '2000-01-01', 2)"
+      )
     }
 
     it("fully recomputes a grouped current_timestamp expression") {
@@ -39,14 +46,12 @@ abstract class NonDeterministicCreateScenarios extends IvmParitySpecBase("non-de
       sql(
         "INSERT INTO nd_ts_src VALUES (1, TIMESTAMP '2020-01-01 00:00:00', 10), (2, TIMESTAMP '2999-01-01 00:00:00', 5)"
       )
-      val query =
+      assertRecomputed(
+        "nd_ts_mv",
         "SELECT k, SUM(CASE WHEN ts <= current_timestamp() THEN v ELSE 0 END) AS elapsed_total, COUNT(*) AS n " +
-          "FROM nd_ts_src GROUP BY k"
-      sql(s"CREATE MATERIALIZED VIEW nd_ts_mv AS $query")
-      refreshType("nd_ts_mv") shouldBe RefreshTypeCode.FullRefresh
-      sql("INSERT INTO nd_ts_src VALUES (3, TIMESTAMP '2000-01-01 00:00:00', 2)")
-      refreshMv("nd_ts_mv")
-      assertMvCorrect("nd_ts_mv", query)
+          "FROM nd_ts_src GROUP BY k",
+        "INSERT INTO nd_ts_src VALUES (3, TIMESTAMP '2000-01-01 00:00:00', 2)"
+      )
     }
 
     it("does not accept an incremental aggregate with now or localtimestamp by default") {

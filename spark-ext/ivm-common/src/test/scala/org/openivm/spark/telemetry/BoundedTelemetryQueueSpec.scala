@@ -98,6 +98,29 @@ class BoundedTelemetryQueueSpec extends AnyFunSpec with Matchers {
         override def record(line: String): Unit    = fail("invalid JSON was published")
         override def manifest(value: String): Unit = throw new IllegalStateException("secret")
       }
+
+      it("waits for in-flight records without closing the queue") {
+        val entered = new CountDownLatch(1)
+        val release = new CountDownLatch(1)
+        val writer = new BoundedTelemetryQueue.Writer {
+          override def record(line: String): Unit = { entered.countDown(); release.await(); () }
+          override def manifest(value: String): Unit = ()
+        }
+        val q = new BoundedTelemetryQueue(2, 100, writer)
+        try {
+          q.offer("{}") shouldBe true
+          entered.await(10, TimeUnit.SECONDS) shouldBe true
+          q.health.queued shouldBe 0
+          q.awaitDrain(10) shouldBe false
+          release.countDown()
+          q.awaitDrain(10000) shouldBe true
+          q.offer("{}") shouldBe true
+          q.awaitDrain(10000) shouldBe true
+        } finally {
+          release.countDown()
+          q.shutdown(10000) shouldBe true
+        }
+      }
       val q = new BoundedTelemetryQueue(2, 100, writer)
       q.offer("not json") shouldBe true
       q.shutdown(10000) shouldBe true
