@@ -89,7 +89,16 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
               .filter(seq =>
                 seq.end == arg.length && seq.args.size == 3 && seq.args.take(2).forall(dateBound(_).isDefined)
               )
-              .map(_ => unnest.end -> s"explode(${restore(arg)})")
+              .map { seq =>
+                val nativeStep = seq.args(2).replaceAll("\\s+", "")
+                val oneDay =
+                  "`add`(`add`(((0)*INTERVAL1MONTH),((1)*INTERVAL1DAY)),to_microseconds(CAST(0ASBIGINT)))"
+                val sequence =
+                  if (nativeStep.equalsIgnoreCase(oneDay))
+                    s"sequence(${seq.args.take(2).map(restore).mkString(", ")}, INTERVAL 1 DAY)"
+                  else restore(arg)
+                unnest.end -> s"explode($sequence)"
+              }
           }
         }
         .orElse {

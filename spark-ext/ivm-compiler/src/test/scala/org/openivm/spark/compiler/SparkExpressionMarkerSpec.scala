@@ -57,6 +57,21 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
     bridge.requireAllSeen()
   }
 
+  it should "restore the native one-day date generator interval only for marked date bounds" in {
+    val bridge = new SparkExpressionMarker(opaque = true)
+    val start  = bridge.encode(Seq("start_date"), DateBound)(_.head)
+    val end    = bridge.encode(Seq("end_date"), DateBound)(_.head)
+    val step   = "`add`(`add`(((0) * INTERVAL 1 MONTH), ((1) * INTERVAL 1 DAY)), to_microseconds(CAST(0 AS BIGINT)))"
+    val input  = s"unnest(sequence(CAST($start AS TIMESTAMP), CAST($end AS TIMESTAMP), $step))"
+    bridge.restore(input) shouldBe "explode(sequence(start_date, end_date, INTERVAL 1 DAY))"
+    bridge.requireAllSeen()
+
+    val otherStep = step.replace("((1) * INTERVAL 1 DAY)", "((2) * INTERVAL 1 DAY)")
+    bridge.restore(input.replace(step, otherStep)) should include(otherStep)
+    bridge.restore(s"unnest(sequence(start_date, end_date, $step))") shouldBe
+      s"unnest(sequence(start_date, end_date, $step))"
+  }
+
   it should "reject missing or malformed markers" in {
     val bridge = new SparkExpressionMarker
     val marker = bridge.encode(Seq("'Ä'", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")
