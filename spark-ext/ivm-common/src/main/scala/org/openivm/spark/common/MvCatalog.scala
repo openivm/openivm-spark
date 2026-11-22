@@ -767,6 +767,31 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
       }
   }
 
+  def advanceWithCdfWatermarks(
+      spark: SparkSession,
+      name: TableIdentifier,
+      newVersion: Long,
+      watermarks: Map[String, Long]
+  ): Unit = {
+    val serializedName = serializeName(name)
+    openExistingPerMvDbAt(spark, perMvDbPath(spark, serializedName)).foreach { perMvDb =>
+      perMvDb.withBatch { batch =>
+        val latest = getLong(perMvDb, MetaCf, LastVersionMetaKey).getOrElse(-1L)
+        if (newVersion > latest) {
+          OpenIvmRocksDBBatchOps.put(perMvDb, batch, MetaCf, LastVersionMetaKey, RocksDBCodec.utf8(newVersion.toString))
+          watermarks.foreach { case (source, version) =>
+            val key = RocksDBCodec.utf8(s"${MvMetadata.WatermarkKeyPrefix}$source")
+            val previous = getUtf8(perMvDb, PropertiesCf, key)
+              .flatMap(ChangeWatermark.decodeDeltaVersion)
+              .map(_.version)
+            val value = ChangeWatermark.DeltaVersion(previous.fold(version)(math.max(_, version))).encode
+            OpenIvmRocksDBBatchOps.put(perMvDb, batch, PropertiesCf, key, RocksDBCodec.utf8(value))
+          }
+        }
+      }
+    }
+  }
+
   def updateProperties(
       spark: SparkSession,
       name: TableIdentifier,
@@ -950,6 +975,19 @@ object MvCatalog {
 
   def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
     backend(spark).advance(spark, lookup(spark, name).map(_.name).getOrElse(name), newVersion)
+
+  def advanceWithCdfWatermarks(
+      spark: SparkSession,
+      name: TableIdentifier,
+      newVersion: Long,
+      watermarks: Map[String, Long]
+  ): Unit =
+    backend(spark).advanceWithCdfWatermarks(
+      spark,
+      lookup(spark, name).map(_.name).getOrElse(name),
+      newVersion,
+      watermarks
+    )
 
   def updateProperties(
       spark: SparkSession,

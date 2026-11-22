@@ -115,6 +115,19 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       CdfWatermarkCatalog.get(spark, "db.mv_orders", "db.orders") shouldBe None
     }
 
+    it("atomically advances the MV version and retains monotonic CDF watermarks") {
+      val entry = metadata("db.mv_atomic_cdf", "db.atomic_source")
+      MvCatalog.upsert(spark, entry)
+      MvCatalog.advanceWithCdfWatermarks(spark, entry.name, 5L, Map("db.atomic_source" -> 9L))
+      MvCatalog.advanceWithCdfWatermarks(spark, entry.name, 4L, Map("db.atomic_source" -> 20L))
+      MvCatalog.advanceWithCdfWatermarks(spark, entry.name, 6L, Map("db.atomic_source" -> 7L))
+
+      val updated = MvCatalog.lookup(spark, entry.name).get
+      updated.lastVersion shouldBe 6L
+      updated.properties("owner") shouldBe "openivm"
+      updated.changeWatermarks("db.atomic_source") shouldBe ChangeWatermark.DeltaVersion(9L)
+    }
+
     it("keeps shared watermark rows monotonic under synchronized concurrent puts") {
       implicit val executionContext: ExecutionContext = ExecutionContext.global
       val barrier                                     = new CyclicBarrier(2)

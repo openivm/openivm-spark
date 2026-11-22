@@ -3,7 +3,21 @@ package org.openivm.spark.common
 import io.delta.tables.DeltaTable
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.functions.{array_contains, col, lit}
+import org.apache.spark.sql.functions.{
+  array,
+  array_contains,
+  coalesce,
+  col,
+  concat,
+  greatest,
+  lit,
+  map_concat,
+  map_filter,
+  map_from_arrays,
+  not,
+  substring,
+  when
+}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Row, SparkSession}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
@@ -162,6 +176,39 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
         .update(
           col(Name) === lit(serializedName(name)) && col(LastVersion) < lit(newVersion),
           Map(LastVersion -> lit(newVersion))
+        )
+    }
+  }
+
+  override def advanceWithCdfWatermarks(
+      spark: SparkSession,
+      name: TableIdentifier,
+      newVersion: Long,
+      watermarks: Map[String, Long]
+  ): Unit = {
+    val entries = watermarks.toSeq.map { case (source, version) =>
+      s"${MvMetadata.WatermarkKeyPrefix}$source" -> version
+    }.sortBy(_._1)
+    if (entries.isEmpty) advance(spark, name, newVersion)
+    else withDeltaRetry {
+      ensureTables(spark)
+      val keys = array(entries.map { case (key, _) => lit(key) }: _*)
+      val properties = col(Properties)
+      val values = array(entries.map { case (key, version) =>
+        val existing = properties.getItem(key)
+        val previous = when(existing.startsWith("v:"), substring(existing, 3, 20).cast("long"))
+          .otherwise(lit(Long.MinValue))
+        coalesce(
+          concat(lit("v:"), greatest(previous, lit(version)).cast("string")),
+          lit(ChangeWatermark.DeltaVersion(version).encode)
+        )
+      }: _*)
+      val retained = map_filter(properties, (key, _) => not(array_contains(keys, key)))
+      DeltaTable
+        .forPath(spark, path(spark))
+        .update(
+          col(Name) === lit(serializedName(name)) && col(LastVersion) < lit(newVersion),
+          Map(LastVersion -> lit(newVersion), Properties -> map_concat(retained, map_from_arrays(keys, values)))
         )
     }
   }
