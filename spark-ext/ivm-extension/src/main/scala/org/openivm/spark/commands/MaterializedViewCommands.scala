@@ -3341,7 +3341,7 @@ case class CreateMaterializedViewCommand(
       Some(compiler.compileCacheTier(originalCreateCompileRequest).split(":").last),
       Some(analyzed)
     )
-    val createCompileRequest = originalCreateCompileRequest.copy(viewSql = expressionBridge.sql)
+    val createCompileRequest        = originalCreateCompileRequest.copy(viewSql = expressionBridge.sql)
     var authoritativeClassification = Option.empty[EffectiveClassification]
     val compiled = profile.timeStep(
       "create_compile_classification",
@@ -6096,7 +6096,7 @@ case class RefreshMaterializedViewCommand(
           val persistedInitialLoad = meta.properties.get(MvMetadata.CompiledInitialLoadSqlKey).filter(_.nonEmpty)
           val cachedInitialLoad    = MvMetadata.anyCachedInitialLoadSql(meta.properties, meta.sourceSchemaFingerprint)
           val initialLoad          = persistedInitialLoad.orElse(cachedInitialLoad).getOrElse("")
-          val restoredInitialLoad = meta.properties.get(SparkExpressionPrepass.RestoredInitialLoadProperty)
+          val restoredInitialLoad  = meta.properties.get(SparkExpressionPrepass.RestoredInitialLoadProperty)
           // ADVANCE SOURCE VERSIONS changes the pinned query but not CREATE's stored initial load.
           val recompileBridge =
             if (
@@ -6117,7 +6117,7 @@ case class RefreshMaterializedViewCommand(
                 org.openivm.spark.compiler.LptsSparkDialect.translate(compiled.initialLoadSql)
               )
               bridge.markers.requireAllSeen()
-              val bound = OpenIvmCompiler.reattachBareInitialLoadSources(restored, compileRequest)
+              val bound        = OpenIvmCompiler.reattachBareInitialLoadSources(restored, compileRequest)
               val resultSchema = spark.sql(bound).schema
               val targetSchema = spark.read.format("delta").load(meta.location).schema
               if (

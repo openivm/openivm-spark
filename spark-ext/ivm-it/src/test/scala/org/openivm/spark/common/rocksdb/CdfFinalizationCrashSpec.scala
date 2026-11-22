@@ -126,13 +126,16 @@ private[rocksdb] object CdfFinalizationCrashProbe {
             val (log, rows) = activeRefreshLog()
             require(BoundedTelemetryRuntime.awaitDrain(10000L), "live phase queue did not drain")
             val paths = Files.list(root.resolve("phase-events"))
-            val events = try {
-              val mapper = new ObjectMapper()
-              paths.iterator().asScala
-                .filter(_.getFileName.toString.endsWith(".jsonl"))
-                .map(path => mapper.readTree(path.toFile))
-                .toVector
-            } finally paths.close()
+            val events =
+              try {
+                val mapper = new ObjectMapper()
+                paths
+                  .iterator()
+                  .asScala
+                  .filter(_.getFileName.toString.endsWith(".jsonl"))
+                  .map(path => mapper.readTree(path.toFile))
+                  .toVector
+              } finally paths.close()
             val starts = events.filter(event =>
               event.path("event_type").asText() == "phase_started" &&
                 event.path("refresh_id").asText() == log.refreshId &&

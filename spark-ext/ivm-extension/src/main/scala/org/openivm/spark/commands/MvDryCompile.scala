@@ -218,8 +218,7 @@ object MvDryCompile {
           val restored   = expressionBridge.markers.restore(translated)
           expressionBridge.markers.requireAllSeen()
           OpenIvmCompiler.reattachBareInitialLoadSources(restored, compileRequest)
-        }
-        else queryText
+        } else queryText
       SparkMergeAssembler
         .assemble(
           AssemblyInput(
