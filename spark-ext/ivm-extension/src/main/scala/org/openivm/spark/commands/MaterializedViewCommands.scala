@@ -98,34 +98,40 @@ private[commands] object OpenIvmCompilers {
       }
   }
 
-  private val sessions: java.util.Map[SparkSession, SessionCompiler] =
-    Collections.synchronizedMap(new java.util.WeakHashMap[SparkSession, SessionCompiler]())
+  private val sessions: java.util.Map[SparkSession, (Option[String], SessionCompiler)] =
+    Collections.synchronizedMap(new java.util.WeakHashMap[SparkSession, (Option[String], SessionCompiler)]())
   private val runtimes: java.util.Map[SparkContext, Map[Option[String], OpenIvmCompiler]] =
     Collections.synchronizedMap(new java.util.WeakHashMap[SparkContext, Map[Option[String], OpenIvmCompiler]]())
 
   def forSession(spark: SparkSession): OpenIvmCompiler = session(spark).compiler
 
   def session(spark: SparkSession): SessionCompiler = {
-    val existing = sessions.get(spark)
-    if (existing != null) return existing
-    val waitStarted = System.nanoTime()
-    sessions.synchronized {
-      OpenIvmMetrics.updateTimer("compiler.cache.lock.wait", System.nanoTime() - waitStarted)
-      val existing2 = sessions.get(spark)
-      if (existing2 != null) return existing2
-      val session = new SessionCompiler(sharedRuntime(spark))
-      sessions.put(spark, session)
-      session
-    }
-  }
-
-  private def sharedRuntime(spark: SparkSession): OpenIvmCompiler = {
-    val context = spark.sparkContext
     val cliLibraryPath = spark.conf
       .getOption("spark.openivm.compiler.cliLibraryPath")
       .map(_.trim)
       .filter(_.nonEmpty)
       .orElse(sys.env.get("OPENIVM_CLI_LD_LIBRARY_PATH").map(_.trim).filter(_.nonEmpty))
+    def cached: Option[SessionCompiler] =
+      Option(sessions.get(spark)).collect { case (key, session) if key == cliLibraryPath => session }
+    cached match {
+      case Some(existing) => return existing
+      case None           =>
+    }
+    val waitStarted = System.nanoTime()
+    sessions.synchronized {
+      OpenIvmMetrics.updateTimer("compiler.cache.lock.wait", System.nanoTime() - waitStarted)
+      cached match {
+        case Some(existing) => existing
+        case None =>
+          val session = new SessionCompiler(sharedRuntime(spark, cliLibraryPath))
+          sessions.put(spark, (cliLibraryPath, session))
+          session
+      }
+    }
+  }
+
+  private def sharedRuntime(spark: SparkSession, cliLibraryPath: Option[String]): OpenIvmCompiler = {
+    val context  = spark.sparkContext
     val existing = Option(runtimes.get(context)).flatMap(_.get(cliLibraryPath))
     if (existing.isDefined) return existing.get
     runtimes.synchronized {
