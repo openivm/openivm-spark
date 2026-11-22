@@ -99,7 +99,7 @@ private[rocksdb] object CdfFinalizationCrashProbe {
           case Seq(single) => single
           case other       => sys.error(s"Expected one source, got $other")
         }
-        val beforeOffset   = version(base)
+        val beforeOffset = version(base)
         val expectedBefore = if (firstRefresh) None else Some(beforeOffset)
         require(CdfWatermarkCatalog.get(spark, mv, source) == expectedBefore)
         val beforeMv = version(mv)
@@ -262,13 +262,13 @@ class CdfFinalizationCrashSpec extends AnyFunSpec with Matchers {
         }
       } finally if (process.isAlive) process.destroyForcibly()
     }
+  }
 
-    it("reuses local CDF state correctly after death between catalog advance and watermark put") {
-      checkRecovery(firstRefresh = false)
-    }
+  it("reuses local CDF state correctly after death between catalog advance and watermark put") {
+    checkRecovery(firstRefresh = false)
+  }
 
-    it("does not replay the first refresh when its watermark entry was never written") {
-      checkRecovery(firstRefresh = true)
-    }
+  it("does not replay the first refresh when its watermark entry was never written") {
+    checkRecovery(firstRefresh = true)
   }
 }
