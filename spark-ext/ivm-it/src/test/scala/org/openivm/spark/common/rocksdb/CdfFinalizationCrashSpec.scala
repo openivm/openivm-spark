@@ -1,5 +1,6 @@
 package org.openivm.spark.common.rocksdb
 
+import java.io.RandomAccessFile
 import java.lang.management.ManagementFactory
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths}
@@ -13,6 +14,7 @@ import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
 import scala.jdk.CollectionConverters._
+import scala.util.{Failure, Success, Try}
 
 private[rocksdb] object CdfFinalizationCrashProbe {
   private val base  = "default.cdf_gap_source"
@@ -168,6 +170,31 @@ private[rocksdb] object CdfFinalizationCrashProbe {
 }
 
 class CdfFinalizationCrashSpec extends AnyFunSpec with Matchers {
+  private def failureFrames(log: Path): String =
+    Try {
+      val file = new RandomAccessFile(log.toFile, "r")
+      try {
+        val size  = math.min(file.length(), 65536L).toInt
+        val bytes = new Array[Byte](size)
+        file.seek(file.length() - size)
+        file.readFully(bytes)
+        val frame =
+          """(?m)^\s*at org\.openivm\.spark\.common\.rocksdb\.CdfFinalizationCrashProbe\$\.(\w[\w$<>]*)\(CdfFinalizationCrashSpec\.scala:(\d+)\)\s*$""".r
+        val frames = frame
+          .findAllMatchIn(new String(bytes, UTF_8))
+          .take(2)
+          .map { m =>
+            s"${m.group(1)}(CdfFinalizationCrashSpec.scala:${m.group(2)})"
+          }
+          .toVector
+        if (frames.isEmpty) "no probe frame in the last 64 KiB"
+        else s"probe frames: ${frames.mkString(", ")}"
+      } finally file.close()
+    } match {
+      case Success(result) => result
+      case Failure(error)  => s"probe diagnostics unavailable (${error.getClass.getSimpleName})"
+    }
+
   it("reuses local CDF state correctly after death between catalog advance and watermark put") {
     val root = Paths.get("target").toAbsolutePath.resolve(s"cdf-finalization-crash-${UUID.randomUUID()}")
     Files.createDirectories(root)
@@ -186,9 +213,12 @@ class CdfFinalizationCrashSpec extends AnyFunSpec with Matchers {
         )): _*
       ).redirectErrorStream(true).redirectOutput(log.toFile).start()
       try {
-        withClue(s"$phase failed; see $log: ") {
-          process.waitFor(240, TimeUnit.SECONDS) shouldBe true
-          process.exitValue() shouldBe exit
+        val finished = process.waitFor(240, TimeUnit.SECONDS)
+        val actual   = if (finished) Some(process.exitValue()) else None
+        val detail   = if (!finished || !actual.contains(exit)) s"; ${failureFrames(log)}" else ""
+        withClue(s"$phase failed; see $log$detail: ") {
+          finished shouldBe true
+          actual.get shouldBe exit
         }
       } finally if (process.isAlive) process.destroyForcibly()
     }
