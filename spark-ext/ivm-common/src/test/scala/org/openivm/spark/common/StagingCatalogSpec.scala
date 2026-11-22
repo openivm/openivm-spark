@@ -1,6 +1,7 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
@@ -125,16 +126,35 @@ class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers
       val viewName  = "mv_missing_consumption"
       val baseTable = "orders_missing_consumption"
       val d         = delta(baseTable, "INSERT", s"$warehouseDir/stg/orders/ins/missing", 2500L)
-      StagingCatalog.record(spark, d)
-      StagingCatalog.markConsumed(spark, viewName, Seq(d.stagingPath))
-      StagingCatalog.collectFor(spark, viewName, Seq(baseTable)) shouldBe empty
+      val session   = spark.newSession()
+      session.conf.set("spark.openivm.catalog.backend", "delta")
+      session.conf.set("spark.openivm.catalog.path", s"$warehouseDir/delta-catalog")
+      val name = TableIdentifier(viewName)
+      val meta =
+        MvMetadata(name, "SELECT 1", 0, "SIMPLE_PROJECTION", 0L, Seq(baseTable), "", warehouseDir, ts(0L), Map.empty)
+      StagingCatalog.record(session, d)
+      intercept[IllegalStateException] {
+        StagingCatalog.markConsumed(session, viewName, Seq(d.stagingPath))
+      }
+      java.nio.file.Files.exists(Paths.get(trackedMvDbPath(viewName)).resolve("CURRENT")) shouldBe false
+      MvCatalog.upsert(session, meta)
+      StagingCatalog.markConsumed(session, viewName, Seq(d.stagingPath))
+      StagingCatalog.collectFor(session, viewName, Seq(baseTable)) shouldBe empty
 
       val db  = openTrackedMvDb(viewName)
       val key = RocksDBCodec.utf8("unrelated")
       db.withBatch(batch => OpenIvmRocksDBBatchOps.put(db, batch, "properties", key, RocksDBCodec.utf8("keep")))
-      StagingCatalog.removeConsumedForView(spark, viewName)
-      StagingCatalog.collectFor(spark, viewName, Seq(baseTable)).map(_.stagingPath) shouldBe Seq(d.stagingPath)
+      DeltaMvCatalogBackend.remove(session, name)
+      intercept[IllegalStateException] {
+        StagingCatalog.markConsumed(session, viewName, Seq(d.stagingPath))
+      }
+      MvCatalog.prepareCreate(session, name)
+      StagingCatalog.collectFor(session, viewName, Seq(baseTable)).map(_.stagingPath) shouldBe Seq(d.stagingPath)
       db.get("properties", key).map(RocksDBCodec.fromUtf8) shouldBe Some("keep")
+      MvCatalog.upsert(session, meta)
+      StagingCatalog.markConsumed(session, viewName, Seq(d.stagingPath))
+      MvCatalog.remove(session, name)
+      StagingCatalog.collectFor(session, viewName, Seq(baseTable)).map(_.stagingPath) shouldBe Seq(d.stagingPath)
     }
 
     it("records per-MV consumed paths idempotently") {
