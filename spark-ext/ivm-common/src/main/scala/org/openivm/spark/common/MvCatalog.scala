@@ -944,14 +944,18 @@ object MvCatalog {
 
   def ensureTables(spark: SparkSession): Unit = backend(spark).ensureTables(spark)
 
-  def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit =
-    StagingCatalog.consumptionLifecycleLock.synchronized {
-      if (FeatureGate.deltaCatalogEnabled(spark) && backend(spark).lookup(spark, name).isEmpty) {
-        val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
-        StagingCatalog.removeConsumedForView(spark, viewName)
+  def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit = {
+    val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
+    if (FeatureGate.deltaCatalogEnabled(spark))
+      OpenIvmStateBarrier.withMutation(spark) {
+        StagingCatalog.consumptionLifecycleLock(spark, viewName).synchronized {
+          if (backend(spark).lookup(spark, name).isEmpty)
+            StagingCatalog.removeConsumedForView(spark, viewName)
+          backend(spark).prepareCreate(spark, name)
+        }
       }
-      backend(spark).prepareCreate(spark, name)
-    }
+    else backend(spark).prepareCreate(spark, name)
+  }
 
   def upsert(spark: SparkSession, meta: MvMetadata): Unit =
     OpenIvmStateBarrier.withMutation(spark) { backend(spark).upsert(spark, meta) }
@@ -1009,14 +1013,15 @@ object MvCatalog {
   private[spark] def removeStored(spark: SparkSession, name: TableIdentifier): Unit =
     OpenIvmStateBarrier.withMutation(spark) { removeUnderBarrier(spark, name) }
 
-  private def removeUnderBarrier(spark: SparkSession, name: TableIdentifier): Unit =
-    StagingCatalog.consumptionLifecycleLock.synchronized {
+  private def removeUnderBarrier(spark: SparkSession, name: TableIdentifier): Unit = {
+    val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
+    StagingCatalog.consumptionLifecycleLock(spark, viewName).synchronized {
       backend(spark).remove(spark, name)
       if (FeatureGate.deltaCatalogEnabled(spark)) {
-        val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
         StagingCatalog.removeConsumedForView(spark, viewName)
       }
     }
+  }
 
   def schemaFingerprint(
       sources: Map[String, StructType],

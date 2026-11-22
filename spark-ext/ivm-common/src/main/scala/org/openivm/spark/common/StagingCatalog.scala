@@ -270,7 +270,7 @@ object StagingCatalog {
   def markConsumed(spark: SparkSession, viewName: String, paths: Seq[String]): Unit = {
     if (paths.isEmpty) return
 
-    consumptionLifecycleLock.synchronized {
+    consumptionLifecycleLock(spark, viewName).synchronized {
       val maybeMvDb =
         if (FeatureGate.deltaCatalogEnabled(spark)) {
           val name = org.apache.spark.sql.catalyst.parser.CatalystSqlParser.parseTableIdentifier(viewName)
@@ -290,7 +290,12 @@ object StagingCatalog {
     }
   }
 
-  private[common] val consumptionLifecycleLock = new Object
+  private val consumptionLifecycleLocks = Array.fill(128)(new Object)
+
+  private[common] def consumptionLifecycleLock(spark: SparkSession, viewName: String): Object = {
+    val hash = OpenIvmStatePaths.perMvDbPath(spark, viewName).hashCode & Int.MaxValue
+    consumptionLifecycleLocks(hash % consumptionLifecycleLocks.length)
+  }
 
   private[common] def removeConsumedForView(spark: SparkSession, viewName: String): Unit =
     openTrackedMvDb(spark, viewName).foreach { mvDb =>
