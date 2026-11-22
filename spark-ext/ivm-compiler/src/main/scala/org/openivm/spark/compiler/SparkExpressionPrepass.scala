@@ -505,8 +505,13 @@ private[spark] object SparkExpressionPrepass {
           case parsed: UnresolvedAttribute if parsed.nameParts == attr.nameParts =>
           case _ => throw new IllegalArgumentException("Invalid Spark attribute source span")
         }
-        val index = arguments.size
-        arguments += value
+        val existing = arguments.indexOf(value)
+        val index =
+          if (existing >= 0) existing
+          else {
+            arguments += value
+            arguments.size - 1
+          }
         edits += Edit(
           location,
           args => {

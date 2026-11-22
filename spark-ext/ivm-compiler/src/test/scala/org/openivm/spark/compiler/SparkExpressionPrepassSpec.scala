@@ -89,6 +89,21 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
     }
   }
 
+  it should "reuse repeated attribute inputs while restoring each struct field" in {
+    val query = """SELECT g, max_by(named_struct('value', v), k) FROM
+      |(SELECT g, v, named_struct('a', CAST(ts AS TIMESTAMP), 'b', CAST(ts AS TIMESTAMP),
+      |'c', coalesce(v, ''), 'd', coalesce(v, '')) AS k FROM src) s GROUP BY g""".stripMargin
+    val prepared = SparkExpressionPrepass.prepare(query, caseSensitive = false)
+    val id       = """'(__openivm_expr_[0-9a-f]+_[0-9]+__)'""".r.findFirstMatchIn(prepared.sql).get.group(1)
+    val restored = prepared.markers.restore(
+      s"__openivm_spark_expression('$id', {'a': NULL, 'b': NULL, 'c': NULL, 'd': NULL}, src.ts, src.v)"
+    )
+    restored shouldBe
+      "named_struct('a', CAST(src.ts AS TIMESTAMP), 'b', CAST(src.ts AS TIMESTAMP),\n" +
+      "'c', coalesce(src.v, ''), 'd', coalesce(src.v, ''))"
+    prepared.markers.requireAllSeen()
+  }
+
   "Spark expression prepass" should "share marker identity only for equivalent expressions in the same scope" in {
     val marker = """'(__openivm_expr_[0-9a-f]+_[0-9]+__)'""".r
     def ids(sql: String): Seq[String] =
