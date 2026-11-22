@@ -108,6 +108,7 @@ class BoundedTelemetryQueueSpec extends AnyFunSpec with Matchers {
     }
 
     it("waits for in-flight records without closing the queue") {
+      intercept[IllegalArgumentException] { BoundedTelemetryRuntime.awaitDrain(-1L) }
       val entered = new CountDownLatch(1)
       val release = new CountDownLatch(1)
       val writer = new BoundedTelemetryQueue.Writer {

@@ -24,9 +24,12 @@ object BoundedTelemetryRuntime {
   }
 
   def health: Option[BoundedTelemetryQueue.Health] = Option(last.get()).map(_.health)
-  def awaitDrain(timeoutMs: Long): Boolean         = Option(active.get()).exists(_.awaitDrain(timeoutMs))
-  def configurationFailureCount: Long              = configurationFailures.get()
-  def registrationFailureCount: Long               = registrationFailures.get()
+  def awaitDrain(timeoutMs: Long): Boolean = {
+    require(timeoutMs >= 0L)
+    Option(active.get()).exists(_.awaitDrain(timeoutMs))
+  }
+  def configurationFailureCount: Long = configurationFailures.get()
+  def registrationFailureCount: Long  = registrationFailures.get()
 
   private def value(f: BoundedTelemetryQueue.Health => Long): Long = health.map(f).getOrElse(0L)
   private def gauge(f: => Long): Gauge[Long]                       = new Gauge[Long] { override def getValue: Long = f }
