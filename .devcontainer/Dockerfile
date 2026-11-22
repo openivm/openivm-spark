@@ -180,13 +180,6 @@ RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \
       zip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN printf '%s\n' 'py4j==0.10.9.7 --hash=sha256:85defdfd2b2376eb3abf5ca6474b51ab7e0de341c75a02f46dc9b5976f5a5c1b' \
-      | python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes \
-          --target /opt/openivm-py4j/spark-3.5 -r /dev/stdin \
-    && printf '%s\n' 'py4j==0.10.9.9 --hash=sha256:c7c26e4158defb37b0bb124933163641a2ff6e3a3913f7811b0ddbe07ed61533' \
-      | python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes \
-          --target /opt/openivm-py4j/spark-4.1 -r /dev/stdin
-
 COPY --from=jdk17 /opt/java/openjdk /opt/java/jdk-17
 COPY --from=node-runtime /usr/local/ /usr/local/
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker

@@ -40,6 +40,17 @@ jobs:
       - name: Install locked tooling from the warmed cache
         run: npm ci --prefer-offline --no-audit --no-fund
 
+      - name: Install target Py4J
+        shell: bash
+        env:
+          SPARK_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          py4j_dir="$RUNNER_TEMP/openivm-py4j-$SPARK_TARGET"
+          python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes \
+            --target "$py4j_dir" -r "spark-ext/dev/requirements-py4j-$SPARK_TARGET.txt"
+          printf 'PYTHONPATH=%s%s\n' "$py4j_dir" "${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
+
       - name: Verify native compiler matches the source pin
         shell: bash
         run: |
