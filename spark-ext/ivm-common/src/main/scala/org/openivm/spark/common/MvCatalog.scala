@@ -945,7 +945,13 @@ object MvCatalog {
   def ensureTables(spark: SparkSession): Unit = backend(spark).ensureTables(spark)
 
   def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit =
-    backend(spark).prepareCreate(spark, name)
+    StagingCatalog.consumptionLifecycleLock.synchronized {
+      if (FeatureGate.deltaCatalogEnabled(spark) && backend(spark).lookup(spark, name).isEmpty) {
+        val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
+        StagingCatalog.removeConsumedForView(spark, viewName)
+      }
+      backend(spark).prepareCreate(spark, name)
+    }
 
   def upsert(spark: SparkSession, meta: MvMetadata): Unit =
     OpenIvmStateBarrier.withMutation(spark) { backend(spark).upsert(spark, meta) }
@@ -1003,13 +1009,14 @@ object MvCatalog {
   private[spark] def removeStored(spark: SparkSession, name: TableIdentifier): Unit =
     OpenIvmStateBarrier.withMutation(spark) { removeUnderBarrier(spark, name) }
 
-  private def removeUnderBarrier(spark: SparkSession, name: TableIdentifier): Unit = {
-    backend(spark).remove(spark, name)
-    if (FeatureGate.deltaCatalogEnabled(spark)) {
-      val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
-      StagingCatalog.removeConsumedForView(spark, viewName)
+  private def removeUnderBarrier(spark: SparkSession, name: TableIdentifier): Unit =
+    StagingCatalog.consumptionLifecycleLock.synchronized {
+      backend(spark).remove(spark, name)
+      if (FeatureGate.deltaCatalogEnabled(spark)) {
+        val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
+        StagingCatalog.removeConsumedForView(spark, viewName)
+      }
     }
-  }
 
   def schemaFingerprint(
       sources: Map[String, StructType],

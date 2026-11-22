@@ -270,14 +270,27 @@ object StagingCatalog {
   def markConsumed(spark: SparkSession, viewName: String, paths: Seq[String]): Unit = {
     if (paths.isEmpty) return
 
-    val mvDb =
-      OpenIvmRocksDBRegistry.getOrOpen(spark, OpenIvmStatePaths.perMvDbPath(spark, viewName), MvDbColumnFamilies)
-    mvDb.withBatch { batch =>
-      paths.distinct.foreach { path =>
-        OpenIvmRocksDBBatchOps.put(mvDb, batch, ConsumedCf, RocksDBCodec.utf8(path), Array.emptyByteArray)
+    consumptionLifecycleLock.synchronized {
+      val maybeMvDb =
+        if (FeatureGate.deltaCatalogEnabled(spark)) {
+          val name = org.apache.spark.sql.catalyst.parser.CatalystSqlParser.parseTableIdentifier(viewName)
+          if (MvCatalog.lookupStored(spark, name).isEmpty)
+            throw new IllegalStateException(s"Cannot mark staging consumed for untracked materialized view $viewName")
+          Some(
+            OpenIvmRocksDBRegistry.getOrOpen(spark, OpenIvmStatePaths.perMvDbPath(spark, viewName), MvDbColumnFamilies)
+          )
+        } else openTrackedMvDb(spark, viewName)
+      maybeMvDb.foreach { mvDb =>
+        mvDb.withBatch { batch =>
+          paths.distinct.foreach { path =>
+            OpenIvmRocksDBBatchOps.put(mvDb, batch, ConsumedCf, RocksDBCodec.utf8(path), Array.emptyByteArray)
+          }
+        }
       }
     }
   }
+
+  private[common] val consumptionLifecycleLock = new Object
 
   private[common] def removeConsumedForView(spark: SparkSession, viewName: String): Unit =
     openTrackedMvDb(spark, viewName).foreach { mvDb =>
