@@ -1,7 +1,7 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -121,6 +121,22 @@ class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers
   }
 
   describe("StagingCatalog.markConsumed") {
+    it("creates missing consumption state and clears only its markers") {
+      val viewName  = "mv_missing_consumption"
+      val baseTable = "orders_missing_consumption"
+      val d         = delta(baseTable, "INSERT", s"$warehouseDir/stg/orders/ins/missing", 2500L)
+      StagingCatalog.record(spark, d)
+      StagingCatalog.markConsumed(spark, viewName, Seq(d.stagingPath))
+      StagingCatalog.collectFor(spark, viewName, Seq(baseTable)) shouldBe empty
+
+      val db  = openTrackedMvDb(viewName)
+      val key = RocksDBCodec.utf8("unrelated")
+      db.withBatch(batch => OpenIvmRocksDBBatchOps.put(db, batch, "properties", key, RocksDBCodec.utf8("keep")))
+      StagingCatalog.removeConsumedForView(spark, viewName)
+      StagingCatalog.collectFor(spark, viewName, Seq(baseTable)).map(_.stagingPath) shouldBe Seq(d.stagingPath)
+      db.get("properties", key).map(RocksDBCodec.fromUtf8) shouldBe Some("keep")
+    }
+
     it("records per-MV consumed paths idempotently") {
       StagingCatalog.ensureTables(spark)
       registerTrackedView("mv_x")

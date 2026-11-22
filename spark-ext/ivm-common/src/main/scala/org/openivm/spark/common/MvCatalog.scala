@@ -997,11 +997,19 @@ object MvCatalog {
 
   def remove(spark: SparkSession, name: TableIdentifier): Unit =
     OpenIvmStateBarrier.withMutation(spark) {
-      backend(spark).remove(spark, lookup(spark, name).map(_.name).getOrElse(name))
+      removeUnderBarrier(spark, lookup(spark, name).map(_.name).getOrElse(name))
     }
 
   private[spark] def removeStored(spark: SparkSession, name: TableIdentifier): Unit =
-    OpenIvmStateBarrier.withMutation(spark) { backend(spark).remove(spark, name) }
+    OpenIvmStateBarrier.withMutation(spark) { removeUnderBarrier(spark, name) }
+
+  private def removeUnderBarrier(spark: SparkSession, name: TableIdentifier): Unit = {
+    backend(spark).remove(spark, name)
+    if (FeatureGate.deltaCatalogEnabled(spark)) {
+      val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
+      StagingCatalog.removeConsumedForView(spark, viewName)
+    }
+  }
 
   def schemaFingerprint(
       sources: Map[String, StructType],
