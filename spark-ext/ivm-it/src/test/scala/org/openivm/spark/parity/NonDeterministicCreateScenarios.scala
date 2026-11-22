@@ -13,60 +13,61 @@ import org.openivm.spark.parity.base.{IvmParityMode, IvmParitySpecBase}
 abstract class NonDeterministicCreateScenarios extends IvmParitySpecBase("non-deterministic-create") {
   self: IvmParityMode =>
 
-  private val AllowKey = "spark.openivm.create.allowNonDeterministic"
-
   private def refreshType(name: String): Int =
     MvCatalog
       .lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(name))
       .map(_.refreshType)
       .getOrElse(fail(s"MV $name not found in catalog"))
 
-  private def withNonDeterministicAllowed[T](body: => T): T = {
-    spark.conf.set(AllowKey, "true")
-    try body
-    finally spark.conf.unset(AllowKey)
-  }
-
-  /** Creates `mv` with the escape hatch, proves it is maintained incrementally, drops it, and
-    * asserts CREATE without the escape hatch rejects it naming `expression`.
-    */
-  private def assertRejectedIncremental(mv: String, query: String, expression: String): Unit = {
-    withNonDeterministicAllowed(sql(s"CREATE MATERIALIZED VIEW $mv AS $query"))
-    refreshType(mv) should not be RefreshTypeCode.FullRefresh
-    sql(s"DROP MATERIALIZED VIEW $mv")
-
-    val error = intercept[AnalysisException](sql(s"CREATE MATERIALIZED VIEW $mv AS $query"))
-    error.getMessage should include(expression)
-    error.getMessage should include("diverge from a recompute")
-    error.getMessage should include(AllowKey)
-    MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)) shouldBe None
-    spark.catalog.tableExists(mv) shouldBe false
-  }
-
   describe("CREATE MATERIALIZED VIEW determinism guard") {
 
-    it("rejects a time-dependent expression in an incrementally maintained view") {
+    it("fully recomputes a grouped current_date expression") {
       sql("CREATE TABLE nd_date_src (k INT, d DATE, v BIGINT) USING DELTA")
       sql("INSERT INTO nd_date_src VALUES (1, current_date(), 10), (1, DATE '2020-01-01', 20), (2, current_date(), 5)")
-      assertRejectedIncremental(
-        "nd_date_mv",
+      val query =
         "SELECT k, SUM(CASE WHEN d >= current_date() THEN v ELSE 0 END) AS today_total, COUNT(*) AS n " +
-          "FROM nd_date_src GROUP BY k",
-        "current_date"
-      )
+          "FROM nd_date_src GROUP BY k"
+      sql(s"CREATE MATERIALIZED VIEW nd_date_mv AS $query")
+      refreshType("nd_date_mv") shouldBe RefreshTypeCode.FullRefresh
+      sql("INSERT INTO nd_date_src VALUES (3, DATE '2000-01-01', 2)")
+      refreshMv("nd_date_mv")
+      assertMvCorrect("nd_date_mv", query)
     }
 
-    it("rejects current_timestamp() in an incrementally maintained view") {
+    it("fully recomputes a grouped current_timestamp expression") {
       sql("CREATE TABLE nd_ts_src (k INT, ts TIMESTAMP, v BIGINT) USING DELTA")
       sql(
         "INSERT INTO nd_ts_src VALUES (1, TIMESTAMP '2020-01-01 00:00:00', 10), (2, TIMESTAMP '2999-01-01 00:00:00', 5)"
       )
-      assertRejectedIncremental(
-        "nd_ts_mv",
+      val query =
         "SELECT k, SUM(CASE WHEN ts <= current_timestamp() THEN v ELSE 0 END) AS elapsed_total, COUNT(*) AS n " +
-          "FROM nd_ts_src GROUP BY k",
-        "current_timestamp"
-      )
+          "FROM nd_ts_src GROUP BY k"
+      sql(s"CREATE MATERIALIZED VIEW nd_ts_mv AS $query")
+      refreshType("nd_ts_mv") shouldBe RefreshTypeCode.FullRefresh
+      sql("INSERT INTO nd_ts_src VALUES (3, TIMESTAMP '2000-01-01 00:00:00', 2)")
+      refreshMv("nd_ts_mv")
+      assertMvCorrect("nd_ts_mv", query)
+    }
+
+    it("does not accept an incremental aggregate with now or localtimestamp by default") {
+      sql("CREATE TABLE nd_alt_clock_src (k INT, ts TIMESTAMP, v BIGINT) USING DELTA")
+      Seq(("now", "now()"), ("localtimestamp", "localtimestamp()"), ("localtimestamp_bare", "localtimestamp"))
+        .foreach { case (name, expression) =>
+          val mv = s"nd_${name}_mv"
+          val query =
+            s"SELECT k, SUM(CASE WHEN ts <= $expression THEN v ELSE 0 END) AS total, COUNT(*) AS n " +
+              "FROM nd_alt_clock_src GROUP BY k"
+          val failure =
+            try {
+              sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
+              None
+            } catch { case e: AnalysisException => Some(e) }
+          failure match {
+            case Some(error) =>
+              error.getMessage.toLowerCase(java.util.Locale.ROOT) should include(expression.takeWhile(_ != '('))
+            case None => refreshType(mv) shouldBe RefreshTypeCode.FullRefresh
+          }
+        }
     }
 
     it("accepts a random expression in a view that is recomputed on every refresh") {
