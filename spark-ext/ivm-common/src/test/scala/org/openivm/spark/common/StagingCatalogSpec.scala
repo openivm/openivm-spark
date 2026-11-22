@@ -152,8 +152,20 @@ class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers
       StagingCatalog.collectFor(session, viewName, Seq(baseTable)).map(_.stagingPath) shouldBe Seq(d.stagingPath)
       db.get("properties", key).map(RocksDBCodec.fromUtf8) shouldBe Some("keep")
       MvCatalog.upsert(session, meta)
-      StagingCatalog.markConsumed(session, viewName, Seq(d.stagingPath))
-      MvCatalog.remove(session, name)
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val start                                       = new CyclicBarrier(2)
+      val consume = Future {
+        start.await()
+        try StagingCatalog.markConsumed(session, viewName, Seq(d.stagingPath))
+        catch {
+          case e: IllegalStateException if e.getMessage.contains("untracked materialized view") => ()
+        }
+      }
+      val remove = Future {
+        start.await()
+        MvCatalog.remove(session, name)
+      }
+      Await.result(Future.sequence(Seq(consume, remove)), 60.seconds)
       StagingCatalog.collectFor(session, viewName, Seq(baseTable)).map(_.stagingPath) shouldBe Seq(d.stagingPath)
     }
 
