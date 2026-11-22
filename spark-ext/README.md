@@ -171,6 +171,11 @@ The metrics plugin exposes `openivm.state_sync.capture.serial` and
 `openivm.state_sync.capture.worker_pool` counts, worker-pool width, and
 `openivm.state_sync.capture.databases` timing for the database-capture portion.
 
+In CDF mode, CREATE reads its initial rows from the captured Delta source
+versions and records their physical identities with the CREATE watermarks.
+Concurrent source commits are left for a subsequent refresh; explicit snapshot
+pins remain part of the stored query.
+
 `spark.openivm.cdf.preflight.parallelSources.enabled=true` enables an experimental,
 default-off source-availability preflight using at most two workers per refresh.
 It checks independent source ranges before applying refresh SQL; unavailable or

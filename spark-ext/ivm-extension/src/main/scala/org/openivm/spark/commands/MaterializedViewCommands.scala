@@ -1936,7 +1936,9 @@ private[commands] object MvCommandHelper {
       ).getOrElse(Map.empty)
       properties.get(CreateRecoveryWatermarksMarker) match {
         case Some(value) if value.equalsIgnoreCase("true") =>
-          Some(properties.filter(_._1.startsWith(MvMetadata.WatermarkKeyPrefix)))
+          Some(properties.filter { case (key, _) =>
+            key.startsWith(MvMetadata.WatermarkKeyPrefix) || key == CdfCreateSnapshots.Property
+          })
         case _ =>
           throw new IllegalStateException(
             s"Existing Delta path $location lacks $CreateRecoveryWatermarksMarker; " +
@@ -3451,9 +3453,10 @@ case class CreateMaterializedViewCommand(
         org.openivm.spark.compiler.OpenIvmCompiler
           .reattachBareInitialLoadSources(restored, originalCreateCompileRequest)
       }
-    val physicalOutput = profile.timeStep("create_analyze_physical_schema") {
-      spark.sql(viewBodySql).queryExecution.analyzed.output
+    val physicalInitialPlan = profile.timeStep("create_analyze_physical_schema") {
+      spark.sql(viewBodySql).queryExecution.analyzed
     }
+    val physicalOutput = physicalInitialPlan.output
     val requiresPublicProjection =
       physicalOutput.size != analyzed.output.size ||
         physicalOutput.zip(analyzed.output).exists { case (physical, logical) =>
@@ -3567,6 +3570,7 @@ case class CreateMaterializedViewCommand(
     // (otherwise we'd double-apply upstream view-deltas this MV already
     // absorbed via the CTAS).  Encoded opaquely so the same property key
     // round-trips both `intercept`-mode timestamps and `cdf`-mode versions.
+    var cdfCreateSnapshots = Option.empty[CdfCreateSnapshots.Captured]
     val watermarkProps = profile.timeStep("create_capture_watermarks", s"sources=${qualNames.size}") {
       val pinnedVersions = SparkTimeTravelSql.resolvedVersionPins(pinBinding.resolvedPins)
       val pinnedWatermarks = MvMetadata.changeWatermarkProperties(
@@ -3574,6 +3578,7 @@ case class CreateMaterializedViewCommand(
       )
       recoverCreateWatermarkProperties(spark, dataLocation) match {
         case Some(recovered) =>
+          CdfCreateSnapshots.verifyRecovered(spark, recovered, qualNames)
           pinnedWatermarks.foreach { case (key, expected) =>
             if (!recovered.get(key).contains(expected))
               throw new IllegalStateException(
@@ -3584,13 +3589,23 @@ case class CreateMaterializedViewCommand(
           }
           recovered
         case None =>
-          val tracked = qualNames.filterNot(pinnedVersions.contains)
-          // Records describing every committed source change up to now precede the watermark,
-          // so this MV, whose initial load reads those changes, never consumes them.
-          if (propagation.requiresDmlInterception) SourceChangeLedger.reconcile(spark, tracked)
-          MvMetadata.changeWatermarkProperties(
-            propagation.currentWatermarks(spark, tracked)
-          ) ++ pinnedWatermarks
+          if (propagation.mode == ChangeFeedMode.Cdf) {
+            val captured = CdfCreateSnapshots.capture(
+              spark,
+              qualNames,
+              qualSchemas,
+              pinBinding.resolvedPins,
+              physicalInitialPlan
+            )
+            cdfCreateSnapshots = Some(captured)
+            MvMetadata.changeWatermarkProperties(
+              captured.versions.map { case (source, version) => source -> ChangeWatermark.DeltaVersion(version) }
+            ) ++ captured.properties
+          } else {
+            val tracked = qualNames.filterNot(pinnedVersions.contains)
+            if (propagation.requiresDmlInterception) SourceChangeLedger.reconcile(spark, tracked)
+            MvMetadata.changeWatermarkProperties(propagation.currentWatermarks(spark, tracked)) ++ pinnedWatermarks
+          }
       }
     }
     val watermarksBySource = watermarkProps.toSeq.flatMap { case (key, value) =>
@@ -3723,6 +3738,7 @@ case class CreateMaterializedViewCommand(
     var publicationCommitted                    = false
     var groupedInitial                          = Option.empty[GroupedWindowStatePlan.Initial]
     var groupedInitialView                      = Option.empty[String]
+    var cdfInitialView                          = Option.empty[String]
     // CREATE PRE: re-verify each pinned source's physical identity at its
     // verified path immediately before the initial CTAS. A drop/recreate between
     // pin resolution and the write is a rebind and hard-fails before any owned
@@ -3743,6 +3759,16 @@ case class CreateMaterializedViewCommand(
               s"refresh_type=${compiled.refreshTypeName};init_sql_bytes=${dataWriteSql.length}"
             ) {
               reusedDeltaPath = DeltaTable.isDeltaTable(spark, dataLocation)
+              if (reusedDeltaPath) {
+                val recovered = recoverCreateWatermarkProperties(spark, dataLocation).getOrElse {
+                  throw new IllegalStateException(s"Existing CREATE data at $dataLocation disappeared")
+                }
+                if (recovered != watermarkProps)
+                  throw new IllegalStateException(
+                    s"Existing CREATE data at $dataLocation has different source watermarks; refusing publication"
+                  )
+                CdfCreateSnapshots.verifyRecovered(spark, recovered, qualNames)
+              }
               if (!reusedDeltaPath) {
                 groupedInitial = groupedWindowPlan.flatMap { plan =>
                   profile.timeStep("create_grouped_window_state") {
@@ -3763,6 +3789,18 @@ case class CreateMaterializedViewCommand(
                     managedDataTarget
                   )
                 }
+                if (groupedInitial.isEmpty) cdfCreateSnapshots.foreach { snapshots =>
+                  val temp = "openivm_cdf_initial_" + UUID.randomUUID().toString.replace("-", "")
+                  snapshots.initialRows(spark, physicalInitialPlan).createOrReplaceTempView(temp)
+                  cdfInitialView = Some(temp)
+                  dataWriteSql = createDataWriteSql(
+                    dataLocation,
+                    clusterClause,
+                    tblPropsClause,
+                    s"SELECT * FROM `$temp`",
+                    managedDataTarget
+                  )
+                }
                 val ctasStmtKind = RefreshPerf.classify(dataWriteSql, "")
                 var attempt      = 0
                 var done         = false
@@ -3772,6 +3810,7 @@ case class CreateMaterializedViewCommand(
                   var attemptSucceeded = false
                   try {
                     CommandConcurrencyInjection.maybePauseBeforeCreateDataWrite()
+                    cdfCreateSnapshots.foreach(_.verify(spark))
                     groupedInitial.foreach(_.verifySources(spark))
                     val dataWriteT0 = System.nanoTime()
                     val dataWriteOutcome =
@@ -3829,6 +3868,8 @@ case class CreateMaterializedViewCommand(
           // still false) and is never retried or demoted.
           if (createPinnedIdentities.nonEmpty)
             verifyPinnedSourceIdentitiesAtPath(spark, name, createPinnedIdentities)
+          cdfCreateSnapshots.foreach(_.verify(spark))
+          if (reusedDeltaPath) CdfCreateSnapshots.verifyRecovered(spark, watermarkProps, qualNames)
           groupedInitial.foreach(_.verifySources(spark))
 
           writtenDataTableId = Some(
@@ -4003,6 +4044,7 @@ case class CreateMaterializedViewCommand(
         throw t
     } finally {
       groupedInitialView.foreach(spark.catalog.dropTempView)
+      cdfInitialView.foreach(spark.catalog.dropTempView)
       groupedInitial.foreach(_.close())
     }
 
