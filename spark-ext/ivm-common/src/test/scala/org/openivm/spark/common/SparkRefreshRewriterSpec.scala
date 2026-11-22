@@ -1249,7 +1249,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
   describe("outer-join projection partial recompute rewrites") {
     it("preserves explicit and implicit subquery aliases in full recompute inserts") {
-      Seq("openivm_tgt", "`openivm_tgt`").foreach { alias =>
+      Seq("openivm_tgt", "`openivm_tgt`", "\"openivm_tgt\"").foreach { alias =>
         Seq("", "AS ").foreach { modifier =>
           val input =
             s"""INSERT INTO openivm_data_mv_r
@@ -1265,9 +1265,9 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           )
           rewritten.statements should have size 1
           val merge = rewritten.statements.head
-          merge should include(s"SELECT $alias.region, $alias.total FROM")
+          merge should include(s"SELECT $alias.`region`, $alias.`total` FROM")
           merge should include(s") $alias\nWHERE $alias.region IS NOT NULL")
-          CatalystSqlParser.parsePlan(merge)
+          CatalystSqlParser.parsePlan(merge.replace("\"openivm_tgt\"", "`openivm_tgt`"))
         }
       }
     }
