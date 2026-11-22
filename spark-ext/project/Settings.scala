@@ -188,6 +188,10 @@ object Settings {
   val assemblySettings: Seq[Def.Setting[_]] = Seq(
     assembly / assemblyJarName := s"${name.value}-${version.value}-assembly.jar",
     assembly / assemblyMergeStrategy := {
+      case name
+          if sys.env.get("OPENIVM_ASSEMBLY_LINUX_AMD64").contains("1") &&
+            name.startsWith("librocksdbjni-") && name != "librocksdbjni-linux64.so" =>
+        MergeStrategy.discard
       case PathList("META-INF", "MANIFEST.MF")     => MergeStrategy.discard
       case PathList("META-INF", "services", _ @_*) => MergeStrategy.concat
       case PathList("META-INF", _ @_*)             => MergeStrategy.discard

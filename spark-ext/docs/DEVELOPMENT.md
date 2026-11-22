@@ -82,6 +82,17 @@ builds; Maven artifact metadata publishes the same bytes under the lowercase,
 Scala-suffixed filename shown above.
 Copy `.env.example` to `.env` and populate the private-feed values before use.
 
+For Linux x86-64 glibc deployments with an upload size limit, an opt-in
+assembly omits RocksDB JNI libraries for other platforms while retaining
+`librocksdbjni-linux64.so` and all other assembly entries:
+
+```bash
+OPENIVM_ASSEMBLY_LINUX_AMD64=1 npx --no-install nx run spark-ext:assembly --configuration=spark-4.1
+```
+
+This artifact is not suitable for other architectures, operating systems, or
+musl-based Linux. The default assembly remains multi-platform.
+
 Every SBT publication entrypoint (`publish`, `publishLocal`, and `publishM2`)
 first builds the final shaded assembly and initializes
 `org.openivm.spark.parser.gen.IvmSqlBaseLexer` in an isolated classloader whose
