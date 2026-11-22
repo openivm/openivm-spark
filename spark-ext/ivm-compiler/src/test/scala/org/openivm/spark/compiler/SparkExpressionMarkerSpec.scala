@@ -72,6 +72,19 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
     }
   }
 
+  it should "restore native named marker arguments without changing nested SQL" in {
+    val bridge = new SparkExpressionMarker(opaque = true)
+    val inner  = bridge.encode(Seq("txt", "id"), Text)(args => s"concat(${args.mkString(", ")})")
+    val outer  = bridge.encode(Seq(inner, "'a := b'"), Text)(args => s"coalesce(${args.mkString(", ")})")
+    val native = outer.replace("txt, id", "\"text name\" := source.txt, id := source.id")
+    bridge.restore(native) shouldBe "coalesce(concat(source.txt, source.id), 'a := b')"
+    bridge.requireAllSeen()
+
+    val malformed = new SparkExpressionMarker(opaque = true)
+    val encoded   = malformed.encode(Seq("txt"), Text)(_.head)
+    intercept[IllegalStateException](malformed.restore(encoded.replace("txt)", "txt := )")))
+  }
+
   it should "survive native compilation of nested projection expressions" in {
     val cli        = sys.env.getOrElse("OPENIVM_CLI_PATH", "/opt/openivm/duckdb")
     val escapedCli = cli.replace("'", "'\\''")

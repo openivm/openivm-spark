@@ -131,7 +131,7 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
                       seed.startsWith("STRUCT_PACK(") || seed.startsWith("NAMED_STRUCT(")
                   }
                   if (!allowed) None
-                  else Some(call.end -> renderMarker(id, call.args.drop(2)))
+                  else Some(call.end -> renderMarker(id, call.args.drop(2).map(stripNativeArgumentName)))
                 }
               }
             }
@@ -175,6 +175,13 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
       throw new IllegalStateException("Native compiler changed a Spark expression marker's arity")
     seen += id
     marker.render(args.map(arg => restoreStructPacks(restore(arg))))
+  }
+
+  private def stripNativeArgumentName(arg: String): String = arg match {
+    case SparkExpressionMarker.NativeNamedArgument(value) =>
+      if (value.trim.isEmpty) throw new IllegalStateException("Missing Spark expression marker argument value")
+      value.trim
+    case _ => arg
   }
 
   private def parsePayload(text: String): Option[(String, Seq[String])] = {
@@ -221,6 +228,8 @@ private[compiler] object SparkExpressionMarker {
 
   private final case class Marker(arity: Int, result: ResultType, render: Seq[String] => String)
   private final case class Call(end: Int, args: Seq[String])
+  private val NativeNamedArgument =
+    """(?s)^\s*(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+"|`(?:[^`]|``)+`)\s*:=\s*(.*)$""".r
 
   private def hasStructConstructor(sql: String): Boolean = {
     var found = false

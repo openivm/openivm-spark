@@ -147,7 +147,7 @@ private[compiler] object SparkFunctionShimSql {
                     val target = sql.substring(as + 2, cast.closeParen).trim
                     if (!target.equalsIgnoreCase("VARCHAR") && !target.equalsIgnoreCase("STRING")) None
                     else
-                      parseSingleFunctionCallInRange(sql, (begin, as), "row").flatMap { row =>
+                      parseSingleFunctionCallInRange(sql, (begin, as), "row", allowQuoted = true).flatMap { row =>
                         splitTopLevelArgs(sql, row).filter(_.size == arity).map { ranges =>
                           val args = ranges.map { case (start, end) => sql.substring(start, end).trim }
                           seen += id
@@ -843,13 +843,22 @@ private[compiler] object SparkFunctionShimSql {
   private def parseSingleFunctionCallInRange(
       sql: String,
       range: (Int, Int),
-      functionName: String
+      functionName: String,
+      allowQuoted: Boolean = false
   ): Option[FunctionCall] = {
     val (start, endExclusive) = range
     val callStart             = skipTriviaForward(sql, start, endExclusive)
     if (callStart >= endExclusive) None
     else {
-      parseFunctionCallAt(sql, callStart, functionName)
+      val quoteEnd = callStart + functionName.length + 1
+      val call =
+        if (
+          allowQuoted && sql.charAt(callStart) == '"' && quoteEnd < endExclusive &&
+          sql.regionMatches(true, callStart + 1, functionName, 0, functionName.length) &&
+          sql.charAt(quoteEnd) == '"'
+        ) parseFunctionCall(sql, quoteEnd + 1)
+        else parseFunctionCallAt(sql, callStart, functionName)
+      call
         .filter(call => call.closeParen < endExclusive && isTriviaOnly(sql, call.closeParen + 1, endExclusive))
     }
   }

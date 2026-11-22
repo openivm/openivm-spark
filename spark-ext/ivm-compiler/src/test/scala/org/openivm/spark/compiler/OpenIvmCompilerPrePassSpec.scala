@@ -29,6 +29,17 @@ class OpenIvmCompilerPrePassSpec extends AnyFunSpec with Matchers {
       markers.hasUnsafeArguments shouldBe true
     }
 
+    it("restores native quoted row calls without accepting other function names") {
+      val markers = new SparkFunctionShimSql.ScalarDialectMarkers
+      val encoded = markers.rewrite("SELECT lower(flag), timestampdiff(SECOND, ts, end_ts) FROM src")
+      val quoted  = encoded.replace("row(", "\"row\"(")
+      intercept[IllegalStateException](markers.restore(quoted.replace("\"row\"(", "\"other\"(")))
+      val restored = markers.restore(quoted)
+      restored should include("lower(flag)")
+      restored should include("timestampdiff(SECOND, ts, end_ts)")
+      markers.requireAllSeen()
+    }
+
     it("declines retries containing other unsupported call shapes") {
       val markers = new SparkFunctionShimSql.ScalarDialectMarkers
       markers.rewrite("SELECT unix_timestamp(ts), lower(concat(flag, 'x')) FROM src")
