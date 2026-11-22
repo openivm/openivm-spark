@@ -1867,6 +1867,32 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       assertBagEqual("mv_t1a_publish", "SELECT id, label FROM sales_t1a_publish")
     }
 
+    it("finishes CREATE telemetry when the initial catalog lookup fails") {
+      val query = "SELECT 1 AS id"
+      val command = CreateMaterializedViewCommand(
+        TableIdentifier("mv_t1a_lookup_fail"),
+        spark.sessionState.sqlParser.parsePlan(query),
+        Map.empty,
+        ifNotExists = false,
+        provider = None,
+        originalQueryText = query
+      )
+      val payloads = withLogCapture { appender =>
+        withSparkLocalProperties("openivm.request_id" -> "req-create-lookup-fail") {
+          val error = intercept[IllegalArgumentException] {
+            withSparkConfs(FeatureGate.CatalogBackendKey -> "invalid") {
+              command.run(spark)
+            }
+          }
+          error.getMessage should include(FeatureGate.CatalogBackendKey)
+        }
+        executionSpanPayloads(appender.messages, "mv_t1a_lookup_fail")
+      }
+      payloads should have size 1
+      payloads.head.path("request_id").asText() shouldBe "req-create-lookup-fail"
+      payloads.head.path("outcome").asText() shouldBe "create_failed"
+    }
+
     it("records non-zero CTAS timing when the initial save fails before returning") {
       val udfName = s"sleep_then_divzero_${UUID.randomUUID().toString.replace("-", "")}"
       spark.udf.register(

@@ -3067,6 +3067,7 @@ case class CreateMaterializedViewCommand(
       RefreshSqlLog.start(spark, profile.refreshId, commandName, RefreshSqlLog.ModeCreate)
     var createOutcome               = "create_failed"
     var createFinalizationAttempted = false
+    var createTelemetryFinished     = false
     var pendingCreateOutcome        = Option.empty[String]
     var createInsightClassification =
       Option.empty[OpenIvmMaterializedViewInsightEvents.Classification]
@@ -3081,110 +3082,120 @@ case class CreateMaterializedViewCommand(
         sqlLog.flush()
       }
 
-    // Record the user-supplied CREATE-MV body up front. Not executed by us
-    // (stmt_order = -1, duration = -1) but invaluable for the benchmarker
-    // because it's the verbatim user query.
-    sqlLog.record(
-      category = "original_query",
-      stmtOrder = -1,
-      attemptIdx = 0,
-      stmtKind = "select",
-      sql = originalQueryText,
-      durationMs = -1L
-    )
-    val createLockKeys = (mvLockKeys(spark, name, MvCatalog.lookup(spark, name)) :+ metaName(name)).distinct
-    CreatePublicationMutex.withLock(metaName(MvCatalog.qualifiedName(spark, name))) { publication =>
-      publication.previousFailure.foreach { previous =>
-        val required = previous.getOrElse {
-          throw new java.io.IOException("CREATE publication has no verified retry binding")
-        }
-        if (OpenIvmStateSync.publicationBinding(spark) != required)
-          throw new java.io.IOException("CREATE publication retry binding does not match the failed publication")
-      }
-      val createUpstreamReadKeys = profile.timeObservedStep("create_guard_discovery") {
-        org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
-          MvCatalog.ensureTables(isolated)
-          if (MvCatalog.lookupForRelation(isolated, name).isDefined) Seq.empty[String]
-          else {
-            val analyzed    = isolated.sql(originalQueryText).queryExecution.analyzed
-            val sourceNames = collectSourceSchemas(analyzed)._1
-            computeUpstreamMvByQual(isolated, sourceNames).values
-              .map(meta => metaName(meta.name))
-              .toSeq
-              .distinct
-              .sorted
-          }
-        }
-      }
-      val lockWaitT0 = System.nanoTime()
-      val outcome = RefreshMutex.withLocks(
-        createUpstreamReadKeys,
-        createLockKeys,
-        createLockKeys,
-        metaName(MvCatalog.qualifiedName(spark, name))
-      ) {
-        val threadName = Thread.currentThread().getName
-        val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
-        profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
-        org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
-          OpenIvmMetrics.CreateInflight.incrementAndGet()
-          try {
-            CommandConcurrencyInjection.maybePauseBeforeCreate()
-            DriverHeavyOperationAdmission.withPermit(spark, "create") {
-              val create =
-                if (
-                  name.database.isEmpty && MvCatalog.lookupForRelation(isolated, name).isEmpty &&
-                  MvCatalog.lookupStored(isolated, TableIdentifier(name.table)).isDefined
-                ) copy(name = MvCatalog.qualifiedName(isolated, name))
-                else this
-              create.runCreate(
-                isolated,
-                profile,
-                sqlLog,
-                createUpstreamReadKeys.toSet,
-                classification => createInsightClassification = Some(classification),
-                () => publication.metadataPublicationAttempted = true
-              )
-            }
-          } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
-        }
-      }
-      pendingCreateOutcome = Some(outcome)
-      Seq.empty[org.apache.spark.sql.Row]
-    } { publication =>
-      try {
-        pendingCreateOutcome.foreach { outcome =>
-          val retry = publication.previousFailure.map(_.getOrElse {
-            throw new java.io.IOException("CREATE publication has no verified retry binding")
-          })
-          if (retry.isDefined || outcome != "create_already_exists" || OpenIvmStateSync.guardedSqlEnabled(spark)) {
-            if (retry.isDefined || !FeatureGate.stateSyncAsyncEnabled(spark)) {
-              val binding = OpenIvmStateSync.publicationBinding(spark)
-              if (retry.exists(_ != binding))
-                throw new java.io.IOException("CREATE publication retry binding does not match the failed publication")
-              publication.binding = Some(binding)
-              OpenIvmStateSync.backupNowBound(spark, binding)
-            } else OpenIvmStateSync.backupForCommand(spark)
-          }
-          createOutcome = outcome
-          if (outcome == "create_executed")
-            createInsightClassification.foreach { classification =>
-              OpenIvmMaterializedViewInsightEvents.createCompleted(
-                spark,
-                profile.refreshId,
-                commandName,
-                classification
-              )
-            }
-        }
-      } finally {
+    def finishCreate(): Unit =
+      if (!createTelemetryFinished) {
+        createTelemetryFinished = true
         try finalizeCreate()
         finally {
           sqlLog.finish(createOutcome)
           OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
         }
       }
-    }
+
+    try {
+      // Record the user-supplied CREATE-MV body up front. Not executed by us
+      // (stmt_order = -1, duration = -1) but invaluable for the benchmarker
+      // because it's the verbatim user query.
+      sqlLog.record(
+        category = "original_query",
+        stmtOrder = -1,
+        attemptIdx = 0,
+        stmtKind = "select",
+        sql = originalQueryText,
+        durationMs = -1L
+      )
+      val createLockKeys = (mvLockKeys(spark, name, MvCatalog.lookup(spark, name)) :+ metaName(name)).distinct
+      CreatePublicationMutex.withLock(metaName(MvCatalog.qualifiedName(spark, name))) { publication =>
+        publication.previousFailure.foreach { previous =>
+          val required = previous.getOrElse {
+            throw new java.io.IOException("CREATE publication has no verified retry binding")
+          }
+          if (OpenIvmStateSync.publicationBinding(spark) != required)
+            throw new java.io.IOException("CREATE publication retry binding does not match the failed publication")
+        }
+        val createUpstreamReadKeys = profile.timeObservedStep("create_guard_discovery") {
+          org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
+            MvCatalog.ensureTables(isolated)
+            if (MvCatalog.lookupForRelation(isolated, name).isDefined) Seq.empty[String]
+            else {
+              val analyzed    = isolated.sql(originalQueryText).queryExecution.analyzed
+              val sourceNames = collectSourceSchemas(analyzed)._1
+              computeUpstreamMvByQual(isolated, sourceNames).values
+                .map(meta => metaName(meta.name))
+                .toSeq
+                .distinct
+                .sorted
+            }
+          }
+        }
+        val lockWaitT0 = System.nanoTime()
+        val outcome = RefreshMutex.withLocks(
+          createUpstreamReadKeys,
+          createLockKeys,
+          createLockKeys,
+          metaName(MvCatalog.qualifiedName(spark, name))
+        ) {
+          val threadName = Thread.currentThread().getName
+          val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
+          profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
+          org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
+            OpenIvmMetrics.CreateInflight.incrementAndGet()
+            try {
+              CommandConcurrencyInjection.maybePauseBeforeCreate()
+              DriverHeavyOperationAdmission.withPermit(spark, "create") {
+                val create =
+                  if (
+                    name.database.isEmpty && MvCatalog.lookupForRelation(isolated, name).isEmpty &&
+                    MvCatalog.lookupStored(isolated, TableIdentifier(name.table)).isDefined
+                  ) copy(name = MvCatalog.qualifiedName(isolated, name))
+                  else this
+                create.runCreate(
+                  isolated,
+                  profile,
+                  sqlLog,
+                  createUpstreamReadKeys.toSet,
+                  classification => createInsightClassification = Some(classification),
+                  () => publication.metadataPublicationAttempted = true
+                )
+              }
+            } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
+          }
+        }
+        pendingCreateOutcome = Some(outcome)
+        Seq.empty[org.apache.spark.sql.Row]
+      } { publication =>
+        try {
+          pendingCreateOutcome.foreach { outcome =>
+            val retry = publication.previousFailure.map(_.getOrElse {
+              throw new java.io.IOException("CREATE publication has no verified retry binding")
+            })
+            if (retry.isDefined || outcome != "create_already_exists" || OpenIvmStateSync.guardedSqlEnabled(spark)) {
+              if (retry.isDefined || !FeatureGate.stateSyncAsyncEnabled(spark)) {
+                val binding = OpenIvmStateSync.publicationBinding(spark)
+                if (retry.exists(_ != binding))
+                  throw new java.io.IOException(
+                    "CREATE publication retry binding does not match the failed publication"
+                  )
+                publication.binding = Some(binding)
+                OpenIvmStateSync.backupNowBound(spark, binding)
+              } else OpenIvmStateSync.backupForCommand(spark)
+            }
+            createOutcome = outcome
+            if (outcome == "create_executed")
+              createInsightClassification.foreach { classification =>
+                OpenIvmMaterializedViewInsightEvents.createCompleted(
+                  spark,
+                  profile.refreshId,
+                  commandName,
+                  classification
+                )
+              }
+          }
+        } finally {
+          finishCreate()
+        }
+      }
+    } finally finishCreate()
   }
 
   private def runCreate(
