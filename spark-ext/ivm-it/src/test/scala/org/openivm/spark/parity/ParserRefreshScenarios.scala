@@ -172,6 +172,94 @@ abstract class ParserRefreshScenarios extends IvmParitySpecBase("parser-refresh"
       intercept[Exception](eligibility("`default`.`ensure_corrupt_p14`"))
     }
 
+    it("resolves legacy bare keys only for their live namespace") {
+      val key = "dbt.fabricspark.materialized_view.query_hash"
+      sql("CREATE DATABASE ensure_namespace_a_p20")
+      sql("CREATE DATABASE ensure_namespace_b_p20")
+      sql("CREATE TABLE ensure_src_p20 (id INT) USING DELTA")
+      sql("INSERT INTO ensure_src_p20 VALUES (1)")
+      val originalAsync = spark.conf.getOption("spark.openivm.stateSync.async.enabled")
+      spark.conf.set("spark.openivm.stateSync.async.enabled", "false")
+      try {
+        sql("USE ensure_namespace_a_p20")
+        sql(
+          s"CREATE MATERIALIZED VIEW ensure_mv_p20 TBLPROPERTIES ('$key' = '$hash') AS " +
+            "SELECT id FROM default.ensure_src_p20"
+        )
+        val bare = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p20")).get
+        bare.name.database shouldBe None
+        MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p20", Some("ensure_namespace_a_p20"))) shouldBe Some(bare)
+        sql("INSERT INTO default.ensure_src_p20 VALUES (2)")
+        guarded("`ensure_namespace_a_p20`.`ensure_mv_p20`").head.getString(0) shouldBe "refreshed"
+        assertMvCorrect("ensure_mv_p20", "SELECT id FROM default.ensure_src_p20")
+        val refreshed = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p20")).get
+        sql("USE ensure_namespace_b_p20")
+        sql("CREATE TABLE ensure_mv_p20 (id INT) USING DELTA")
+        MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p20")) shouldBe None
+        intercept[Exception](guarded("ensure_mv_p20"))
+        MvCatalog
+          .lookup(spark, TableIdentifier("ensure_mv_p20", Some("ensure_namespace_a_p20")))
+          .map(_.location) shouldBe Some(bare.location)
+        sql("DROP TABLE ensure_mv_p20")
+        sql(
+          s"CREATE MATERIALIZED VIEW IF NOT EXISTS ensure_mv_p20 TBLPROPERTIES ('$key' = '$hash') AS " +
+            "SELECT id FROM default.ensure_src_p20"
+        )
+        val other = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p20")).get
+        other.name.database shouldBe Some("ensure_namespace_b_p20")
+        MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p20", Some("ensure_namespace_a_p20"))) shouldBe Some(
+          refreshed
+        )
+        assertMvCorrect("ensure_mv_p20", "SELECT id FROM default.ensure_src_p20")
+        sql("DROP MATERIALIZED VIEW ensure_mv_p20")
+        MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p20", Some("ensure_namespace_a_p20"))) shouldBe Some(
+          refreshed
+        )
+        sql("INSERT INTO default.ensure_src_p20 VALUES (3)")
+        guarded("`ensure_namespace_a_p20`.`ensure_mv_p20`").head.getString(0) shouldBe "refreshed"
+        assertMvCorrect("ensure_namespace_a_p20.ensure_mv_p20", "SELECT id FROM default.ensure_src_p20")
+        val afterRefresh = MvCatalog.lookup(spark, TableIdentifier("ensure_mv_p20", Some("ensure_namespace_a_p20"))).get
+        MvCatalog.upsert(
+          spark,
+          afterRefresh.copy(properties = afterRefresh.properties - "_ivm_direct_mv_dependency_map")
+        )
+        guarded("ensure_mv_p20").head.getString(0) shouldBe "absent"
+        MvCatalog.upsert(spark, afterRefresh)
+        decline("`ensure_mv_p20`", "registration_missing")
+        sql("CREATE TABLE ensure_mv_p20 (id INT) USING DELTA")
+        sql("DROP MATERIALIZED VIEW ensure_namespace_a_p20.ensure_mv_p20")
+        spark.catalog.tableExists("ensure_namespace_b_p20.ensure_mv_p20") shouldBe true
+        MvCatalog.list(spark).exists(_.location == bare.location) shouldBe false
+
+        sql("USE ensure_namespace_a_p20")
+        sql(
+          s"CREATE MATERIALIZED VIEW ensure_backed_p20 TBLPROPERTIES ('$key' = '$hash') AS " +
+            "SELECT id, COUNT(*) AS n FROM default.ensure_src_p20 GROUP BY id HAVING COUNT(*) > 0"
+        )
+        val backed = MvCatalog.lookup(spark, TableIdentifier("ensure_backed_p20")).get
+        backed.name.database shouldBe None
+        backed.usesBackingDataTable shouldBe true
+        sql("DROP VIEW ensure_backed_p20")
+        decline("`ensure_backed_p20`", "public_relation_missing")
+        MvCatalog.upsert(
+          spark,
+          backed.copy(properties = backed.properties + (MvMetadata.TargetDeltaTableIdKey -> "foreign"))
+        )
+        intercept[Exception](eligibility("`ensure_backed_p20`"))
+        MvCatalog.upsert(spark, backed)
+        sql("USE ensure_namespace_b_p20")
+        decline("`ensure_backed_p20`", "registration_missing")
+        sql("DROP MATERIALIZED VIEW ensure_namespace_a_p20.ensure_backed_p20")
+        MvCatalog.list(spark).exists(_.location == backed.location) shouldBe false
+      } finally {
+        sql("USE default")
+        originalAsync match {
+          case Some(value) => spark.conf.set("spark.openivm.stateSync.async.enabled", value)
+          case None        => spark.conf.unset("spark.openivm.stateSync.async.enabled")
+        }
+      }
+    }
+
     it("validates the live definition before writing and returns refresh proof") {
       val key    = "dbt.fabricspark.materialized_view.query_hash"
       val target = "`spark_catalog`.`default`.`ensure_mv_p15`"

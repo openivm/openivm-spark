@@ -1764,6 +1764,59 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       assertBagEqual(name.table, viewBody)
     }
 
+    it("serializes concurrent bare CREATE names across namespaces without overwriting metadata") {
+      spark.sql("CREATE DATABASE IF NOT EXISTS create_namespace_a")
+      spark.sql("CREATE DATABASE IF NOT EXISTS create_namespace_b")
+      spark.sql("CREATE TABLE create_namespace_source (id INT) USING DELTA")
+      spark.sql("INSERT INTO create_namespace_source VALUES (1), (2)")
+      val firstSession  = org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark)
+      val secondSession = org.apache.spark.sql.openivm.SparkSessionAccess.cloneSession(spark)
+      firstSession.catalog.setCurrentDatabase("create_namespace_a")
+      secondSession.catalog.setCurrentDatabase("create_namespace_b")
+      val barrier      = ParkedCommandBarrier.forObservation(CommandObservationBudget)
+      val parkFirst    = new AtomicBoolean(true)
+      val secondThread = new AtomicReference[Thread]()
+      CommandConcurrencyInjection.withBeforeCreateDataWrite {
+        if (parkFirst.compareAndSet(true, false)) barrier.park()
+      } {
+        withPool(2) { implicit ec =>
+          barrier.use {
+            val first = Future {
+              firstSession
+                .sql(
+                  "CREATE MATERIALIZED VIEW create_namespace_mv AS SELECT id FROM default.create_namespace_source"
+                )
+                .collect()
+            }
+            barrier.awaitEntered() shouldBe true
+            val second = Future {
+              secondThread.set(Thread.currentThread())
+              secondSession
+                .sql(
+                  "CREATE MATERIALIZED VIEW IF NOT EXISTS create_namespace_mv AS " +
+                    "SELECT id FROM default.create_namespace_source"
+                )
+                .collect()
+            }
+            val deadline = System.nanoTime() + 30.seconds.toNanos
+            def queued: Boolean =
+              Option(secondThread.get()).exists(RefreshMutex.hasQueuedThread("create_namespace_mv", _))
+            while (!queued && System.nanoTime() < deadline) Thread.`yield`()
+            queued shouldBe true
+            barrier.release()
+            awaitResult(Future.sequence(Seq(first, second)))
+          }
+        }
+      }
+      val firstMeta  = MvCatalog.lookup(firstSession, TableIdentifier("create_namespace_mv")).get
+      val secondMeta = MvCatalog.lookup(secondSession, TableIdentifier("create_namespace_mv")).get
+      firstMeta.name.database shouldBe None
+      secondMeta.name.database shouldBe Some("create_namespace_b")
+      firstMeta.location should not be secondMeta.location
+      assertBagEqual("create_namespace_a.create_namespace_mv", "SELECT id FROM create_namespace_source")
+      assertBagEqual("create_namespace_b.create_namespace_mv", "SELECT id FROM create_namespace_source")
+    }
+
     it("allows independent path CTAS phases to enter concurrently") {
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_overlap_1(id INT, label STRING) USING DELTA")
       spark.sql("CREATE TABLE IF NOT EXISTS sales_t1a_overlap_2(id INT, label STRING) USING DELTA")
@@ -3117,12 +3170,12 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
                   "openivm.request_id" -> "req-refresh-2",
                   "openivm.node_id"    -> "model.refresh.two"
                 ) {
-                  spark.sql("REFRESH MATERIALIZED VIEW mv_t15_serial").collect()
+                  spark.sql("REFRESH MATERIALIZED VIEW default.mv_t15_serial").collect()
                 }
               }
               val queueDeadline = System.nanoTime() + 30.seconds.toNanos
               def refresh2Queued: Boolean =
-                Option(refresh2Thread.get()).exists(RefreshMutex.hasQueuedThread("mv_t15_serial", _))
+                Option(refresh2Thread.get()).exists(RefreshMutex.hasQueuedThread("default.mv_t15_serial", _))
               while (!refresh2Queued && System.nanoTime() < queueDeadline) Thread.`yield`()
               refresh2Queued shouldBe true
               assertStillParked(barrier, refresh1)

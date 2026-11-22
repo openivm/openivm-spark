@@ -870,6 +870,53 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
 object MvCatalog {
   private def backend(spark: SparkSession): MvCatalogBackend = MvCatalogBackend.forSession(spark)
 
+  def qualifiedName(spark: SparkSession, name: TableIdentifier): TableIdentifier =
+    if (name.database.isDefined) name
+    else TableIdentifier(name.table, Some(spark.catalog.currentDatabase), name.catalog)
+
+  private def tableSql(name: TableIdentifier): String =
+    (name.catalog.toSeq ++ name.database.toSeq :+ name.table)
+      .map(part => s"`${part.replace("`", "``")}`")
+      .mkString(".")
+
+  private def legacyMatches(spark: SparkSession, name: TableIdentifier, meta: MvMetadata): Option[Boolean] = {
+    val target  = tableSql(name)
+    val backing = tableSql(TableIdentifier(s"${name.table}__ivm_data", name.database, name.catalog))
+    val log =
+      if (spark.catalog.tableExists(target)) DeltaTableVersion.analyzedDeltaLogOption(spark, target)
+      else if (meta.usesBackingDataTable && spark.catalog.tableExists(backing))
+        DeltaTableVersion.registeredDeltaLogOption(spark, backing)
+      else return None
+    val hconf = spark.sessionState.newHadoopConf()
+    def qualified(path: org.apache.hadoop.fs.Path): java.net.URI =
+      path.getFileSystem(hconf).makeQualified(path).toUri.normalize()
+    Some(
+      log.exists { deltaLog =>
+        val matches = qualified(deltaLog.dataPath) == qualified(new org.apache.hadoop.fs.Path(meta.location))
+        if (
+          matches && !meta.properties.get(MvMetadata.TargetDeltaTableIdKey).forall(_ == deltaLog.update().metadata.id)
+        )
+          throw new IllegalStateException(s"Materialized view $target has a mismatched Delta table ID")
+        matches
+      }
+    )
+  }
+
+  private def resolveLookup(
+      spark: SparkSession,
+      name: TableIdentifier,
+      read: TableIdentifier => Option[MvMetadata],
+      allowUnresolvedLegacy: Boolean
+  ): Option[MvMetadata] = {
+    val qualified = qualifiedName(spark, name)
+    read(qualified).orElse {
+      val legacy = TableIdentifier(name.table)
+      read(legacy).filter { meta =>
+        legacyMatches(spark, qualified, meta).getOrElse(allowUnresolvedLegacy && name.database.isEmpty)
+      }
+    }
+  }
+
   def ensureTables(spark: SparkSession): Unit = backend(spark).ensureTables(spark)
 
   def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit =
@@ -878,10 +925,23 @@ object MvCatalog {
   def upsert(spark: SparkSession, meta: MvMetadata): Unit =
     OpenIvmStateBarrier.withMutation(spark) { backend(spark).upsert(spark, meta) }
 
-  def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = backend(spark).lookup(spark, name)
+  def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
+    val selected = backend(spark)
+    resolveLookup(spark, name, selected.lookup(spark, _), allowUnresolvedLegacy = true)
+  }
 
-  def lookupReadOnly(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
-    backend(spark).lookupReadOnly(spark, name)
+  private[spark] def lookupForRelation(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
+    val selected = backend(spark)
+    resolveLookup(spark, name, selected.lookup(spark, _), allowUnresolvedLegacy = false)
+  }
+
+  private[spark] def lookupStored(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
+    backend(spark).lookup(spark, name)
+
+  def lookupReadOnly(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
+    val selected = backend(spark)
+    resolveLookup(spark, name, selected.lookupReadOnly(spark, _), allowUnresolvedLegacy = false)
+  }
 
   def list(spark: SparkSession): Seq[MvMetadata] = backend(spark).list(spark)
 
@@ -889,15 +949,20 @@ object MvCatalog {
     OpenIvmStateBarrier.withMutation(spark) { backend(spark).viewsForSource(spark, table) }
 
   def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
-    backend(spark).advance(spark, name, newVersion)
+    backend(spark).advance(spark, lookup(spark, name).map(_.name).getOrElse(name), newVersion)
 
   def updateProperties(
       spark: SparkSession,
       name: TableIdentifier,
       properties: Map[String, String]
-  ): Unit = backend(spark).updateProperties(spark, name, properties)
+  ): Unit = backend(spark).updateProperties(spark, lookup(spark, name).map(_.name).getOrElse(name), properties)
 
   def remove(spark: SparkSession, name: TableIdentifier): Unit =
+    OpenIvmStateBarrier.withMutation(spark) {
+      backend(spark).remove(spark, lookup(spark, name).map(_.name).getOrElse(name))
+    }
+
+  private[spark] def removeStored(spark: SparkSession, name: TableIdentifier): Unit =
     OpenIvmStateBarrier.withMutation(spark) { backend(spark).remove(spark, name) }
 
   def schemaFingerprint(

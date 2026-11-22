@@ -847,6 +847,9 @@ private[commands] object MvCommandHelper {
   def metaName(id: TableIdentifier): String =
     id.database.fold(id.table)(db => s"$db.${id.table}")
 
+  def mvLockKeys(spark: SparkSession, name: TableIdentifier, meta: Option[MvMetadata]): Seq[String] =
+    (Seq(metaName(MvCatalog.qualifiedName(spark, name))) ++ meta.map(m => metaName(m.name))).distinct
+
   /** The verified friendly<->resolved snapshot-pin binding for one command.
     *
     * `resolvedPins` associate each pinned relation in the body to its RESOLVED
@@ -1655,7 +1658,7 @@ private[commands] object MvCommandHelper {
   ): (Seq[String], Seq[DirectMvDependency]) = {
     val viewMeta = metaName(view)
     val selfMetaOpt =
-      try MvCatalog.lookup(spark, view)
+      try MvCatalog.lookupForRelation(spark, view)
       catch {
         case NonFatal(readFailure) =>
           mvDependencyMapFailClosed(viewMeta, s"its catalog row could not be read (${readFailure.getMessage})")
@@ -2200,7 +2203,7 @@ private[commands] object MvCommandHelper {
   ): Unit =
     ownedPublicView.foreach { expected =>
       try {
-        if (MvCatalog.lookup(spark, name).isEmpty) {
+        if (MvCatalog.lookupForRelation(spark, name).isEmpty) {
           val current = spark.table(sqlIdent(name)).queryExecution.analyzed.collectFirst { case view: View =>
             view.desc
           }
@@ -2224,7 +2227,7 @@ private[commands] object MvCommandHelper {
         case _: Throwable => true
       }
     val mvMetadataPublished =
-      try MvCatalog.lookup(spark, name).nonEmpty
+      try MvCatalog.lookupForRelation(spark, name).nonEmpty
       catch {
         case _: Throwable => true
       }
@@ -2948,11 +2951,12 @@ case class CreateMaterializedViewCommand(
       sql = originalQueryText,
       durationMs = -1L
     )
-    CreatePublicationMutex.withLock(commandName) {
+    val createLockKeys = (mvLockKeys(spark, name, MvCatalog.lookup(spark, name)) :+ metaName(name)).distinct
+    CreatePublicationMutex.withLock(metaName(MvCatalog.qualifiedName(spark, name))) {
       val createUpstreamReadKeys = profile.timeObservedStep("create_guard_discovery") {
         org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
           MvCatalog.ensureTables(isolated)
-          if (MvCatalog.lookup(isolated, name).isDefined) Seq.empty[String]
+          if (MvCatalog.lookupForRelation(isolated, name).isDefined) Seq.empty[String]
           else {
             val analyzed    = isolated.sql(originalQueryText).queryExecution.analyzed
             val sourceNames = collectSourceSchemas(analyzed)._1
@@ -2965,7 +2969,7 @@ case class CreateMaterializedViewCommand(
         }
       }
       val lockWaitT0 = System.nanoTime()
-      val outcome = RefreshMutex.withLocks(createUpstreamReadKeys, Seq(commandName)) {
+      val outcome = RefreshMutex.withLocks(createUpstreamReadKeys, createLockKeys) {
         val threadName = Thread.currentThread().getName
         val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
         profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
@@ -2974,7 +2978,13 @@ case class CreateMaterializedViewCommand(
           try {
             CommandConcurrencyInjection.maybePauseBeforeCreate()
             DriverHeavyOperationAdmission.withPermit(spark, "create") {
-              runCreate(
+              val create =
+                if (
+                  name.database.isEmpty && MvCatalog.lookupForRelation(isolated, name).isEmpty &&
+                  MvCatalog.lookupStored(isolated, TableIdentifier(name.table)).isDefined
+                ) copy(name = MvCatalog.qualifiedName(isolated, name))
+                else this
+              create.runCreate(
                 isolated,
                 profile,
                 sqlLog,
@@ -3027,7 +3037,7 @@ case class CreateMaterializedViewCommand(
 
     // Existence guard
     profile.timeStep("create_catalog_lookup") {
-      MvCatalog.lookup(spark, name)
+      MvCatalog.lookupForRelation(spark, name)
     } match {
       case Some(meta) if ifNotExists =>
         if (OpenIvmExecutionSpan.hasActiveExport) {
@@ -4167,10 +4177,13 @@ case class ShowRefreshEligibilityCommand(name: TableIdentifier, expectedQueryHas
     def decline(reason: String): Seq[Row] =
       Seq(Row("lifecycle_required", expectedQueryHash, target, null, reason))
 
-    RefreshMutex.withReadLock(metaName(name)) {
+    val lockKeys = mvLockKeys(spark, name, MvCatalog.lookupReadOnly(spark, name))
+    RefreshMutex.withLocks(lockKeys, Seq.empty) {
       MvCatalog.lookupReadOnly(spark, name) match {
         case None => decline("registration_missing")
         case Some(meta) =>
+          if (!lockKeys.contains(metaName(meta.name)))
+            throw new IllegalStateException(s"Materialized view $target changed while acquiring locks")
           val ownership = MaterializedViewLifecycle.liveOwnership(spark, name, meta)
           if (!ownership.dataOwned)
             throw new IllegalStateException(s"Materialized view $target has unsafe backing: ${ownership.reason}")
@@ -4232,11 +4245,27 @@ case class RefreshMaterializedViewCommand(
   override def run(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
 
+    val initialMeta = MvCatalog.lookupForRelation(spark, name)
+    initialMeta match {
+      case Some(meta) if metaName(meta.name) != metaName(name) =>
+        val storedName = TableIdentifier(meta.name.table, meta.name.database, name.catalog.orElse(meta.name.catalog))
+        val rows = org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
+          name.catalog.foreach(isolated.catalog.setCurrentCatalog)
+          name.database.foreach(isolated.catalog.setCurrentDatabase)
+          copy(name = storedName).run(isolated)
+        }
+        return if (expectedQueryHash.isEmpty) rows
+        else rows.map(row => Row.fromSeq(row.toSeq.updated(2, sqlIdent(name))))
+      case _ => ()
+    }
+
     // Serialize concurrent REFRESHes against the same MV — see comment on
     // RefreshMutex above. Without this, two threads that both read the
     // same unconsumed staging-delta snapshot each apply it once, doubling
     // count-monoid aggregates.
-    val viewMeta = metaName(name)
+    val viewMeta      = metaName(name)
+    val dependencyKey = initialMeta.map(meta => metaName(meta.name)).getOrElse(viewMeta)
+    val viewLockKeys  = mvLockKeys(spark, name, initialMeta)
     if (expectedQueryHash.isEmpty) OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
     val lockT0           = System.nanoTime()
     var commandCompleted = false
@@ -4269,14 +4298,17 @@ case class RefreshMaterializedViewCommand(
                   s"(${readFailure.getMessage})"
               )
           })
-            .filter(meta => metaName(meta.name) != viewMeta)
-            .filter(candidate => dependsOnUpstreamKey(candidate, viewMeta))
+            .filter(meta => metaName(meta.name) != dependencyKey)
+            .filter(candidate => dependsOnUpstreamKey(candidate, dependencyKey))
             .map(meta => metaName(meta.name))
         }
         .getOrElse(Seq.empty)
-      val writeKeys = viewMeta +: downstreamWriteKeys
+      val writeKeys = viewLockKeys ++ downstreamWriteKeys
       val rows = RefreshMutex.withLocks(upstreamMvSourceKeys, writeKeys) {
-        val missing = expectedQueryHash.isDefined && MvCatalog.lookup(spark, name).isEmpty
+        val currentMeta = MvCatalog.lookupForRelation(spark, name)
+        if (currentMeta.exists(meta => !viewLockKeys.contains(metaName(meta.name))))
+          throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} changed while acquiring locks")
+        val missing = expectedQueryHash.isDefined && currentMeta.isEmpty
         if (missing) {
           if (expectedTableId.isDefined)
             throw new IllegalStateException(s"Pinned materialized view ${sqlIdent(name)} is absent")
@@ -9817,11 +9849,13 @@ private[spark] object MaterializedViewLifecycle extends org.apache.spark.interna
       )
     )
 
-    val mvQual      = metaName(name)
-    val mvShort     = name.identifier
+    val mvQual  = metaName(meta.name)
+    val mvShort = meta.name.identifier
+    val shortOwnedByAnother = mvShort != mvQual &&
+      MvCatalog.lookupStored(spark, TableIdentifier(mvShort)).isDefined
     val propagation = ChangePropagationFactory.forSession(spark)
     propagation.removeForBaseTable(spark, mvQual)
-    if (mvShort != mvQual) propagation.removeForBaseTable(spark, mvShort)
+    if (mvShort != mvQual && !shortOwnedByAnother) propagation.removeForBaseTable(spark, mvShort)
     OpenIvmInsightEvents.action(
       spark,
       operationId,
@@ -9836,9 +9870,9 @@ private[spark] object MaterializedViewLifecycle extends org.apache.spark.interna
       )
     )
     CdfWatermarkCatalog.removeForView(spark, mvQual)
-    if (mvShort != mvQual) CdfWatermarkCatalog.removeForView(spark, mvShort)
+    if (mvShort != mvQual && !shortOwnedByAnother) CdfWatermarkCatalog.removeForView(spark, mvShort)
     CdfWatermarkCatalog.removeForBaseTable(spark, mvQual)
-    if (mvShort != mvQual) CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
+    if (mvShort != mvQual && !shortOwnedByAnother) CdfWatermarkCatalog.removeForBaseTable(spark, mvShort)
     OpenIvmInsightEvents.action(
       spark,
       operationId,
@@ -9854,7 +9888,7 @@ private[spark] object MaterializedViewLifecycle extends org.apache.spark.interna
     )
 
     val warehouse       = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
-    val safeMvName      = mvQual.replace(".", "_").replace(" ", "_")
+    val safeMvName      = metaName(meta.name).replace(".", "_").replace(" ", "_")
     val viewDeltaNsPath = new Path(s"$warehouse/_ivm/view_deltas/$safeMvName")
     try {
       val vdFs             = viewDeltaNsPath.getFileSystem(spark.sessionState.newHadoopConf())
@@ -9890,7 +9924,7 @@ private[spark] object MaterializedViewLifecycle extends org.apache.spark.interna
         )
     }
 
-    MvCatalog.remove(spark, name)
+    MvCatalog.removeStored(spark, meta.name)
     OpenIvmInsightEvents.action(
       spark,
       operationId,
@@ -9910,6 +9944,16 @@ case class DropMaterializedViewCommand(
 
   override def run(spark: SparkSession): Seq[Row] = {
     import MvCommandHelper._
+
+    val initialMeta = MvCatalog.lookupForRelation(spark, name)
+    if (name.database.isDefined && initialMeta.exists(_.name.database.isEmpty)) {
+      // Legacy cascade identities are bare and must resolve in the target namespace.
+      return org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
+        name.catalog.foreach(isolated.catalog.setCurrentCatalog)
+        name.database.foreach(isolated.catalog.setCurrentDatabase)
+        copy(name = TableIdentifier(name.table)).run(isolated)
+      }
+    }
 
     val operationId = UUID.randomUUID().toString
     val viewName    = metaName(name)
@@ -9941,14 +9985,17 @@ case class DropMaterializedViewCommand(
           targetRelation = Some(viewName)
         )
       )
-      val rootIdentity = StreamingDependencyCatalog.materializedIdentity(viewName)
-      val preflight = MvCatalog.lookup(spark, name).map { meta =>
+      val preflight = MvCatalog.lookupForRelation(spark, name).map { meta =>
         val descendants = StreamingTableManager.resolveMaterializedCascadeDescendants(spark, meta)
         (meta, descendants, MvCatalog.mvIdentity(meta), mvBackingIdentity(spark, meta))
       }
-      val lockKeys = rootIdentity +: preflight.toSeq.flatMap(_._2.map(_.identity))
+      val rootIdentity =
+        StreamingDependencyCatalog.materializedIdentity(preflight.map(p => metaName(p._1.name)).getOrElse(viewName))
+      val lockKeys =
+        mvLockKeys(spark, name, preflight.map(_._1)) ++
+          Seq(name.table, rootIdentity) ++ preflight.toSeq.flatMap(_._2.map(_.identity))
       val rows: Seq[Row] = RefreshMutex.withLocks(lockKeys, admissionDeadline) {
-        MvCatalog.lookup(spark, name) match {
+        MvCatalog.lookupForRelation(spark, name) match {
           case None if ifExists =>
             outcome = "drop_missing_ignored"
             Seq.empty[Row]
