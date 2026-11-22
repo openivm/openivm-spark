@@ -256,6 +256,13 @@ without revalidating unchanged namespaces through public catalog setters. This
 preserves Fabric internal database names while still propagating non-default
 V2 catalogs and multipart namespaces when their cloned state differs.
 
+## Streaming target locations
+
+Streaming-table CREATE resolves a session-catalog namespace through Spark's
+catalog before requesting its default target path. Explicit LOCATION is
+preserved. Creation fails if the catalog's actual target path differs from the
+planned path; catalog lookup failures are not replaced with a warehouse guess.
+
 ## Targeted streaming status polling
 
 `SHOW STREAMING TABLES [IN namespace] [LIKE 'pattern']` returns the existing nine status fields.

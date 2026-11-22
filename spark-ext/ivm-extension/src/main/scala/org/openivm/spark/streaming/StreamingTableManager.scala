@@ -237,6 +237,10 @@ object StreamingTableManager {
                   s"A reset recovery for ${StreamingTableMetadata.quoteMultipart(spec.name)} is pending; " +
                     "resubmit the exact replacement with onQueryChange=rebuild"
                 )
+              if (!plannedPath.contains(intent.targetPath))
+                StreamingTableErrors.invalid(
+                  s"Planned location '${plannedPath.get}' differs from journaled target '${intent.targetPath}'"
+                )
               spec.location
                 .map(location => StreamingTableMetadata.normalizePath(spark, location))
                 .foreach { location =>
@@ -349,7 +353,7 @@ object StreamingTableManager {
                 discardUncommittedCreation(spark, spec.name, identity, plannedPath.get, definition, insight)
           }
           val target =
-            try StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema, interrupted)
+            try StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema, plannedPath.get, interrupted)
             catch {
               case NonFatal(error) if interrupted.isEmpty && recovery.isEmpty && spec.location.isEmpty =>
                 try discardUncommittedCreation(spark, spec.name, identity, plannedPath.get, definition, insight)
@@ -1318,7 +1322,7 @@ object StreamingTableManager {
       val upstreamDropped = afterDescendants.copy(upstreamDropped = true)
       StreamingTableMetadata.updateResetIntent(spark, afterDescendants, upstreamDropped)
 
-      val replacement = StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema)
+      val replacement = StreamingTableMetadata.createOwnedTarget(spark, spec, frame.schema, current.dataPath)
       StreamingInsightEvents.action(
         spark,
         insight.operationId,

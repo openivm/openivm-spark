@@ -26,6 +26,8 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
   protected def sessionExtensions: String =
     "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions"
 
+  protected def sessionCatalog: String = "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+
   override protected def beforeAll(): Unit = {
     super.beforeAll()
     warehouse.mkdirs()
@@ -37,7 +39,7 @@ trait StreamingTableTestFixture extends BeforeAndAfterAll with BeforeAndAfterEac
         "spark.sql.extensions",
         sessionExtensions
       )
-      .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+      .config("spark.sql.catalog.spark_catalog", sessionCatalog)
       .config("spark.openivm.enabled", "true")
       .config(FeatureGate.StreamingCheckpointArchiveUriKey, checkpointArchive.getAbsolutePath)
       .config("spark.sql.warehouse.dir", warehouse.getAbsolutePath)

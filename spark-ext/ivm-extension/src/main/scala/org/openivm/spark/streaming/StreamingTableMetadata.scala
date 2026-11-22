@@ -225,7 +225,7 @@ object StreamingTableMetadata {
       )
     val qualified = qualifiedNameParts(spark, name)
     if (qualified.size >= 2) {
-      val namespace         = qualified.dropRight(1).mkString(".")
+      val namespace         = quoteMultipart(qualified.dropRight(1))
       val namespaceLocation = spark.catalog.getDatabase(namespace).locationUri
       if (normalized == normalizePath(spark, namespaceLocation))
         StreamingTableErrors.invalid(
@@ -242,9 +242,10 @@ object StreamingTableMetadata {
     location.map(value => normalizePath(spark, value)).orElse {
       val qualified = qualifiedNameParts(spark, name)
       if (qualified.size == 3 && qualified.head.equalsIgnoreCase("spark_catalog")) {
+        val namespace = spark.catalog.getDatabase(quoteMultipart(qualified.dropRight(1)))
         val identifier = new TableIdentifier(
           qualified.last,
-          Some(qualified(1)),
+          Some(namespace.name),
           Some(qualified.head)
         )
         Some(normalizePath(spark, new Path(spark.sessionState.catalog.defaultTablePath(identifier))))
@@ -632,6 +633,7 @@ object StreamingTableMetadata {
       spark: SparkSession,
       spec: StreamingTableSpec,
       schema: StructType,
+      expectedPath: String,
       interrupted: Option[StreamingTableTarget] = None
   ): StreamingTableTarget = {
     validateProvider(spec)
@@ -675,6 +677,11 @@ object StreamingTableMetadata {
     }
 
     val initiallyCreated = awaitReadableTarget(spark, spec.name, requireTableIdMarker = false)
+    if (initiallyCreated.dataPath != expectedPath)
+      StreamingTableErrors.invalid(
+        s"Target ${initiallyCreated.sqlIdentifier} was created at '${initiallyCreated.dataPath}', " +
+          s"not its planned location '$expectedPath'"
+      )
     val setIdentitySql =
       s"ALTER TABLE ${initiallyCreated.sqlIdentifier} SET TBLPROPERTIES " +
         s"(${sqlString(DeltaIdMarkerKey)}=${sqlString(initiallyCreated.deltaTableId)}, " +
