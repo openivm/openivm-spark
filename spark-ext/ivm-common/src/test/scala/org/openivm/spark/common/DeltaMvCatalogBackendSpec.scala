@@ -37,6 +37,16 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       .config(FeatureGate.CatalogBackendKey, "delta")
       .config(FeatureGate.CatalogPathKey, s"$root/catalog")
       .config("spark.ui.enabled", "false")
+      .withExtensions { extensions =>
+        extensions.injectCheckRule { session => plan =>
+          if (session.conf.getOption("spark.openivm.test.rejectCreateTable").contains("true")) {
+            plan.foreach { node =>
+              if (node.nodeName.contains("CreateTable"))
+                throw new IllegalStateException("CREATE TABLE is unavailable for path-backed catalogs")
+            }
+          }
+        }
+      }
       .getOrCreate()
   }
 
@@ -79,6 +89,57 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
     )
 
   describe("Delta MV catalog backend") {
+    it("initializes both catalog paths concurrently and preserves data when reinitialized from another schema") {
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val catalogPath                                 = s"$root/concurrent-initialization"
+      val barrier                                     = new CyclicBarrier(2)
+      spark.sql("CREATE DATABASE IF NOT EXISTS delta_init_context")
+
+      def inContext[A](f: SparkSession => A): A = withNewSession { session =>
+        session.conf.set(FeatureGate.CatalogPathKey, catalogPath)
+        session.catalog.setCurrentDatabase("delta_init_context")
+        session.conf.set("spark.openivm.test.rejectCreateTable", "true")
+        f(session)
+      }
+
+      Await.result(
+        Future.sequence(
+          (1 to 2).map(_ =>
+            Future {
+              inContext { session =>
+                barrier.await()
+                MvCatalog.ensureTables(session)
+                CdfWatermarkCatalog.ensureTables(session)
+              }
+            }
+          )
+        ),
+        5.minutes
+      )
+
+      inContext { session =>
+        val entry = metadata("db.mv_init", "db.source_init")
+        MvCatalog.upsert(session, entry)
+        CdfWatermarkCatalog.put(session, "db.mv_init", "db.source_init", 7L)
+        MvCatalog.ensureTables(session)
+        CdfWatermarkCatalog.ensureTables(session)
+        MvCatalog.lookup(session, entry.name) shouldBe Some(entry)
+        CdfWatermarkCatalog.get(session, "db.mv_init", "db.source_init") shouldBe Some(7L)
+        DeltaTable
+          .forPath(session, s"$catalogPath/mv_metadata")
+          .detail()
+          .select("partitionColumns")
+          .head()
+          .getSeq[String](0) shouldBe Seq("name")
+        DeltaTable
+          .forPath(session, s"$catalogPath/cdf_watermarks")
+          .detail()
+          .select("partitionColumns")
+          .head()
+          .getSeq[String](0) shouldBe Seq("view_name")
+      }
+    }
+
     it("round-trips, indexes dependencies, advances, updates, and removes metadata") {
       val orders   = metadata("db.mv_orders", "db.orders")
       val customer = metadata("db.mv_customer", "db.customer")

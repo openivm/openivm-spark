@@ -95,7 +95,7 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
 
   override def ensureTables(spark: SparkSession): Unit = OpenIvmMetrics.time("catalog.mv_catalog.ensure_tables") {
     withDeltaRetry {
-      DeltaTable.createIfNotExists(spark).location(path(spark)).addColumns(schema).partitionedBy(Name).execute()
+      DeltaPathTable.createIfAbsent(spark, path(spark), schema, Name)
     }
   }
 

@@ -28,7 +28,7 @@ private[common] object DeltaCdfWatermarkBackend extends CdfWatermarkBackend with
 
   override def ensureTables(spark: SparkSession): Unit = OpenIvmMetrics.time("catalog.cdf_watermark.ensure_tables") {
     withDeltaRetry {
-      DeltaTable.createIfNotExists(spark).location(path(spark)).addColumns(schema).partitionedBy(ViewName).execute()
+      DeltaPathTable.createIfAbsent(spark, path(spark), schema, ViewName)
     }
   }
 
