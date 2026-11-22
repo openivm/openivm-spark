@@ -138,7 +138,12 @@ and reader options retain native Spark behavior where supported. The managed
 target sink remains Delta-only: omitting `USING` selects Delta, and an explicit
 non-Delta target provider is rejected.
 
-Lifecycle commands use the same caller session:
+Lifecycle commands use the same caller session.
+
+When invoked from a worker thread, CREATE, SHOW, STOP, and DROP temporarily
+bind that caller session as the thread-active session for Delta metadata work.
+The previous thread binding is restored on success or failure; the process-wide
+default session is not changed and no session is cloned.
 
 ```sql
 SHOW STREAMING TABLES;
