@@ -203,8 +203,8 @@ object Settings {
     // JNI symbol names like `Java_org_rocksdb_RocksDB_version`. Renaming
     // the Java classes via sbt-assembly does not rewrite those symbols,
     // so any shaded callsite would fail at runtime with
-    // `UnsatisfiedLinkError`. We pin the same `rocksdbjni` version Spark
-    // 3.5 ships (8.3.2) so the unshaded classpath is consistent.
+    // `UnsatisfiedLinkError`. Each Spark target pins the `rocksdbjni` version
+    // shipped by that Spark release so the unshaded classpath is consistent.
     assembly / assemblyShadeRules := Seq(
       ShadeRule.rename("org.duckdb.**" -> "org.openivm.shaded.duckdb.@1").inAll,
       ShadeRule.rename("org.antlr.v4.runtime.**" -> "org.openivm.shaded.antlr.@1").inAll
