@@ -1401,7 +1401,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
             backupEntered.await(60, TimeUnit.SECONDS) shouldBe true
             activeExport.get() shouldBe export
             val mvLock = Future {
-              RefreshMutex.withLocks(Seq.empty, Seq(view)) { () }
+              RefreshMutex.withLocks(Seq.empty, Seq(view, s"default.$view")) { () }
             }
             Await.result(mvLock, 15.seconds)
             val samePublication = Future {
@@ -1416,7 +1416,7 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
             }
             val queueDeadline = System.nanoTime() + 30.seconds.toNanos
             def publicationQueued: Boolean =
-              Option(publicationThread.get()).exists(CreatePublicationMutex.hasQueuedThread(view, _))
+              Option(publicationThread.get()).exists(CreatePublicationMutex.hasConditionWaiter(s"default.$view", _))
             while (!publicationQueued && System.nanoTime() < queueDeadline) Thread.`yield`()
             publicationQueued shouldBe true
             publicationEntered.getCount shouldBe 1L
@@ -1425,6 +1425,189 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
             Await.result(create, 120.seconds)
             Await.result(samePublication, 120.seconds)
             publicationEntered.getCount shouldBe 0L
+          } finally {
+            releaseBackup.countDown()
+            OpenIvmStateSync.setBackupPassHookForTesting(null)
+            OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+          }
+        }
+      }
+    }
+
+    it("allows a valid CREATE after a pre-publication body failure") {
+      val source = "sales_t1_retry_invalid"
+      val view   = "mv_t1_retry_invalid"
+      intercept[Exception] {
+        spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id FROM $source").collect()
+      }
+      intercept[java.io.IOException] {
+        CreatePublicationMutex.withLock(s"default.$view") { _ =>
+          throw new java.io.IOException("injected pre-publication body failure")
+        } { _ => () }
+      }
+      MvCatalog.lookupForRelation(spark, TableIdentifier(view)) shouldBe empty
+      spark.sql(s"CREATE TABLE $source(id INT) USING DELTA").collect()
+      spark.sql(s"INSERT INTO $source VALUES (1)").collect()
+      spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id FROM $source").collect()
+      spark.table(view).collect().map(_.getInt(0)).toSeq shouldBe Seq(1)
+    }
+
+    it("rejects unbound or mismatched publication retries before creating missing metadata") {
+      val source = "sales_t1_retry_missing_metadata"
+      spark.sql(s"CREATE TABLE $source(id INT) USING DELTA").collect()
+      spark.sql(s"INSERT INTO $source VALUES (1)").collect()
+      val other     = spark.newSession()
+      val ownerRoot = new File(warehouseDir, "state-sync-missing-owner")
+      val otherRoot = new File(warehouseDir, "state-sync-missing-other")
+      withSparkConfs(FeatureGate.StateSyncAsyncEnabledKey -> "false") {
+        other.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "false")
+        OpenIvmStateSync.setStateSyncUriHookForTesting { session =>
+          if (session eq other) Some(otherRoot.toURI.toString) else Some(ownerRoot.toURI.toString)
+        }
+        try {
+          Seq("unbound", "mismatch", "body_after_metadata").foreach { scenario =>
+            val view    = s"mv_t1_retry_${scenario}_missing"
+            val binding = OpenIvmStateSync.publicationBinding(spark)
+            intercept[java.io.IOException] {
+              CreatePublicationMutex.withLock(s"default.$view") { attempt =>
+                if (scenario == "body_after_metadata") {
+                  attempt.metadataPublicationAttempted = true
+                  throw new java.io.IOException("injected body failure after metadata publication")
+                }
+              } { attempt =>
+                if (scenario == "mismatch") attempt.binding = Some(binding)
+                throw new java.io.IOException("injected publication failure")
+              }
+            }
+            intercept[Exception] {
+              other.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id FROM $source").collect()
+            }
+            MvCatalog.lookupForRelation(spark, TableIdentifier(view)) shouldBe empty
+            spark.catalog.tableExists(view) shouldBe false
+            if (scenario == "mismatch") {
+              spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id FROM $source").collect()
+              spark.table(view).collect().map(_.getInt(0)).toSeq shouldBe Seq(1)
+            }
+          }
+          otherRoot.exists() shouldBe false
+        } finally OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+      }
+    }
+
+    it("does not acknowledge a waiting CREATE after publication fails") {
+      val source = "sales_t1_failed_publication"
+      val view   = "mv_t1_failed_publication"
+      spark.sql(s"CREATE TABLE $source(id INT) USING DELTA").collect()
+      spark.sql(s"INSERT INTO $source VALUES (1)").collect()
+      val backupEntered = new CountDownLatch(1)
+      val releaseBackup = new CountDownLatch(1)
+      val waiterThread  = new AtomicReference[Thread]()
+      val passes        = new java.util.concurrent.atomic.AtomicInteger()
+      val remoteRoot    = new File(warehouseDir, "state-sync-failed-publication")
+      withSparkConfs(FeatureGate.StateSyncAsyncEnabledKey -> "false") {
+        OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(remoteRoot.toURI.toString))
+        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+          if (passes.incrementAndGet() == 1) {
+            backupEntered.countDown()
+            if (!releaseBackup.await(60, TimeUnit.SECONDS))
+              throw new IllegalStateException("CREATE backup was not released")
+          }
+          throw new java.io.IOException("injected CREATE publication failure")
+        }
+        withPool(2) { implicit ec =>
+          val first = Future {
+            spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id FROM $source").collect()
+          }
+          try {
+            backupEntered.await(60, TimeUnit.SECONDS) shouldBe true
+            val waiter = Future {
+              waiterThread.set(Thread.currentThread())
+              spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS $view AS SELECT id FROM $source").collect()
+            }
+            val deadline = System.nanoTime() + 30.seconds.toNanos
+            def waiting: Boolean =
+              Option(waiterThread.get()).exists(CreatePublicationMutex.hasConditionWaiter(s"default.$view", _))
+            while (!waiting && System.nanoTime() < deadline) Thread.`yield`()
+            waiting shouldBe true
+            releaseBackup.countDown()
+            intercept[Exception](awaitResult(first, 120.seconds))
+            intercept[Exception](awaitResult(waiter, 120.seconds))
+            passes.get() shouldBe 2
+            OpenIvmStateSync.setBackupPassHookForTesting(null)
+            spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS $view AS SELECT id FROM $source").collect()
+            remoteRoot.listFiles() should not be empty
+          } finally {
+            releaseBackup.countDown()
+            OpenIvmStateSync.setBackupPassHookForTesting(null)
+            OpenIvmStateSync.setStateSyncUriHookForTesting(null)
+          }
+        }
+      }
+    }
+
+    it("rejects CREATE publication retries from differently configured sessions") {
+      val source = "sales_t1_publication_binding"
+      val view   = "mv_t1_publication_binding"
+      spark.sql(s"CREATE TABLE $source(id INT) USING DELTA").collect()
+      spark.sql(s"INSERT INTO $source VALUES (1)").collect()
+      val noDestination    = spark.newSession()
+      val otherDestination = spark.newSession()
+      val ownerRoot        = new File(warehouseDir, "state-sync-binding-owner")
+      val otherRoot        = new File(warehouseDir, "state-sync-binding-other")
+      val backupEntered    = new CountDownLatch(1)
+      val releaseBackup    = new CountDownLatch(1)
+      val noDestThread     = new AtomicReference[Thread]()
+      val otherThread      = new AtomicReference[Thread]()
+      val passes           = new java.util.concurrent.atomic.AtomicInteger()
+      withSparkConfs(FeatureGate.StateSyncAsyncEnabledKey -> "false") {
+        noDestination.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "false")
+        otherDestination.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "false")
+        OpenIvmStateSync.setStateSyncUriHookForTesting { session =>
+          if (session eq noDestination) None
+          else if (session eq otherDestination) Some(otherRoot.toURI.toString)
+          else Some(ownerRoot.toURI.toString)
+        }
+        OpenIvmStateSync.setBackupPassHookForTesting { (_, _, _) =>
+          passes.incrementAndGet()
+          backupEntered.countDown()
+          if (!releaseBackup.await(60, TimeUnit.SECONDS))
+            throw new IllegalStateException("CREATE backup was not released")
+          throw new java.io.IOException("injected CREATE publication failure")
+        }
+        withPool(3) { implicit ec =>
+          val first = Future {
+            spark.sql(s"CREATE MATERIALIZED VIEW $view AS SELECT id FROM $source").collect()
+          }
+          try {
+            backupEntered.await(60, TimeUnit.SECONDS) shouldBe true
+            val noUri = Future {
+              noDestThread.set(Thread.currentThread())
+              noDestination.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS $view AS SELECT id FROM $source").collect()
+            }
+            val otherUri = Future {
+              otherThread.set(Thread.currentThread())
+              otherDestination.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS $view AS SELECT id FROM $source").collect()
+            }
+            val deadline = System.nanoTime() + 30.seconds.toNanos
+            def waiting(thread: AtomicReference[Thread]): Boolean =
+              Option(thread.get()).exists(CreatePublicationMutex.hasConditionWaiter(s"default.$view", _))
+            while ((!waiting(noDestThread) || !waiting(otherThread)) && System.nanoTime() < deadline) Thread.`yield`()
+            waiting(noDestThread) shouldBe true
+            waiting(otherThread) shouldBe true
+            releaseBackup.countDown()
+            intercept[Exception](awaitResult(first, 120.seconds))
+            intercept[Exception](awaitResult(noUri, 120.seconds))
+            intercept[Exception](awaitResult(otherUri, 120.seconds))
+            passes.get() shouldBe 1
+            val ownerBinding = OpenIvmStateSync.publicationBinding(spark)
+            OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(otherRoot.toURI.toString))
+            intercept[java.io.IOException](OpenIvmStateSync.backupNowBound(spark, ownerBinding))
+            passes.get() shouldBe 1
+            OpenIvmStateSync.setStateSyncUriHookForTesting(_ => Some(ownerRoot.toURI.toString))
+            OpenIvmStateSync.setBackupPassHookForTesting(null)
+            spark.sql(s"CREATE MATERIALIZED VIEW IF NOT EXISTS $view AS SELECT id FROM $source").collect()
+            ownerRoot.listFiles() should not be empty
+            otherRoot.exists() shouldBe false
           } finally {
             releaseBackup.countDown()
             OpenIvmStateSync.setBackupPassHookForTesting(null)
@@ -2163,12 +2346,14 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         entry.path("hold_ms").asLong() should be >= 0L
       }
       val createDataLock = createLocks.find(_.path("lock_kind").asText() == "mv_data").get
-      createDataLock.path("mv_key").asText() shouldBe "mv_t5aa_export"
+      createDataLock.path("mv_key").asText() shouldBe "default.mv_t5aa_export"
+      createDataLock.path("mv_keys").elements().asScala.map(_.asText()).toSeq shouldBe
+        Seq("default.mv_t5aa_export", "mv_t5aa_export")
       createDataLock.path("mode").asText() shouldBe "write"
       createDataLock.path("request_id").asText() shouldBe "request-t5aa-create"
       createDataLock.path("dbt_node_id").asText() shouldBe "model.benchmark.mv_t5aa_export"
       val createPublicationLock = createLocks.find(_.path("lock_kind").asText() == "create_publication").get
-      createPublicationLock.path("mv_key").asText() shouldBe "mv_t5aa_export"
+      createPublicationLock.path("mv_key").asText() shouldBe "default.mv_t5aa_export"
       createPublicationLock.path("mode").asText() shouldBe "write"
       createPublicationLock.path("request_id").asText() shouldBe "request-t5aa-create"
       createPublicationLock.path("dbt_node_id").asText() shouldBe "model.benchmark.mv_t5aa_export"
@@ -2184,7 +2369,9 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val refreshLocks = refresh.path("lock_acquisitions").elements().asScala.toSeq
       refreshLocks should have size 1
       val refreshLock = refreshLocks.head
-      refreshLock.path("mv_key").asText() shouldBe "mv_t5aa_export"
+      refreshLock.path("mv_key").asText() shouldBe "default.mv_t5aa_export"
+      refreshLock.path("mv_keys").elements().asScala.map(_.asText()).toSeq shouldBe
+        Seq("default.mv_t5aa_export", "mv_t5aa_export")
       refreshLock.path("lock_kind").asText() shouldBe "mv_data"
       refreshLock.path("mode").asText() shouldBe "write"
       refreshLock.path("released_epoch_ms").asLong() should be >= refreshLock.path("acquired_epoch_ms").asLong()
@@ -3023,7 +3210,12 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
             ) {
               val span = OpenIvmExecutionSpan.start(spark, right, "refresh")
               try
-                RefreshMutex.withLocks(Seq(upstream), Seq(right)) {
+                RefreshMutex.withLocks(
+                  Seq(upstream),
+                  Seq(right, "lock_child_right"),
+                  Seq(right, "lock_child_right"),
+                  right
+                ) {
                   bothEntered.await(10L, TimeUnit.SECONDS)
                   span.complete("incremental_executed", Thread.currentThread().getName)
                 }
@@ -3049,6 +3241,8 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val targetWrite = entries.find(_.path("mv_key").asText() == right).get
       targetWrite.path("mode").asText() shouldBe "write"
       targetWrite.path("lock_kind").asText() shouldBe "mv_data"
+      targetWrite.path("mv_keys").elements().asScala.map(_.asText()).toSeq shouldBe
+        Seq("default.lock_child_right", "lock_child_right")
       span.path("same_mv_lock_wait_ms").asLong() shouldBe entries.map(_.path("wait_ms").asLong()).sum
       entries.foreach { entry =>
         entry.path("requested_epoch_ms").asLong() should be > 0L
@@ -3061,6 +3255,32 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         entry.path("request_id").asText() shouldBe "req-reader-right"
         entry.path("dbt_node_id").asText() shouldBe "model.reader.right"
       }
+    }
+
+    it("reports only acquired target keys when a lock set fails partway through") {
+      val target = "default.lock_partial"
+      val keys   = Seq(target, "lock_partial")
+      val payloads = withLogCapture { appender =>
+        val span = OpenIvmExecutionSpan.start(spark, target, "refresh")
+        try {
+          RefreshMutex.withReadLock("lock_partial") {
+            intercept[IllegalStateException] {
+              RefreshMutex.withLocks(Seq.empty, keys, keys, target) {
+                fail("lock upgrade should not be admitted")
+              }
+            }
+          }
+          span.complete("failed", Thread.currentThread().getName)
+        } finally OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+        executionSpanPayloads(appender.messages, target)
+      }
+
+      payloads should have size 1
+      val entries     = payloads.head.path("lock_acquisitions").elements().asScala.toSeq
+      val targetWrite = entries.find(_.path("mode").asText() == "write").get
+      targetWrite.path("mv_key").asText() shouldBe target
+      targetWrite.path("mv_keys").elements().asScala.map(_.asText()).toSeq shouldBe Seq(target)
+      entries.count(_.path("mode").asText() == "read") shouldBe 1
     }
 
     it("emit one primary span per CREATE and capture queued same-MV lock waits") {
@@ -3114,9 +3334,14 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
       val waitingLocks = waitingCreate.path("lock_acquisitions").elements().asScala.toSeq
       waitingLocks should have size 2
       val publicationWait = waitingLocks.find(_.path("lock_kind").asText() == "create_publication").get
+      publicationWait.path("mv_key").asText() shouldBe "default.mv_t14a_create_span"
       publicationWait.path("mode").asText() shouldBe "write"
       publicationWait.path("wait_ms").asLong() should be > 0L
-      waitingLocks.find(_.path("lock_kind").asText() == "mv_data").get.path("wait_ms").asLong() shouldBe 0L
+      val waitingData = waitingLocks.find(_.path("lock_kind").asText() == "mv_data").get
+      waitingData.path("mv_key").asText() shouldBe "default.mv_t14a_create_span"
+      waitingData.path("mv_keys").elements().asScala.map(_.asText()).toSeq shouldBe
+        Seq("default.mv_t14a_create_span", "mv_t14a_create_span")
+      waitingData.path("wait_ms").asLong() shouldBe 0L
       waitingCreate.path("same_mv_lock_wait_ms").asLong() shouldBe waitingLocks.map(_.path("wait_ms").asLong()).sum
 
       assertBagEqual("mv_t14a_create_span", createSql)

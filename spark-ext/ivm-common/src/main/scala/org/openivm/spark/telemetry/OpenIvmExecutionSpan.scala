@@ -25,7 +25,8 @@ private[telemetry] final case class LockAcquisitionTelemetry(
     holdMs: Long,
     thread: String,
     dbtNodeId: Option[String],
-    requestId: Option[String]
+    requestId: Option[String],
+    mvKeys: Seq[String]
 )
 
 /** Structured one-line execution-span contract for CREATE / REFRESH MV work. */
@@ -125,7 +126,8 @@ final class OpenIvmExecutionSpan private[telemetry] (
       releasedEpochMs: Long,
       waitMs: Long,
       holdMs: Long,
-      thread: String
+      thread: String,
+      mvKeys: Seq[String] = Seq.empty
   ): Unit =
     recordBeforeEmit {
       val normalizedWaitMs = math.max(0L, waitMs)
@@ -140,7 +142,8 @@ final class OpenIvmExecutionSpan private[telemetry] (
         math.max(0L, holdMs),
         thread,
         dbtNodeId,
-        requestId
+        requestId,
+        mvKeys
       )
       sameMvLockWaitMs = addDuration(sameMvLockWaitMs, normalizedWaitMs)
     }
@@ -571,6 +574,7 @@ object OpenIvmExecutionSpan extends Logging {
     acquisitions.foreach { acquisition =>
       val item = new LinkedHashMap[String, AnyRef]()
       item.put("mv_key", acquisition.mvKey)
+      if (acquisition.mvKeys.nonEmpty) item.put("mv_keys", acquisition.mvKeys.asJava)
       item.put("lock_kind", acquisition.lockKind)
       item.put("mode", acquisition.mode)
       item.put("requested_epoch_ms", java.lang.Long.valueOf(acquisition.requestedEpochMs))
@@ -1254,7 +1258,8 @@ object OpenIvmExecutionSpan extends Logging {
       releasedEpochMs: Long,
       waitMs: Long,
       holdMs: Long,
-      thread: String
+      thread: String,
+      mvKeys: Seq[String] = Seq.empty
   ): Unit =
     Option(current.get()).foreach(
       _.recordLockAcquisition(
@@ -1266,7 +1271,8 @@ object OpenIvmExecutionSpan extends Logging {
         releasedEpochMs,
         waitMs,
         holdMs,
-        thread
+        thread,
+        mvKeys
       )
     )
 

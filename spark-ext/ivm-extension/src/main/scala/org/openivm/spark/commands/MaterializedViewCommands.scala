@@ -67,7 +67,7 @@ import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import java.sql.Timestamp
 import java.util.{Collections, UUID}
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.locks.ReentrantLock
+import java.util.concurrent.locks.{Condition, ReentrantLock}
 import scala.util.control.NonFatal
 
 // ---------------------------------------------------------------------------
@@ -221,6 +221,39 @@ private[spark] object RefreshMutex {
   private case object Read  extends LockMode
   private case object Write extends LockMode
   private final case class LockRequest(key: String, mode: LockMode)
+  private final case class AcquiredLock(
+      key: String,
+      requestedEpochMs: Long,
+      acquiredEpochMs: Long,
+      releasedEpochMs: Long,
+      waitNanos: Long,
+      acquiredNanos: Long,
+      releasedNanos: Long
+  )
+
+  private final class LockSetTelemetry(val mvKey: String, val keys: Set[String]) {
+    private var acquired = Vector.empty[AcquiredLock]
+
+    def add(entry: AcquiredLock): Unit = acquired :+= entry
+
+    def record(): Unit =
+      if (acquired.nonEmpty) {
+        val commonAcquired = acquired.map(_.acquiredNanos).max
+        val commonReleased = acquired.map(_.releasedNanos).min
+        OpenIvmExecutionSpan.recordActiveLockAcquisition(
+          mvKey,
+          "mv_data",
+          "write",
+          acquired.map(_.requestedEpochMs).min,
+          acquired.map(_.acquiredEpochMs).max,
+          acquired.map(_.releasedEpochMs).min,
+          TimeUnit.NANOSECONDS.toMillis(acquired.map(_.waitNanos).sum),
+          TimeUnit.NANOSECONDS.toMillis(math.max(0L, commonReleased - commonAcquired)),
+          Thread.currentThread().getName,
+          acquired.map(_.key).sorted
+        )
+      }
+  }
 
   private val locks: java.util.Map[String, LifecycleReadWriteLock] =
     Collections.synchronizedMap(new java.util.HashMap[String, LifecycleReadWriteLock]())
@@ -254,13 +287,25 @@ private[spark] object RefreshMutex {
   def withLocks[A](
       readKeys: Seq[String],
       writeKeys: Seq[String],
+      targetKeys: Seq[String],
+      telemetryKey: String
+  )(body: => A): A = {
+    val telemetry =
+      new LockSetTelemetry(telemetryKey, targetKeys.map(StreamingDependencyCatalog.lifecycleLockKey).toSet)
+    withLockRequests(readKeys.map(_ -> Read) ++ writeKeys.map(_ -> Write), telemetry = Some(telemetry))(body)
+  }
+
+  def withLocks[A](
+      readKeys: Seq[String],
+      writeKeys: Seq[String],
       deadline: LifecycleDeadline
   )(body: => A): A =
     withLockRequests(readKeys.map(_ -> Read) ++ writeKeys.map(_ -> Write), Some(deadline))(body)
 
   private def withLockRequests[A](
       requested: Seq[(String, LockMode)],
-      deadline: Option[LifecycleDeadline] = None
+      deadline: Option[LifecycleDeadline] = None,
+      telemetry: Option[LockSetTelemetry] = None
   )(body: => A): A = {
     val merged = requested.foldLeft(Map.empty[String, LockMode]) { case (byKey, (rawKey, mode)) =>
       val key        = StreamingDependencyCatalog.lifecycleLockKey(rawKey)
@@ -269,13 +314,19 @@ private[spark] object RefreshMutex {
     }
     val ordered = merged.toSeq.sortBy(_._1).map { case (key, mode) => LockRequest(key, mode) }
     def acquire(remaining: List[LockRequest]): A = remaining match {
-      case LockRequest(key, mode) :: tail => withGuard(key, mode, deadline)(acquire(tail))
+      case LockRequest(key, mode) :: tail => withGuard(key, mode, deadline, telemetry)(acquire(tail))
       case Nil                            => body
     }
-    acquire(ordered.toList)
+    try acquire(ordered.toList)
+    finally telemetry.foreach(_.record())
   }
 
-  private def withGuard[A](mvKey: String, mode: LockMode, deadline: Option[LifecycleDeadline])(
+  private def withGuard[A](
+      mvKey: String,
+      mode: LockMode,
+      deadline: Option[LifecycleDeadline],
+      telemetry: Option[LockSetTelemetry] = None
+  )(
       body: => A
   ): A = {
     val key      = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
@@ -333,20 +384,35 @@ private[spark] object RefreshMutex {
       if (admitted) {
         val releasedAtNanos = System.nanoTime()
         val releasedEpochMs = System.currentTimeMillis()
-        OpenIvmExecutionSpan.recordActiveLockAcquisition(
-          key,
-          "mv_data",
-          mode match {
-            case Read  => "read"
-            case Write => "write"
-          },
-          requestedEpochMs,
-          acquiredEpochMs,
-          releasedEpochMs,
-          TimeUnit.NANOSECONDS.toMillis(acquiredAtNanos - waitStarted),
-          TimeUnit.NANOSECONDS.toMillis(releasedAtNanos - acquiredAtNanos),
-          Thread.currentThread().getName
-        )
+        telemetry.filter(group => mode == Write && group.keys.contains(key)) match {
+          case Some(group) =>
+            group.add(
+              AcquiredLock(
+                key,
+                requestedEpochMs,
+                acquiredEpochMs,
+                releasedEpochMs,
+                acquiredAtNanos - waitStarted,
+                acquiredAtNanos,
+                releasedAtNanos
+              )
+            )
+          case None =>
+            OpenIvmExecutionSpan.recordActiveLockAcquisition(
+              key,
+              "mv_data",
+              mode match {
+                case Read  => "read"
+                case Write => "write"
+              },
+              requestedEpochMs,
+              acquiredEpochMs,
+              releasedEpochMs,
+              TimeUnit.NANOSECONDS.toMillis(acquiredAtNanos - waitStarted),
+              TimeUnit.NANOSECONDS.toMillis(releasedAtNanos - acquiredAtNanos),
+              Thread.currentThread().getName
+            )
+        }
       } else {
         OpenIvmMetrics.RefreshQueued.decrementAndGet()
         OpenIvmMetrics.updateTimer("refresh.lock.wait", System.nanoTime() - waitStarted)
@@ -357,21 +423,38 @@ private[spark] object RefreshMutex {
 
 private[spark] object CreatePublicationMutex {
 
+  private final class PublicationLock extends ReentrantLock(true) {
+    def isConditionWaiter(condition: Condition, thread: Thread): Boolean =
+      getWaitingThreads(condition).contains(thread)
+  }
+
   private final class Guard {
-    val lock                = new ReentrantLock(true)
+    val lock                = new PublicationLock
     val publicationComplete = lock.newCondition()
     var publicationPending  = false
+    var failedPublication   = Option.empty[Option[OpenIvmStateSync.PublicationBinding]]
+  }
+
+  private[commands] final class PublicationAttempt(
+      val previousFailure: Option[Option[OpenIvmStateSync.PublicationBinding]]
+  ) {
+    var binding                      = Option.empty[OpenIvmStateSync.PublicationBinding]
+    var metadataPublicationAttempted = false
   }
 
   private val locks: java.util.Map[String, Guard] =
     Collections.synchronizedMap(new java.util.HashMap[String, Guard]())
 
-  private[commands] def hasQueuedThread(mvKey: String, thread: Thread): Boolean = {
+  private[commands] def hasConditionWaiter(mvKey: String, thread: Thread): Boolean = {
     val key = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
-    Option(locks.get(key)).exists(_.lock.hasQueuedThread(thread))
+    Option(locks.get(key)).exists { guard =>
+      guard.lock.lock()
+      try guard.lock.isConditionWaiter(guard.publicationComplete, thread)
+      finally guard.lock.unlock()
+    }
   }
 
-  def withLock[A](mvKey: String)(body: => A)(afterRelease: => Unit): A = {
+  def withLock[A](mvKey: String)(body: PublicationAttempt => A)(afterRelease: PublicationAttempt => Unit): A = {
     val key      = StreamingDependencyCatalog.lifecycleLockKey(mvKey)
     val existing = locks.get(key)
     val guard =
@@ -390,10 +473,15 @@ private[spark] object CreatePublicationMutex {
     val requestedEpochMs = System.currentTimeMillis()
     guard.lock.lock()
     while (guard.publicationPending) guard.publicationComplete.awaitUninterruptibly()
+    val attempt         = new PublicationAttempt(guard.failedPublication)
     val acquiredAtNanos = System.nanoTime()
     val acquiredEpochMs = System.currentTimeMillis()
-    try body
-    finally {
+    var bodySucceeded   = false
+    try {
+      val result = body(attempt)
+      bodySucceeded = true
+      result
+    } finally {
       guard.publicationPending = true
       guard.lock.unlock()
       val releasedAtNanos = System.nanoTime()
@@ -401,27 +489,34 @@ private[spark] object CreatePublicationMutex {
       val waitMs          = TimeUnit.NANOSECONDS.toMillis(acquiredAtNanos - waitStarted)
       val thread          = Thread.currentThread().getName
       OpenIvmMetrics.updateTimer("refresh.lock.wait", acquiredAtNanos - waitStarted)
-      try
-        OpenIvmExecutionSpan.recordActiveLockAcquisition(
-          key,
-          "create_publication",
-          "write",
-          requestedEpochMs,
-          acquiredEpochMs,
-          releasedEpochMs,
-          waitMs,
-          TimeUnit.NANOSECONDS.toMillis(releasedAtNanos - acquiredAtNanos),
-          thread
-        )
-      finally
-        try afterRelease
-        finally {
-          guard.lock.lock()
-          try {
-            guard.publicationPending = false
-            guard.publicationComplete.signal()
-          } finally guard.lock.unlock()
-        }
+      var publicationSucceeded = false
+      try {
+        try
+          OpenIvmExecutionSpan.recordActiveLockAcquisition(
+            key,
+            "create_publication",
+            "write",
+            requestedEpochMs,
+            acquiredEpochMs,
+            releasedEpochMs,
+            waitMs,
+            TimeUnit.NANOSECONDS.toMillis(releasedAtNanos - acquiredAtNanos),
+            thread
+          )
+        finally afterRelease(attempt)
+        publicationSucceeded = bodySucceeded
+      } finally {
+        guard.lock.lock()
+        try {
+          guard.failedPublication =
+            if (publicationSucceeded) None
+            else if (bodySucceeded || attempt.metadataPublicationAttempted)
+              Some(attempt.binding.orElse(attempt.previousFailure.flatten))
+            else attempt.previousFailure
+          guard.publicationPending = false
+          guard.publicationComplete.signal()
+        } finally guard.lock.unlock()
+      }
     }
   }
 }
@@ -2929,6 +3024,7 @@ case class CreateMaterializedViewCommand(
       RefreshSqlLog.start(spark, profile.refreshId, commandName, RefreshSqlLog.ModeCreate)
     var createOutcome               = "create_failed"
     var createFinalizationAttempted = false
+    var pendingCreateOutcome        = Option.empty[String]
     var createInsightClassification =
       Option.empty[OpenIvmMaterializedViewInsightEvents.Classification]
 
@@ -2954,7 +3050,14 @@ case class CreateMaterializedViewCommand(
       durationMs = -1L
     )
     val createLockKeys = (mvLockKeys(spark, name, MvCatalog.lookup(spark, name)) :+ metaName(name)).distinct
-    CreatePublicationMutex.withLock(metaName(MvCatalog.qualifiedName(spark, name))) {
+    CreatePublicationMutex.withLock(metaName(MvCatalog.qualifiedName(spark, name))) { publication =>
+      publication.previousFailure.foreach { previous =>
+        val required = previous.getOrElse {
+          throw new java.io.IOException("CREATE publication has no verified retry binding")
+        }
+        if (OpenIvmStateSync.publicationBinding(spark) != required)
+          throw new java.io.IOException("CREATE publication retry binding does not match the failed publication")
+      }
       val createUpstreamReadKeys = profile.timeObservedStep("create_guard_discovery") {
         org.apache.spark.sql.openivm.SparkSessionAccess.withIsolatedSession(spark) { isolated =>
           MvCatalog.ensureTables(isolated)
@@ -2971,7 +3074,12 @@ case class CreateMaterializedViewCommand(
         }
       }
       val lockWaitT0 = System.nanoTime()
-      val outcome = RefreshMutex.withLocks(createUpstreamReadKeys, createLockKeys) {
+      val outcome = RefreshMutex.withLocks(
+        createUpstreamReadKeys,
+        createLockKeys,
+        createLockKeys,
+        metaName(MvCatalog.qualifiedName(spark, name))
+      ) {
         val threadName = Thread.currentThread().getName
         val lockAcqMs  = (System.nanoTime() - lockWaitT0) / 1000000L
         profile.appendStep("acquire_locks", s"thread=$threadName", lockAcqMs)
@@ -2991,31 +3099,47 @@ case class CreateMaterializedViewCommand(
                 profile,
                 sqlLog,
                 createUpstreamReadKeys.toSet,
-                classification => createInsightClassification = Some(classification)
+                classification => createInsightClassification = Some(classification),
+                () => publication.metadataPublicationAttempted = true
               )
             }
           } finally OpenIvmMetrics.CreateInflight.decrementAndGet()
         }
       }
-      // An existing view is only looked up; there is no state change to publish.
-      if (outcome != "create_already_exists" || OpenIvmStateSync.guardedSqlEnabled(spark))
-        OpenIvmStateSync.backupForCommand(spark)
-      createOutcome = outcome
-      if (outcome == "create_executed")
-        createInsightClassification.foreach { classification =>
-          OpenIvmMaterializedViewInsightEvents.createCompleted(
-            spark,
-            profile.refreshId,
-            commandName,
-            classification
-          )
-        }
+      pendingCreateOutcome = Some(outcome)
       Seq.empty[org.apache.spark.sql.Row]
-    } {
-      try finalizeCreate()
-      finally {
-        sqlLog.finish(createOutcome)
-        OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+    } { publication =>
+      try {
+        pendingCreateOutcome.foreach { outcome =>
+          val retry = publication.previousFailure.map(_.getOrElse {
+            throw new java.io.IOException("CREATE publication has no verified retry binding")
+          })
+          if (retry.isDefined || outcome != "create_already_exists" || OpenIvmStateSync.guardedSqlEnabled(spark)) {
+            if (retry.isDefined || !FeatureGate.stateSyncAsyncEnabled(spark)) {
+              val binding = OpenIvmStateSync.publicationBinding(spark)
+              if (retry.exists(_ != binding))
+                throw new java.io.IOException("CREATE publication retry binding does not match the failed publication")
+              publication.binding = Some(binding)
+              OpenIvmStateSync.backupNowBound(spark, binding)
+            } else OpenIvmStateSync.backupForCommand(spark)
+          }
+          createOutcome = outcome
+          if (outcome == "create_executed")
+            createInsightClassification.foreach { classification =>
+              OpenIvmMaterializedViewInsightEvents.createCompleted(
+                spark,
+                profile.refreshId,
+                commandName,
+                classification
+              )
+            }
+        }
+      } finally {
+        try finalizeCreate()
+        finally {
+          sqlLog.finish(createOutcome)
+          OpenIvmExecutionSpan.finishActive("failed_before_end", Thread.currentThread().getName)
+        }
       }
     }
   }
@@ -3025,7 +3149,8 @@ case class CreateMaterializedViewCommand(
       profile: RefreshProfile,
       sqlLog: RefreshSqlLog,
       expectedUpstreamMvLockKeys: Set[String],
-      recordInsightClassification: OpenIvmMaterializedViewInsightEvents.Classification => Unit
+      recordInsightClassification: OpenIvmMaterializedViewInsightEvents.Classification => Unit,
+      beforeMetadataPublication: () => Unit
   ): String = {
     import MvCommandHelper._
 
@@ -4020,6 +4145,7 @@ case class CreateMaterializedViewCommand(
           // queue behind the concurrent Delta data writes for a task slot.
           val version = DeltaTableVersion.requireLatest(spark, dataLocation)
           OpenIvmStateBarrier.withMutation(spark) {
+            beforeMetadataPublication()
             groupedInitial.foreach { initial =>
               profile.timeStep("create_grouped_window_commit", s"version=$version") {
                 initial.commit(dataLocation, version)
@@ -4350,7 +4476,12 @@ case class RefreshMaterializedViewCommand(
         }
         .getOrElse(Seq.empty)
       val writeKeys = viewLockKeys ++ downstreamWriteKeys
-      val rows = RefreshMutex.withLocks(upstreamMvSourceKeys, writeKeys) {
+      val rows = RefreshMutex.withLocks(
+        upstreamMvSourceKeys,
+        writeKeys,
+        viewLockKeys,
+        metaName(MvCatalog.qualifiedName(spark, name))
+      ) {
         val currentMeta = MvCatalog.lookupForRelation(spark, name)
         if (currentMeta.exists(meta => !viewLockKeys.contains(metaName(meta.name))))
           throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} changed while acquiring locks")

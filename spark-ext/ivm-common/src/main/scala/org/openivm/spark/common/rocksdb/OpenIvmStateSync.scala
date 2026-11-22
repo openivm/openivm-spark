@@ -913,6 +913,28 @@ object OpenIvmStateSync {
       }
     }
 
+  private[openivm] final case class PublicationBinding(
+      context: SparkContext,
+      localRoot: String,
+      destination: Option[String],
+      guarded: Boolean
+  )
+
+  private[openivm] def publicationBinding(spark: SparkSession): PublicationBinding =
+    guardedBinding(spark) match {
+      case Some(binding) =>
+        PublicationBinding(spark.sparkContext, binding.root, Some(binding.store.canonicalRoot), guarded = true)
+      case None =>
+        PublicationBinding(spark.sparkContext, canonicalLocalRoot(spark), stateSyncUri(spark), guarded = false)
+    }
+
+  private def verifyPublicationBinding(
+      actual: PublicationBinding,
+      expected: PublicationBinding
+  ): Unit =
+    if (expected != actual)
+      throw new java.io.IOException("state-sync publication binding changed; refusing CREATE retry")
+
   private[rocksdb] def guardedUri(spark: SparkSession): Option[String] =
     spark.sparkContext.getConf.getOption(FeatureGate.GuardedStateSyncUriKey)
 
@@ -1119,9 +1141,20 @@ object OpenIvmStateSync {
     }
 
   /** Synchronously publish a snapshot covering this request's committed state. */
-  def backupNow(spark: SparkSession): Unit = {
+  def backupNow(spark: SparkSession): Unit = backupNowImpl(spark, None)
+
+  private[openivm] def backupNowBound(spark: SparkSession, binding: PublicationBinding): Unit =
+    backupNowImpl(spark, Some(binding))
+
+  private def backupNowImpl(spark: SparkSession, expected: Option[PublicationBinding]): Unit = {
     guardedBinding(spark) match {
       case Some(binding) =>
+        expected.foreach { required =>
+          verifyPublicationBinding(
+            PublicationBinding(spark.sparkContext, binding.root, Some(binding.store.canonicalRoot), guarded = true),
+            required
+          )
+        }
         restoreGuardedOnce(spark, binding)
         val span    = OpenIvmExecutionSpan.captureCurrent()
         val started = System.nanoTime()
@@ -1157,10 +1190,16 @@ object OpenIvmStateSync {
         return
       case None => ()
     }
-    val uri = stateSyncUri(spark)
-      .getOrElse(
-        return
+    val selectedUri = stateSyncUri(spark)
+    expected.foreach { required =>
+      verifyPublicationBinding(
+        PublicationBinding(spark.sparkContext, canonicalLocalRoot(spark), selectedUri, guarded = false),
+        required
       )
+    }
+    val uri = selectedUri.getOrElse(
+      return
+    )
     val key               = effectiveStateSyncKey(spark, uri)
     val sharedDestination = registerRootForUri(uri, canonicalLocalRoot(spark))
     val request           = newBackupRequest(spark, "synchronous")
