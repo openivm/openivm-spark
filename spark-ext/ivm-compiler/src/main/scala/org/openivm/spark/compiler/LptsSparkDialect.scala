@@ -139,22 +139,22 @@ object LptsSparkDialect {
     *     sees the exact string-literal content Spark's parser will receive.
     */
   def translate(sql: String): String = {
-    val qualified = SparkFunctionShimSql.rewriteQualifiedSystemIntervals(sql)
-    val predicates = rewriteWhereBooleanColumn(qualified)
+    val qualified   = SparkFunctionShimSql.rewriteQualifiedSystemIntervals(sql)
+    val predicates  = rewriteWhereBooleanColumn(qualified)
     val unqualified = stripNativeBuiltinQualification(predicates)
-    val castTypes = rewriteQuotedCastTypes(unqualified)
-    val windows = SparkFunctionShimSql.rewriteOffsetWindowFrames(castTypes)
-    val operators = rewriteNowTimestamp(rewriteLikeOperators(windows))
-    val offsets = SparkFunctionShimSql.restoreWindowOffsetLiterals(operators)
-    val structs = SparkFunctionShimSql.restoreStructMaxBy(offsets)
-    val functions = rewriteSparkFunctionInlinings(rewriteToTimestampDoubleCast(structs))
+    val castTypes   = rewriteQuotedCastTypes(unqualified)
+    val windows     = SparkFunctionShimSql.rewriteOffsetWindowFrames(castTypes)
+    val operators   = rewriteNowTimestamp(rewriteLikeOperators(windows))
+    val offsets     = SparkFunctionShimSql.restoreWindowOffsetLiterals(operators)
+    val structs     = SparkFunctionShimSql.restoreStructMaxBy(offsets)
+    val functions   = rewriteSparkFunctionInlinings(rewriteToTimestampDoubleCast(structs))
     val expressions = rewriteStructExtract(rewriteTimestampWithTimeZone(functions))
-    val casts = rewriteBareHugeIntCast(rewriteBareVarcharCast(rewritePostfixCasts(expressions)))
+    val casts       = rewriteBareHugeIntCast(rewriteBareVarcharCast(rewritePostfixCasts(expressions)))
     val intervals = rewriteIntervalLiterals(
       rewriteToTemporalUnit(rewriteNativeMicrosecondInterval(rewriteGenerateSeries(casts)))
     )
     val identifiers = rewriteDoubleQuotedIdentifiers(rewriteErrorFn(rewriteCountStar(intervals)))
-    val translated = rewriteBareBackslashLiterals(rewriteTrimTwoArg(rewriteNativeInfinityAndTrim(identifiers)))
+    val translated  = rewriteBareBackslashLiterals(rewriteTrimTwoArg(rewriteNativeInfinityAndTrim(identifiers)))
     deduplicateAntiJoinProjectionInputs(rewriteParenthesizedBareWhere(translated))
   }
 

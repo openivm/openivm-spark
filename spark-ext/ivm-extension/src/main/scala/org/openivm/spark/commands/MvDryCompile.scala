@@ -4,12 +4,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.types.StructType
 import org.openivm.spark.common._
-import org.openivm.spark.compiler.{
-  CompiledRefresh,
-  CompileRequest,
-  LptsSparkDialect,
-  SparkTimeTravelSql
-}
+import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, LptsSparkDialect, SparkTimeTravelSql}
 
 /**
  * Session-scoped "cold DAG" registry for dry-run materialized views.

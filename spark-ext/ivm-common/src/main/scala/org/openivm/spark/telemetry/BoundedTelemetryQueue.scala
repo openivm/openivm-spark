@@ -109,8 +109,9 @@ final class BoundedTelemetryQueue private[telemetry] (
   def awaitDrain(timeoutMs: Long): Boolean = {
     require(timeoutMs >= 0L)
     gate.lock()
-    val target = try accepted.get()
-    finally gate.unlock()
+    val target =
+      try accepted.get()
+      finally gate.unlock()
     val started = System.nanoTime()
     val timeout = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
     while (published.get() + failures.get() < target && worker.isAlive && System.nanoTime() - started < timeout) {

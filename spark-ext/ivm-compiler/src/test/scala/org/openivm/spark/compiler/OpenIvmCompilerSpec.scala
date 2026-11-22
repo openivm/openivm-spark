@@ -1240,19 +1240,23 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       "orders"   -> DeltaShape.InsertOnly,
       "products" -> DeltaShape.Unchanged
     )
-    sharedCompiler.compilerSourceFacts(
-      req.copy(facts = WorkloadFacts(deltaShape = Map("other.products" -> DeltaShape.Unchanged)))
-    ).deltaShape shouldBe empty
-    sharedCompiler.compilerSourceFacts(
-      req.copy(facts =
-        WorkloadFacts(deltaShape =
-          Map(
-            "catalog.sales.products" -> DeltaShape.Unchanged,
-            "products"               -> DeltaShape.InsertOnly
+    sharedCompiler
+      .compilerSourceFacts(
+        req.copy(facts = WorkloadFacts(deltaShape = Map("other.products" -> DeltaShape.Unchanged)))
+      )
+      .deltaShape shouldBe empty
+    sharedCompiler
+      .compilerSourceFacts(
+        req.copy(facts =
+          WorkloadFacts(deltaShape =
+            Map(
+              "catalog.sales.products" -> DeltaShape.Unchanged,
+              "products"               -> DeltaShape.InsertOnly
+            )
           )
         )
       )
-    ).deltaShape shouldBe Map("products" -> DeltaShape.General)
+      .deltaShape shouldBe Map("products" -> DeltaShape.General)
 
     val compiled = sharedCompiler.compile(req)
     compiled.refreshTypeName shouldBe "SIMPLE_PROJECTION"

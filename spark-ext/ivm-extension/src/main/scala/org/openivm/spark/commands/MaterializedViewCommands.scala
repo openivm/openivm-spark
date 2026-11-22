@@ -41,12 +41,7 @@ import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StringType, Str
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.{OpenIvmStateBarrier, OpenIvmStateSync}
-import org.openivm.spark.compiler.{
-  CompiledRefresh,
-  CompileRequest,
-  OpenIvmCompiler,
-  SparkTimeTravelSql
-}
+import org.openivm.spark.compiler.{CompiledRefresh, CompileRequest, OpenIvmCompiler, SparkTimeTravelSql}
 import org.openivm.spark.insights.OpenIvmInsightsBroker
 import org.openivm.spark.streaming.{
   StreamingInsightEvents,

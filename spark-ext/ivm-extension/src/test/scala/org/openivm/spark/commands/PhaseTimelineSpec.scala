@@ -30,9 +30,11 @@ class PhaseTimelineSpec extends AnyFunSpec with Matchers {
     }
 
     val mapper = new ObjectMapper()
-    val rows = events.map(line => mapper.readTree(line))
+    val rows = events
+      .map(line => mapper.readTree(line))
       .filter(_.get("event_type").asText() == "phase")
-      .map(row => row.get("phase").asText() -> row).toMap
+      .map(row => row.get("phase").asText() -> row)
+      .toMap
     rows("outer").get("inclusive_ns").asLong() shouldBe 100L
     rows("outer").get("exclusive_ns").asLong() shouldBe 60L
     rows("middle").get("inclusive_ns").asLong() shouldBe 20L

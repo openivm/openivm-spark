@@ -103,7 +103,7 @@ class BoundedTelemetryQueueSpec extends AnyFunSpec with Matchers {
         val entered = new CountDownLatch(1)
         val release = new CountDownLatch(1)
         val writer = new BoundedTelemetryQueue.Writer {
-          override def record(line: String): Unit = { entered.countDown(); release.await(); () }
+          override def record(line: String): Unit    = { entered.countDown(); release.await(); () }
           override def manifest(value: String): Unit = ()
         }
         val q = new BoundedTelemetryQueue(2, 100, writer)

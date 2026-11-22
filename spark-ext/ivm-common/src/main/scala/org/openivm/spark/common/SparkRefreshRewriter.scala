@@ -867,7 +867,7 @@ object SparkRefreshRewriter {
         withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
       // These final passes preserve output order and cardinality.
       val withPublishedSnapshotReuse = reuseFullyReplacedTargetInCascade(withSemiJoinRewrite, mvName, viewLogicalName)
-      val finalStatements = withPublishedSnapshotReuse.map(postProcess)
+      val finalStatements            = withPublishedSnapshotReuse.map(postProcess)
       lineageCapture match {
         case None => RewrittenRefresh(finalStatements, hasRunningWindowProgram = hasRunningWindowProgram)
         case Some(_) =>

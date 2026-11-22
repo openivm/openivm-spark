@@ -205,9 +205,9 @@ private[compiler] object SparkFunctionShimSql {
         if (add.region(i, sql.length).lookingAt()) {
           parseFunctionCall(sql, add.end()).filter(_.topLevelCommaCount == 1).flatMap { call =>
             splitTopLevelArgs(sql, call).collect { case Seq(left, right) =>
-              val original = sql.substring(i, call.closeParen + 1)
+              val original    = sql.substring(i, call.closeParen + 1)
               val unqualified = LptsSparkDialect.stripNativeBuiltinQualification(original)
-              val precise = LptsSparkDialect.rewriteNativeMicrosecondInterval(unqualified)
+              val precise     = LptsSparkDialect.rewriteNativeMicrosecondInterval(unqualified)
               if (precise != unqualified) (call.closeParen + 1, precise)
               else {
                 val lhs = rewriteQualifiedSystemIntervals(sql.substring(left._1, left._2).trim)
@@ -230,6 +230,7 @@ private[compiler] object SparkFunctionShimSql {
   }
 
   private val OffsetWindowFunction = "(?i)(?:lag|lead)".r.pattern
+
   /** DuckDB serializes a frame for LAG/LEAD even though these functions do
     * not use it. Spark rejects any explicit frame on either function.
     */
