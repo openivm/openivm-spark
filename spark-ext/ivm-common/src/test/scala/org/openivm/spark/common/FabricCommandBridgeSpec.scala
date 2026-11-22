@@ -40,7 +40,10 @@ object FabricCommandProbe {
         Array(classOf[ParserInterface]),
         new InvocationHandler {
           override def invoke(proxy: Any, method: Method, args: Array[AnyRef]): AnyRef =
-            if (method.getName == "parsePlan" && args(0).toString.startsWith("FABRIC PROBE "))
+            if (
+              (method.getName == "parsePlan" || method.getName == "parsePlanWithParameters") &&
+              args(0).toString.startsWith("FABRIC PROBE ")
+            )
               FabricCommandProbeCommand(args(0).toString.endsWith("FAIL"), args(0).toString.endsWith("WAIT"))
             else
               try method.invoke(delegate, args: _*)
