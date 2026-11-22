@@ -7,9 +7,11 @@ import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.commands.RefreshSqlLog
 import org.openivm.spark.common.{CdfWatermarkCatalog, FeatureGate, MvCatalog, RefreshSqlLogRow, RefreshTypeCode}
+import org.openivm.spark.telemetry.BoundedTelemetryRuntime
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -39,6 +41,9 @@ private[rocksdb] object CdfFinalizationCrashProbe {
       .master("local[1]")
       .appName(s"cdf-finalization-crash-$phase")
       .config("spark.ui.enabled", "false")
+      .config("spark.plugins", "org.openivm.spark.plugin.metrics.OpenIvmMetricsPlugin")
+      .config("spark.openivm.telemetry.queue.enabled", "true")
+      .config("spark.openivm.telemetry.queue.localUri", root.resolve("phase-events").toUri.toString)
       .config("spark.driver.host", "localhost")
       .config("spark.driver.bindAddress", "127.0.0.1")
       .config("spark.sql.shuffle.partitions", "1")
@@ -119,6 +124,30 @@ private[rocksdb] object CdfFinalizationCrashProbe {
             stack.exists(_.getMethodName.contains("postRefreshCleanup"))
           ) {
             val (log, rows) = activeRefreshLog()
+            require(BoundedTelemetryRuntime.awaitDrain(10000L), "live phase queue did not drain")
+            val paths = Files.list(root.resolve("phase-events"))
+            val events = try {
+              val mapper = new ObjectMapper()
+              paths.iterator().asScala
+                .filter(_.getFileName.toString.endsWith(".jsonl"))
+                .map(path => mapper.readTree(path.toFile))
+                .toVector
+            } finally paths.close()
+            val starts = events.filter(event =>
+              event.path("event_type").asText() == "phase_started" &&
+                event.path("refresh_id").asText() == log.refreshId &&
+                event.path("request_id").asText() == "cdf-crash-live" &&
+                event.path("phase").asText() == "finalize_mark_consumed"
+            )
+            require(starts.size == 1, "the running refresh did not publish its correlated phase start")
+            require(
+              !events.exists(event =>
+                event.path("event_type").asText() == "phase" &&
+                  event.path("refresh_id").asText() == log.refreshId &&
+                  event.path("phase_id").asLong() == starts.head.path("phase_id").asLong()
+              ),
+              "the refresh phase ended before the live observation"
+            )
             val merge = rows.filter { row =>
               val sql = row.sqlText.toUpperCase(java.util.Locale.ROOT)
               row.refreshId == log.refreshId && row.mode == "refresh" && row.category == "rewritten_stmt" &&
@@ -136,6 +165,7 @@ private[rocksdb] object CdfFinalizationCrashProbe {
             Runtime.getRuntime.halt(if (merge.nonEmpty && full.isEmpty) 73 else 74)
           }
         }
+        spark.sparkContext.setLocalProperty("openivm.request_id", "cdf-crash-live")
         sql(s"REFRESH MATERIALIZED VIEW $mv")
         sys.error("Expected the CDF finalization crash hook to fire")
       } else {

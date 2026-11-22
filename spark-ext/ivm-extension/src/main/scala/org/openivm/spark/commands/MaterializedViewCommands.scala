@@ -6443,29 +6443,33 @@ case class RefreshMaterializedViewCommand(
           cached.getOrElse {
             val fresh = sessionCompiler.compiler.compile(compileRequest, profile.compilerTrace)
             if (reuseInSession) sessionCompiler.rememberRefresh(compileRequest, fresh)
-            if (compileCacheEnabled && fresh.sql.nonEmpty) {
-              val backfilled = refreshProperties ++
-                MvMetadata.compiledProperties(
-                  meta.sourceSchemaFingerprint,
-                  compileCacheTier,
-                  fresh.sql,
-                  fresh.initialLoadSql,
-                  fresh.refreshType,
-                  fresh.refreshTypeName
-                )
-              try {
-                MvCatalog.updateProperties(spark, name, backfilled)
-                refreshProperties = backfilled
-              } catch {
-                case t: Throwable =>
-                  logWarning(
-                    s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
-                      s"${t.getClass.getName}: ${t.getMessage}"
-                  )
-              }
-            }
             fresh
           }
+        }
+      }
+      // Persist cache-generation invalidation even when the per-session LRU
+      // supplied the program. Otherwise stale persisted entries survive a
+      // successful refresh and the metadata continues advertising the old
+      // compiler generation.
+      if (compileCacheEnabled && compiled.sql.nonEmpty && (cached.isEmpty || refreshProperties != meta.properties)) {
+        val backfilled = refreshProperties ++
+          MvMetadata.compiledProperties(
+            meta.sourceSchemaFingerprint,
+            compileCacheTier,
+            compiled.sql,
+            compiled.initialLoadSql,
+            compiled.refreshType,
+            compiled.refreshTypeName
+          )
+        try {
+          MvCatalog.updateProperties(spark, name, backfilled)
+          refreshProperties = backfilled
+        } catch {
+          case t: Throwable =>
+            logWarning(
+              s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
+                s"${t.getClass.getName}: ${t.getMessage}"
+            )
         }
       }
       if (profile.isActive && sqlLog.isActive) {
@@ -9721,7 +9725,16 @@ case class RefreshMaterializedViewCommand(
     profile.timeObservedStep("finalize_catalog_advance") {
       replacementMeta match {
         case Some(updated) => MvCatalog.upsert(spark, updated.copy(lastVersion = newVersion))
-        case None          => MvCatalog.advance(spark, name, newVersion)
+        case None if propagation.mode == ChangeFeedMode.Cdf =>
+          val cdfWatermarks = changeBatches
+            .collect {
+              case batch: CdfChangeBatch           => batch.baseTable -> batch.endVersionInclusive
+              case batch: SourceVersionChangeBatch => batch.baseTable -> batch.endVersionInclusive
+            }
+            .groupBy(_._1)
+            .map { case (baseTable, versions) => baseTable -> versions.map(_._2).max }
+          MvCatalog.advanceWithCdfWatermarks(spark, name, newVersion, cdfWatermarks)
+        case None => MvCatalog.advance(spark, name, newVersion)
       }
     }
 

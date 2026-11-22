@@ -72,6 +72,22 @@ class SparkExpressionMarkerSpec extends AnyFlatSpec with Matchers {
       s"unnest(sequence(start_date, end_date, $step))"
   }
 
+  it should "restore date generator steps after native interval translation" in {
+    val bridge = new SparkExpressionMarker(opaque = true)
+    val start  = bridge.encode(Seq("start_date"), DateBound)(_.head)
+    val end    = bridge.encode(Seq("end_date"), DateBound)(_.head)
+    val steps = Seq(
+      "`add`(`add`(((0) * INTERVAL 1 MONTH), ((1) * INTERVAL 1 DAY)), to_microseconds(CAST(0 AS BIGINT)))",
+      "add(add(to_months(0), to_days(1)), to_microseconds(CAST(0 AS BIGINT)))",
+      """"system".main."add"("system".main."add"("system".main.to_months(0), "system".main.to_days(1)), "system".main.to_microseconds(CAST(0 AS BIGINT)))"""
+    )
+    steps.foreach { step =>
+      val sql = s"unnest(generate_series(CAST($start AS TIMESTAMP), CAST($end AS TIMESTAMP), $step))"
+      bridge.restore(LptsSparkDialect.translate(sql)) shouldBe "explode(sequence(start_date, end_date, INTERVAL 1 DAY))"
+    }
+    bridge.requireAllSeen()
+  }
+
   it should "reject missing or malformed markers" in {
     val bridge = new SparkExpressionMarker
     val marker = bridge.encode(Seq("'Ä'", "'(?i)ä'"), Boolean)(args => s"regexp_like(${args.mkString(", ")})")

@@ -90,11 +90,9 @@ private[spark] final class SparkExpressionMarker(opaque: Boolean = false, stable
                 seq.end == arg.length && seq.args.size == 3 && seq.args.take(2).forall(dateBound(_).isDefined)
               )
               .map { seq =>
-                val nativeStep = seq.args(2).replaceAll("\\s+", "")
-                val oneDay =
-                  "`add`(`add`(((0)*INTERVAL1MONTH),((1)*INTERVAL1DAY)),to_microseconds(CAST(0ASBIGINT)))"
+                val nativeStep = normalizeDateGeneratorStep(seq.args(2))
                 val sequence =
-                  if (nativeStep.equalsIgnoreCase(oneDay))
+                  if (oneDayGeneratorSteps.contains(nativeStep))
                     s"sequence(${seq.args.take(2).map(restore).mkString(", ")}, INTERVAL 1 DAY)"
                   else restore(arg)
                 unnest.end -> s"explode($sequence)"
@@ -237,6 +235,23 @@ private[compiler] object SparkExpressionMarker {
 
   private final case class Marker(arity: Int, result: ResultType, render: Seq[String] => String)
   private final case class Call(end: Int, args: Seq[String])
+  private def normalizeDateGeneratorStep(sql: String): String =
+    sql.replaceAll("\\s+", "").toLowerCase(java.util.Locale.ROOT)
+
+  private lazy val oneDayGeneratorSteps: Set[String] = {
+    val legacy = "`add`(`add`(((0)*INTERVAL 1 MONTH),((1)*INTERVAL 1 DAY)),to_microseconds(CAST(0 AS BIGINT)))"
+    val native = "add(add(to_months(0),to_days(1)),to_microseconds(CAST(0 AS BIGINT)))"
+    val qualified =
+      """"system".main."add"("system".main."add"("system".main.to_months(0),"system".main.to_days(1)),"system".main.to_microseconds(CAST(0 AS BIGINT)))"""
+    Seq(
+      legacy,
+      LptsSparkDialect.translate(legacy),
+      LptsSparkDialect.translate(native),
+      LptsSparkDialect.translate(native.replace("add(", "\"add\"(")),
+      LptsSparkDialect.translate(qualified)
+    ).map(normalizeDateGeneratorStep).toSet
+  }
+
   private val NativeNamedArgument =
     """(?s)^\s*(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+"|`(?:[^`]|``)+`)\s*:=\s*(.*)$""".r
 
