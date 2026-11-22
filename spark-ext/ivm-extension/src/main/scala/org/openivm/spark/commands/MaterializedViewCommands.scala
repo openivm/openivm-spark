@@ -6427,7 +6427,14 @@ case class RefreshMaterializedViewCommand(
               .getOrElse("")
           )
         else None
-      val cached = persisted.orElse(if (reuseInSession) sessionCompiler.cachedRefresh(compileRequest) else None)
+      // With the persisted cache enabled, its exact request tier is authoritative:
+      // falling back to the session LRU on a persisted miss would mask invalidated
+      // or legacy-tier entries and report a cache hit without migrating the key.
+      val cached =
+        persisted.orElse(
+          if (reuseInSession && !compileCacheEnabled) sessionCompiler.cachedRefresh(compileRequest)
+          else None
+        )
       val compileCacheHit = cached.isDefined
       OpenIvmMetrics.recordCompileCache(compileCacheHit)
       val compiled = profile.timeStep(
