@@ -185,9 +185,10 @@ final class CdfChangePropagation extends ChangePropagation {
   /**
    * Per-(view, source) last-consumed Delta version: take the greater of the
    * separate watermark catalog and the version committed with MV metadata.
-   * Repair a lagging watermark catalog from that durable metadata before
-   * collecting changes. A source with neither (e.g. a view created under intercept
-   * mode) is absent; [[collectChanges]] reports it as a batch without a
+   * Repair an existing lagging watermark from durable metadata before collecting
+   * changes. Missing catalog entries can be untouched baselines; use metadata
+   * without creating an entry for those sources. A source with neither (e.g. a
+   * view created under intercept mode) is absent; [[collectChanges]] reports it as a batch without a
    * baseline, which REFRESH recomputes and re-baselines rather than
    * replaying the whole change feed onto the view's rows.
    */
@@ -200,7 +201,7 @@ final class CdfChangePropagation extends ChangePropagation {
     val liveBySource = CdfWatermarkCatalog.getAll(spark, viewName, sources)
     val lagging = sources.distinct.flatMap { src =>
       persisted.get(src).collect {
-        case ChangeWatermark.DeltaVersion(version) if liveBySource.get(src).forall(_ < version) => src -> version
+        case ChangeWatermark.DeltaVersion(version) if liveBySource.get(src).exists(_ < version) => src -> version
       }
     }.toMap
     if (lagging.nonEmpty) CdfWatermarkCatalog.putAll(spark, viewName, lagging)
