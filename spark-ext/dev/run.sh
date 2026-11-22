@@ -236,6 +236,7 @@ prepare_sbt() {
         "$PROJECT_DIR/ivm-extension/target/scala-2.13"
     select_java_runtime
     configure_native_artifacts
+    export PYTHONPATH="/opt/openivm-py4j/$OPENIVM_SPARK_TARGET${PYTHONPATH:+:$PYTHONPATH}"
     if [[ "$needs_native" == "1" ]]; then
         require_native_artifacts
     fi

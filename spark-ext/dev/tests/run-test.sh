@@ -43,6 +43,7 @@ cat >"$WORK_DIR/bin/sbt" <<'EOF'
     printf 'cli=%s\n' "$OPENIVM_CLI_PATH"
     printf 'extension=%s\n' "$OPENIVM_EXTENSION_PATH"
     printf 'sbt_opts=%s\n' "$SBT_OPTS"
+    printf 'pythonpath=%s\n' "$PYTHONPATH"
 } >"$DIRECT_RUNNER_CAPTURE.env"
 printf '%s\n' "$@" >"$DIRECT_RUNNER_CAPTURE.args"
 exit "${DIRECT_RUNNER_FAKE_RC:-0}"
@@ -77,6 +78,7 @@ OPENIVM_NATIVE_DIR="$WORK_DIR/native" \
 OPENIVM_TEST_FORKS=3 \
 OPENIVM_TEST_LOG_ROOT="$WORK_DIR/logs" \
 OPENIVM_TEST_LOG_TIMESTAMP=20261001-152913 \
+PYTHONPATH=/existing/python \
 DIRECT_RUNNER_CAPTURE="$CAPTURE" \
     "$RUNNER" --target spark-3.5 --skip-pins-sync verify -Dprobe=true \
     >"$WORK_DIR/verify.stdout"
@@ -100,6 +102,7 @@ cmp "$WORK_DIR/expected.args" "$CAPTURE.args"
 grep -Fqx "target=spark-3.5" "$CAPTURE.env"
 grep -Fqx "java_home=$WORK_DIR/jdk" "$CAPTURE.env"
 grep -Fqx "native_dir=$WORK_DIR/native" "$CAPTURE.env"
+grep -Fqx "pythonpath=/opt/openivm-py4j/spark-3.5:/existing/python" "$CAPTURE.env"
 grep -Fq -- "-Dopenivm.test.forks=3" "$CAPTURE.env"
 grep -Fq -- "-Dopenivm.test.log.dir=$WORK_DIR/logs/test-20261001-152913" "$CAPTURE.env"
 [[ -d "$WORK_DIR/logs/test-20261001-152913" ]]
@@ -118,10 +121,12 @@ TARGET=spark-4.1 \
 OPENIVM_JAVA_HOME_SPARK_41="$WORK_DIR/jdk21" \
 OPENIVM_SBT_BIN="$WORK_DIR/bin/sbt" \
 OPENIVM_NATIVE_DIR="$WORK_DIR/native" \
+PYTHONPATH=/existing/python \
 DIRECT_RUNNER_CAPTURE="$WORK_DIR/build41" \
     "$RUNNER" build >"$WORK_DIR/build41.stdout"
 grep -Fqx "target=spark-4.1" "$WORK_DIR/build41.env"
 grep -Fqx "java_home=$WORK_DIR/jdk21" "$WORK_DIR/build41.env"
+grep -Fqx "pythonpath=/opt/openivm-py4j/spark-4.1:/existing/python" "$WORK_DIR/build41.env"
 grep -Fqx "compile" "$WORK_DIR/build41.args"
 
 printf 'a.Test\nb.Test\n' >"$WORK_DIR/inventory/spark-3.5.txt"
