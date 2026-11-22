@@ -7717,8 +7717,12 @@ case class RefreshMaterializedViewCommand(
                   }
                 }
               var windowCascadeMergePlan: Option[WindowCascadeMergePlan] = None
+              val globalWindowSnapshotTarget =
+                if (windowSinglePassPlan.isDefined && rewrittenSql.exists(isWholeWindowDeleteSql(_, mergeTargetId)))
+                  Some(mergeTargetId)
+                else None
               val windowCascadeCtasIdx =
-                rewrittenSql.indexWhere(isRawWindowSnapshotCtas(_, viewDeltaPath))
+                rewrittenSql.indexWhere(isRawWindowSnapshotCtas(_, viewDeltaPath, globalWindowSnapshotTarget))
               val windowInsertIdx = rewrittenSql.indexWhere(isWindowNewSnapshotInsertSql(_, mergeTargetId))
               def useCascadeFirstWindowPlan: Boolean =
                 windowSinglePassPlan.exists(_.isInstanceOf[WindowSinglePassWrite]) &&
@@ -7837,7 +7841,7 @@ case class RefreshMaterializedViewCommand(
                   !propagation.requiresDmlInterception &&
                     windowSinglePassPlan.exists(_.isInstanceOf[WindowSinglePassWrite]) &&
                     idx == windowCascadeCtasIdx &&
-                    isRawWindowSnapshotCtas(sql, viewDeltaPath)
+                    isRawWindowSnapshotCtas(sql, viewDeltaPath, globalWindowSnapshotTarget)
 
                 val cacheWindowSinglePassSnapshot =
                   isWindowNewSnapshotCreateSql(sql) &&
@@ -8851,7 +8855,7 @@ case class RefreshMaterializedViewCommand(
     val wholeDeletes = rewrittenStatements.take(insertIdx).count(isWholeWindowDeleteSql(_, targetId))
     if (
       allowFullSnapshot && wholeDeletes == 1 &&
-      rewrittenStatements.exists(isRawWindowSnapshotCtas(_, viewDeltaPath))
+      rewrittenStatements.exists(isRawWindowSnapshotCtas(_, viewDeltaPath, Some(targetId)))
     ) {
       val plan = windowSinglePassWrite(spark, meta, targetId, "true", viewDeltaPath)
       return Some(
@@ -9647,15 +9651,21 @@ case class RefreshMaterializedViewCommand(
 
   private def isRawWindowSnapshotCtas(
       sql: String,
-      viewDeltaPath: String
+      viewDeltaPath: String,
+      globalTarget: Option[TableIdentifier] = None
   ): Boolean = {
     val view = name.table.toUpperCase(java.util.Locale.ROOT)
     SparkRefreshRewriter
       .extractViewDeltaCtasBody(sql, viewDeltaPath)
       .exists { body =>
-        val upper = body.toUpperCase(java.util.Locale.ROOT)
+        val upper          = body.toUpperCase(java.util.Locale.ROOT)
+        val positiveBranch = upper.split("UNION ALL", 2).lift(1).getOrElse("")
         upper.contains(s"FROM OPENIVM_OLD_$view") &&
-        upper.contains(s"FROM OPENIVM_NEW_$view") &&
+        (upper.contains(s"FROM OPENIVM_NEW_$view") ||
+          globalTarget.exists(id =>
+            positiveBranch.contains(s"FROM ${MvCommandHelper.sqlIdent(id).toUpperCase(java.util.Locale.ROOT)}") &&
+              positiveBranch.contains("CAST(1 AS INTEGER) AS OPENIVM_MULTIPLICITY")
+          )) &&
         upper.contains("UNION ALL") &&
         upper.contains("CAST(-1 AS INTEGER) AS OPENIVM_MULTIPLICITY") &&
         upper.contains("CAST(1 AS INTEGER) AS OPENIVM_MULTIPLICITY") &&

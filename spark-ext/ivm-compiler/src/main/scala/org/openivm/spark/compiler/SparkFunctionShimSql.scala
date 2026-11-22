@@ -60,9 +60,17 @@ private[compiler] object SparkFunctionShimSql {
             .filter(args => args.size == 2 || args.size == 3)
             .foreach { args =>
               val (start, end) = args(1)
-              sql.substring(start, end).trim match {
+              val original     = sql.substring(start, end)
+              val trimmed      = original.trim
+              trimmed match {
                 case offsetCast(value) if value.toLong >= Int.MinValue && value.toLong <= Int.MaxValue =>
-                  replacements += ((start, end, value))
+                  val offset = original.indexOf(trimmed)
+                  replacements += ((
+                    start,
+                    end,
+                    original.substring(0, offset) + value +
+                      original.substring(offset + trimmed.length)
+                  ))
                 case _ =>
               }
             }

@@ -212,7 +212,7 @@ object LptsSparkDialect {
       }
       val matcher = WhereBooleanColumn.matcher(sql).region(index, sql.length)
       if (boundary && matcher.lookingAt())
-        Some(matcher.end() -> (sql.substring(index, index + 5) + matcher.group(1) + "((" + matcher.group(2) + "))"))
+        Some(matcher.end() -> (sql.substring(index, index + 5) + " ((" + matcher.group(2) + "))"))
       else None
     }
 
