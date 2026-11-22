@@ -11,6 +11,23 @@ import org.scalatest.matchers.should.Matchers
   */
 class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
+  describe("boolean WHERE predicates") {
+    it("protects a parenthesized column from being parsed as a table alias") {
+      val sql = """SELECT * FROM t WHERE (active);
+        |SELECT * FROM t WHERE (`enabled`);
+        |SELECT * FROM t WHERE ("quoted");
+        |SELECT 'WHERE (active)' -- WHERE (active)
+        |/* WHERE (active) */ FROM t WHERE ((active))""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("FROM t WHERE ((active))")
+      translated should include("FROM t WHERE ((`enabled`))")
+      translated should include("FROM t WHERE ((`quoted`))")
+      translated should include("'WHERE (active)' -- WHERE (active)")
+      translated should include("/* WHERE (active) */")
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+  }
+
   describe("DuckDB system builtin qualification") {
     it("unqualifies function calls without changing literals, comments, columns, or other catalogs") {
       val sql = """SELECT "system".main.sum(x), system."main".count_star(),

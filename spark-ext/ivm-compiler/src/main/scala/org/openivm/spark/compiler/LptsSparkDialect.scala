@@ -156,7 +156,9 @@ object LptsSparkDialect {
                                         SparkFunctionShimSql.restoreWindowOffsetLiterals(
                                           rewriteNowTimestamp(
                                             rewriteLikeOperators(
-                                              rewriteQuotedCastTypes(stripNativeBuiltinQualification(sql))
+                                              rewriteQuotedCastTypes(
+                                                stripNativeBuiltinQualification(rewriteWhereBooleanColumn(sql))
+                                              )
                                             )
                                           )
                                         )
@@ -178,6 +180,22 @@ object LptsSparkDialect {
         )
       )
     )
+
+  // Spark can parse WHERE (column) as a relation alias with a column list.
+  private val WhereBooleanColumn =
+    """(?i)where(\s*)\((\s*(?:[a-z_][a-z0-9_$]*|`(?:``|[^`])+`|"(?:""|[^"])+")\s*)\)""".r.pattern
+
+  private[compiler] def rewriteWhereBooleanColumn(sql: String): String =
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { index =>
+      val boundary = index == 0 || {
+        val previous = sql.charAt(index - 1)
+        !previous.isLetterOrDigit && previous != '_' && previous != '$' && previous != '.'
+      }
+      val matcher = WhereBooleanColumn.matcher(sql).region(index, sql.length)
+      if (boundary && matcher.lookingAt())
+        Some(matcher.end() -> (sql.substring(index, index + 5) + matcher.group(1) + "((" + matcher.group(2) + "))"))
+      else None
+    }
 
   private val NativeBuiltinQualifier =
     """(?i)(?:"system"|system)\s*\.\s*(?:"main"|main)\s*\.\s*(?=(?:[a-z_][a-z0-9_$]*|"[a-z_][a-z0-9_$]*")\s*\()""".r.pattern
