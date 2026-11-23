@@ -5,7 +5,11 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 /** Output of [[SparkRefreshRewriter.rewrite]]: the ordered list of Spark-SQL
   * statements that, when executed, perform one incremental refresh.
   */
-final case class RewrittenRefresh(statements: Seq[String], hasRunningWindowProgram: Boolean)
+final case class RewrittenRefresh(
+    statements: Seq[String],
+    hasRunningWindowProgram: Boolean,
+    aggregateInputPath: Option[String]
+)
 
 /** Thrown when a snapshot-pinned source read is about to be emitted but the
   * caller supplied no VERIFIED physical Delta path to bind it to.
@@ -515,10 +519,13 @@ object SparkRefreshRewriter {
     activePinnedPaths.set(sourceSnapshotPinnedPaths)
     try {
       val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
+      val cascade =
+        affectedGroupCascade(stmts, viewLogicalName, viewDeltaPath, mvName, mvLocation, mvVersionBeforeRefresh)
+      val inputPath = cascade.map(_.inputPath).getOrElse(viewDeltaPath)
 
       var viewDeltaMaterialized   = false
       var hasRunningWindowProgram = false
-      val rewritten: Seq[String] = stmts.flatMap { stmt =>
+      def rewriteStatement(stmt: String): Seq[String] = {
         classify(stmt, viewLogicalName) match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
           case StatementKind.ViewDeltaInsert =>
@@ -528,7 +535,7 @@ object SparkRefreshRewriter {
                 rewriteViewDeltaInsert(
                   stmt,
                   viewLogicalName,
-                  viewDeltaPath,
+                  inputPath,
                   deltaShape,
                   semiJoinPruneEnabled,
                   fkTermPruneEnabled,
@@ -540,13 +547,13 @@ object SparkRefreshRewriter {
                   sourceSnapshotRelations
                 )
               } else {
-                rewriteAdditionalViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath)
+                rewriteAdditionalViewDeltaInsert(stmt, viewLogicalName, inputPath)
               }
             Seq(rewritten)
           case StatementKind.ViewDeltaCompanion =>
-            Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, viewDeltaPath))
+            Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, inputPath))
           case StatementKind.MvMerge =>
-            Seq(rewriteMvMerge(stmt, viewLogicalName, mvName, viewDeltaPath))
+            Seq(rewriteMvMerge(stmt, viewLogicalName, mvName, inputPath))
           case StatementKind.SimpleProjectionDataInsert =>
             rewriteSimpleProjectionDataInsert(
               stmt,
@@ -601,6 +608,10 @@ object SparkRefreshRewriter {
         }
       }
 
+      val rewritten = stmts.flatMap { stmt =>
+        cascade.flatMap(_.statements.get(stmt)).getOrElse(rewriteStatement(stmt))
+      }
+
       // Spark 3.5 does not support the DuckDB `SELECT * EXCEPT (col, ...)` column
       // exclusion syntax — `EXCEPT` is parsed as the set operator.  Expand any
       // surviving `SELECT * EXCEPT (col1, col2) FROM openivm_delta_<short>` form
@@ -613,11 +624,73 @@ object SparkRefreshRewriter {
       val withSemiJoinRewrite =
         withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
       val withPublishedSnapshotReuse = reuseFullyReplacedTargetInCascade(withSemiJoinRewrite, mvName, viewLogicalName)
-      RewrittenRefresh(withPublishedSnapshotReuse.map(postProcess), hasRunningWindowProgram)
+      RewrittenRefresh(withPublishedSnapshotReuse.map(postProcess), hasRunningWindowProgram, cascade.map(_.inputPath))
     } finally {
       activeQualifiedNames.set(prior)
       activeSnapshotPins.set(priorPins)
       activePinnedPaths.set(priorPaths)
+    }
+  }
+
+  /** Lower the native affected-key snapshot and its signed publication together.
+    * The MERGE input has its own path so publishing the cascade cannot change
+    * the affected keys. Both signed sides read those keys, and the negative side
+    * reads the backing table at its pre-refresh Delta version.
+    */
+  private case class AffectedGroupCascade(inputPath: String, statements: Map[String, Seq[String]])
+
+  private def affectedGroupCascade(
+      stmts: Seq[String],
+      view: String,
+      outputPath: String,
+      mvName: TableIdentifier,
+      mvLocation: String,
+      mvVersion: Option[Long]
+  ): Option[AffectedGroupCascade] = {
+    val viewName       = java.util.regex.Pattern.quote(view)
+    val affectedCreate = s"(?is)CREATE\\s+(?:TEMP\\s+)?TABLE\\s+(openivm_old_affected_$viewName)\\s+AS\\s+(.+)".r
+    val snapshotCreate = s"(?is)CREATE\\s+(?:TEMP\\s+)?TABLE\\s+(openivm_old_snapshot_$viewName)\\s+AS\\s+(.+)".r
+    stmts.zipWithIndex.collectFirst { case (affectedStmt @ affectedCreate(affected, keys), affectedIdx) =>
+      val delta   = s"openivm_delta_$viewName"
+      val publish = s"(?is)INSERT\\s+INTO\\s+$delta\\s*\\(([^)]+)\\)\\s+(SELECT.+)".r
+      val reset   = s"(?is)DELETE\\s+FROM\\s+$delta\\s+WHERE\\s+1\\s*=\\s*1(?:\\s+AND\\s+.+)?".r
+      val program = for {
+        snapshotStmt <- stmts.drop(affectedIdx + 1).find(s => snapshotCreate.pattern.matcher(s).matches())
+        snapshotCreate(snapshot, oldRows) <- Some(snapshotStmt)
+        resetIdx     <- stmts.indices.drop(affectedIdx + 2).find(i => reset.pattern.matcher(stmts(i)).matches())
+        negativeStmt <- stmts.lift(resetIdx + 1)
+        publish(columns, negative)    <- Some(negativeStmt)
+        positiveStmt                  <- stmts.lift(resetIdx + 2)
+        publish(newColumns, positive) <- Some(positiveStmt)
+        if columns == newColumns && negative.contains(snapshot) && positive.contains(affected)
+      } yield {
+        val inputPath = s"$outputPath-input"
+        val input     = s"delta.`${inputPath.replace("`", "``")}`"
+        // Dry compilation has no live MV version. Execution supplies the version
+        // captured before applying the refresh.
+        val oldVersion = mvVersion.fold("")(v => s" VERSION AS OF $v")
+        val oldMv      = s"delta.`${mvLocation.replace("`", "``")}`$oldVersion"
+        val deltaRef   = s"(?i)\\b$delta\\b".r
+        val dataRef    = s"(?i)\\bopenivm_data_$viewName\\b".r
+        val rewrittenKeys =
+          deltaRef.replaceAllIn(stripTimestampPredicate(keys), java.util.regex.Matcher.quoteReplacement(input))
+        val rewrittenOld = dataRef.replaceAllIn(oldRows, java.util.regex.Matcher.quoteReplacement(oldMv))
+        val rewrittenNew =
+          dataRef.replaceAllIn(positive, java.util.regex.Matcher.quoteReplacement(backtickMvName(mvName)))
+        val publication =
+          s"""CREATE OR REPLACE TABLE delta.`${outputPath.replace("`", "``")}` USING DELTA AS
+             |WITH $affected AS ($rewrittenKeys),
+             |     $snapshot AS ($rewrittenOld),
+             |     openivm_signed ($columns) AS ($negative UNION ALL $rewrittenNew)
+             |SELECT * FROM openivm_signed""".stripMargin
+        val drops =
+          s"(?i)DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:${java.util.regex.Pattern.quote(affected)}|${java.util.regex.Pattern
+              .quote(snapshot)})".r
+        val skipped = Seq(affectedStmt, snapshotStmt, stmts(resetIdx), negativeStmt) ++
+          stmts.filter(s => drops.pattern.matcher(s).matches())
+        AffectedGroupCascade(inputPath, skipped.map(_ -> Seq.empty[String]).toMap + (positiveStmt -> Seq(publication)))
+      }
+      program.getOrElse(throw new IllegalStateException(s"Incomplete affected-group cascade for '$view'"))
     }
   }
 

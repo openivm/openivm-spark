@@ -1349,6 +1349,47 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
 
   // ── 10. Recompute-cascade snapshot rewrite ───────────────────────────────
   describe("pragma-gated recompute cascade rewrite") {
+    it("separates aggregate MERGE input from the affected-group signed cascade") {
+      val input =
+        """INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity) SELECT 'west', 12, 1;
+          |DROP TABLE IF EXISTS openivm_old_affected_mv_r;
+          |CREATE TABLE openivm_old_affected_mv_r AS SELECT DISTINCT region FROM openivm_delta_mv_r
+          |  WHERE openivm_timestamp > CAST('2026-11-23' AS TIMESTAMP);
+          |DROP TABLE IF EXISTS openivm_old_snapshot_mv_r;
+          |CREATE TABLE openivm_old_snapshot_mv_r AS SELECT d.* FROM openivm_data_mv_r d
+          |  WHERE EXISTS (SELECT 1 FROM openivm_old_affected_mv_r a WHERE a.region <=> d.region);
+          |MERGE INTO openivm_data_mv_r d USING openivm_delta_mv_r c ON d.region <=> c.region
+          |  WHEN MATCHED THEN UPDATE SET d.total = d.total + c.total;
+          |DELETE FROM openivm_delta_mv_r WHERE 1=1;
+          |INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity)
+          |  SELECT region, total, -1 FROM openivm_old_snapshot_mv_r;
+          |INSERT INTO openivm_delta_mv_r (region, total, openivm_multiplicity)
+          |  SELECT d.region, d.total, 1 FROM openivm_data_mv_r d
+          |  WHERE EXISTS (SELECT 1 FROM openivm_old_affected_mv_r a WHERE a.region <=> d.region);
+          |DROP TABLE openivm_old_snapshot_mv_r;
+          |DROP TABLE openivm_old_affected_mv_r;""".stripMargin
+      val rewritten = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(7L)
+      )
+      val raw = s"delta.`$viewDeltaPath-input`"
+      rewritten.aggregateInputPath shouldBe Some(s"$viewDeltaPath-input")
+      rewritten.statements should have size 3
+      rewritten.statements(0) should startWith(s"CREATE OR REPLACE TABLE $raw")
+      rewritten.statements(1) should include(s"USING $raw")
+      val publication = rewritten.statements.last
+      publication should startWith(s"CREATE OR REPLACE TABLE delta.`$viewDeltaPath`")
+      publication should include(s"SELECT DISTINCT region FROM $raw")
+      publication should include(s"delta.`$mvLocation` VERSION AS OF 7")
+      publication should include("UNION ALL SELECT d.region, d.total, 1 FROM `mydb`.`mv_r`")
+      publication should not include "openivm_timestamp"
+    }
+
     it("reads the published target for a full replacement cascade, without changing partial replacement") {
       val input =
         """CREATE OR REPLACE TEMP TABLE openivm_old_mv_r AS SELECT * FROM openivm_data_mv_r;
