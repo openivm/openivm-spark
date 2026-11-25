@@ -2,13 +2,15 @@ package org.openivm.spark.common.rocksdb
 
 import java.io.File
 
-import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshProfileCatalog, StagingCatalog}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, OpenIvmStatePaths, RefreshProfileCatalog, StagingCatalog}
 import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
 
 class LegacyInterceptWitnessSpec extends IvmParitySpecBase("legacy-intercept-witness") with InterceptMode {
   override protected def extraSparkConf: Map[String, String] = Map(
     FeatureGate.CatalogBackendKey -> "delta",
     FeatureGate.CatalogPathKey    -> new File(warehouseDir, "delta-catalog").toURI.toString,
+    FeatureGate.StateSyncUriKey -> new File(warehouseDir, "state-sync-remote").toURI.toString,
+    FeatureGate.StateSyncAsyncEnabledKey -> "false",
     FeatureGate.ProfileRefreshKey -> "true",
     FeatureGate.GcEnabledKey      -> "false"
   )
@@ -22,10 +24,17 @@ class LegacyInterceptWitnessSpec extends IvmParitySpecBase("legacy-intercept-wit
     sql(s"CREATE TABLE $source(id INT, amount INT) USING DELTA")
     sql(s"INSERT INTO $source VALUES (1, 10)")
     sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
+    val legacy = MvCatalog.lookup(spark, id).get
+    MvCatalog.upsert(spark, legacy.copy(properties = legacy.properties - StagingCatalog.CompletedRefreshTokenKey))
+    val storedName = legacy.name.database.fold(legacy.name.table)(db => s"$db.${legacy.name.table}")
+    val state = OpenIvmRocksDBRegistry.getOrOpen(
+      spark, OpenIvmStatePaths.perMvDbPath(spark, storedName), OpenIvmStatePaths.PerMvColumnFamilies
+    )
+    state.withBatch(batch =>
+      OpenIvmRocksDBBatchOps.delete(state, batch, "meta", RocksDBCodec.utf8("_ivm_completed_refresh_witness")))
+    OpenIvmStateSync.backupNow(spark)
     MvCatalog.lookup(spark, id).get.properties.contains(StagingCatalog.CompletedRefreshTokenKey) shouldBe false
 
-    spark.conf.set(FeatureGate.StateSyncUriKey, new File(warehouseDir, "state-sync-remote").toURI.toString)
-    spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "false")
     sql(s"INSERT INTO $source VALUES (1, 25)")
     RefreshProfileCatalog.removeAll(spark)
     refreshMv(s"default.$mv")
