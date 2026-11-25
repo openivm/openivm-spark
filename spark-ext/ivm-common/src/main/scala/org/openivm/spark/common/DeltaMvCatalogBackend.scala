@@ -19,7 +19,7 @@ import org.apache.spark.sql.functions.{
   when
 }
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.{Column, Row, SparkSession}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import scala.jdk.CollectionConverters._
@@ -200,6 +200,74 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
     }
   }
 
+  private final case class CdfAdvance(id: TableIdentifier, newVersion: Long, entries: Seq[(String, Long)]) {
+    val name: String = serializedName(id)
+  }
+
+  private def withCdfWatermarks(entries: Seq[(String, Long)]): Column = {
+    val keys       = array(entries.map { case (key, _) => lit(key) }: _*)
+    val properties = col(Properties)
+    val values = array(entries.map { case (key, version) =>
+      val existing = properties.getItem(key)
+      val previous = when(existing.startsWith("v:"), substring(existing, 3, 20).cast("long"))
+        .otherwise(lit(Long.MinValue))
+      coalesce(
+        concat(lit("v:"), greatest(previous, lit(version)).cast("string")),
+        lit(ChangeWatermark.DeltaVersion(version).encode)
+      )
+    }: _*)
+    val retained = map_filter(properties, (key, _) => not(array_contains(keys, key)))
+    map_concat(retained, map_from_arrays(keys, values))
+  }
+
+  private def advanceOne(spark: SparkSession, request: CdfAdvance): Unit =
+    if (request.entries.isEmpty)
+      advance(spark, request.id, request.newVersion)
+    else
+      withDeltaRetry {
+        ensureTables(spark)
+        DeltaTable
+          .forPath(spark, path(spark))
+          .update(
+            col(Name) === lit(request.name) && col(LastVersion) < lit(request.newVersion),
+            Map(LastVersion -> lit(request.newVersion), Properties -> withCdfWatermarks(request.entries))
+          )
+      }
+
+  /** One Delta UPDATE that applies each request's single-view advance to its own row (rows are keyed by name).
+    *
+    * The condition names only `name` partitions, so Delta rewrites those rows in one pass instead of first scanning
+    * them for matches. The per-row advance condition moves into the assignments: a row whose stored version is not
+    * older keeps its values.
+    */
+  private def advanceBatch(spark: SparkSession, requests: Seq[CdfAdvance]): Unit =
+    if (requests.map(_.name).distinct.size != requests.size) requests.foreach(advanceOne(spark, _))
+    else
+      OpenIvmMetrics.time("catalog.mv_catalog.advance_batch") {
+        withDeltaRetry {
+          ensureTables(spark)
+          def advancing(r: CdfAdvance): Column = col(Name) === lit(r.name) && col(LastVersion) < lit(r.newVersion)
+          def byName(value: CdfAdvance => Column, otherwise: Column): Column =
+            requests.tail
+              .foldLeft(when(advancing(requests.head), value(requests.head))) { (acc, r) =>
+                acc.when(advancing(r), value(r))
+              }
+              .otherwise(otherwise)
+          DeltaTable
+            .forPath(spark, path(spark))
+            .update(
+              col(Name).isin(requests.map(_.name): _*),
+              Map(
+                LastVersion -> byName(r => lit(r.newVersion), col(LastVersion)),
+                Properties -> byName(
+                  r => if (r.entries.isEmpty) col(Properties) else withCdfWatermarks(r.entries),
+                  col(Properties)
+                )
+              )
+            )
+        }
+      }
+
   override def advanceWithCdfWatermarks(
       spark: SparkSession,
       name: TableIdentifier,
@@ -211,29 +279,9 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
         s"${MvMetadata.WatermarkKeyPrefix}$source" -> version
       }
       .sortBy(_._1)
-    if (entries.isEmpty) advance(spark, name, newVersion)
-    else
-      withDeltaRetry {
-        ensureTables(spark)
-        val keys       = array(entries.map { case (key, _) => lit(key) }: _*)
-        val properties = col(Properties)
-        val values = array(entries.map { case (key, version) =>
-          val existing = properties.getItem(key)
-          val previous = when(existing.startsWith("v:"), substring(existing, 3, 20).cast("long"))
-            .otherwise(lit(Long.MinValue))
-          coalesce(
-            concat(lit("v:"), greatest(previous, lit(version)).cast("string")),
-            lit(ChangeWatermark.DeltaVersion(version).encode)
-          )
-        }: _*)
-        val retained = map_filter(properties, (key, _) => not(array_contains(keys, key)))
-        DeltaTable
-          .forPath(spark, path(spark))
-          .update(
-            col(Name) === lit(serializedName(name)) && col(LastVersion) < lit(newVersion),
-            Map(LastVersion -> lit(newVersion), Properties -> map_concat(retained, map_from_arrays(keys, values)))
-          )
-      }
+    DeltaGroupCommit
+      .forPath[CdfAdvance](path(spark))
+      .submit(CdfAdvance(name, newVersion, entries))(advanceOne(spark, _))(advanceBatch(spark, _))
   }
 
   override def updateProperties(

@@ -4506,11 +4506,12 @@ case class RefreshMaterializedViewCommand(
     val dependencyKey = initialMeta.map(meta => metaName(meta.name)).getOrElse(viewMeta)
     val viewLockKeys  = mvLockKeys(spark, name, initialMeta)
     if (expectedQueryHash.isEmpty) OpenIvmExecutionSpan.start(spark, viewMeta, "refresh")
-    val lockT0           = System.nanoTime()
-    var commandCompleted = false
-    var absent           = false
-    var targetTableId    = Option.empty[String]
-    var completedRefresh = Option.empty[(String, String)]
+    val lockT0             = System.nanoTime()
+    var commandCompleted   = false
+    var absent             = false
+    var targetTableId      = Option.empty[String]
+    var completedRefresh   = Option.empty[(String, String)]
+    val groupCommitArrival = DeltaGroupCommit.refreshStarted()
     try {
       // Every refresh — ordinary or source-version-advance — deterministically
       // also holds the DIRECT upstream MV keys taken from its AUTHORITATIVE
@@ -4549,6 +4550,7 @@ case class RefreshMaterializedViewCommand(
         viewLockKeys,
         metaName(MvCatalog.qualifiedName(spark, name))
       ) {
+        groupCommitArrival.ready()
         val currentMeta = MvCatalog.lookupForRelation(spark, name)
         if (currentMeta.exists(meta => !viewLockKeys.contains(metaName(meta.name))))
           throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} changed while acquiring locks")
@@ -4649,6 +4651,7 @@ case class RefreshMaterializedViewCommand(
           Seq(Row("refreshed", hash, sqlIdent(name), tableId, refreshId, outcome))
       }
     } finally {
+      groupCommitArrival.close()
       // runUnderLock has many early returns and failure paths. Always detach
       // its telemetry collector from the reusable driver thread.
       val failedOutcome = if (commandCompleted) None else Some("refresh_failed")
@@ -9839,7 +9842,7 @@ case class RefreshMaterializedViewCommand(
             }
             .groupBy(_._1)
             .map { case (baseTable, versions) => baseTable -> versions.map(_._2).max }
-          MvCatalog.advanceWithCdfWatermarks(spark, name, newVersion, cdfWatermarks)
+          MvCatalog.advanceStoredWithCdfWatermarks(spark, meta.name, newVersion, cdfWatermarks)
         case None if witnessToken.isDefined =>
           MvCatalog.advanceWithInterceptWitness(spark, meta.name, newVersion, witnessToken.get)
         case None => MvCatalog.advance(spark, name, newVersion)

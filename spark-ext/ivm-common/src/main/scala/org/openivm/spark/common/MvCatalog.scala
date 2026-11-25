@@ -1084,6 +1084,14 @@ object MvCatalog {
       watermarks
     )
 
+  /** Advances the catalog row stored under `storedName`, which must come from a catalog read. */
+  private[spark] def advanceStoredWithCdfWatermarks(
+      spark: SparkSession,
+      storedName: TableIdentifier,
+      newVersion: Long,
+      watermarks: Map[String, Long]
+  ): Unit = backend(spark).advanceWithCdfWatermarks(spark, storedName, newVersion, watermarks)
+
   def updateProperties(
       spark: SparkSession,
       name: TableIdentifier,
