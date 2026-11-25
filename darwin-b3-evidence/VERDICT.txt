@@ -1,0 +1,32 @@
+Darwin lane B3 (option 2: MV-log refresh marker + deferred catalog flush) closeout
+Evidence: b3-closeout.tgz (sha256 a4f50d99a718e9b9fc6713a6b4a2403581b9c9afd6fbe70d8d271aaf0d2ab1c6)
+All latency figures are local devbox / evaluator-modeled object store. OneLake latency is UNMEASURED.
+
+Candidate 0a81f6a6ff160ac34f1ab98797438492f249baf5 (worker/darwin-b3-single-commit), frozen evaluator vs 4292fb10, lane b, 3 pairs:
+  spark-3.5 ACCEPTED combined 121.295; finalize 60523 -> 868 ms (-98.6%); e2e 28075 -> 14789 ms (+47.0%, +45.0..+49.5%); crash 8/8, 0 failing; recovery_qualified=1
+  spark-4.1 ACCEPTED combined 103.938; finalize 59012 -> 8068 ms (-86.3%); e2e 28053 -> 18390 ms (+35.8%, +34.4..+37.5%); crash 8/8, 0 failing; recovery_qualified=1
+  Out-of-diff probes (3.5 and 4.1, candidate and baseline): external-change/recreate/foreign-commit probe pass; gap probe 8/8;
+  scenario A (failed deferred watermark flush -> fresh driver) 3/3; scenario B (old queued flush vs source recreation) 1/1
+  (iii parity false on both baseline and candidate: pre-existing).
+
+Cherry-pick onto 742eac691301dae7ea285afcb881913ed917dd29: b166f133c4d42c98a76203ca9fd8dfcc73d00a21 (worker/darwin-b3-on-742eac69)
+  5 files +503/-21, two composition fixes; builds on 3.5 and 4.1.
+  Local paired perf, 6 pairs, 742 vs b3-on-742 (NOT the frozen evaluator, NOT 742's score):
+    spark-3.5 e2e median +11.8% (pairs +9.1..+29.9%); catalog_finalize 23445 -> 975 ms (-95.8%)
+    spark-4.1 e2e makespan 13807 -> 10650 ms (+22.9%, pairs +4.6..+34.9%); catalog_finalize 26499 -> 7912 ms (-70.1%)
+  742 crash specs: b3-on-742 passes 8/9 StateGuardCrashRecoverySpec points, CdfFinalizationCrashSpec and
+  InterceptStaleSnapshotCrashSpec on both targets; FAILS cdf/mv_version_and_cdf_watermark_gap ("crash point did not fire").
+  742 control passes 9/9 on both targets.
+  Cause: the frozen hook is white-box on the synchronous postRefreshCleanup -> CdfChangePropagation.markConsumed /
+  RocksDbCdfWatermarkBackend.putAll stack, which B3 moves to the post-ack openivm-catalog-finalizer flush.
+  Adapted out-of-diff probe (B3GapAdaptProbeSpec: kill inside the flush between mv_metadata advance and cdf_watermarks
+  write, and before both) passes 4/4 on 3.5 and 4/4 on 4.1: no double-apply (MV version 5 before = after recovery),
+  no lost delta, recover-1/2 no_pending_deltas, recover-3 incremental, parity + convergence + catalogs flushed.
+  Integration requires the builder to adapt that frozen test's hook; no main-code change keeps B3's win and fires the old hook.
+
+Disclosures: marker is a standalone no-data commit (commitInfo tags + txn appId openivm.refresh.v1), not a record inside
+the data commit; MV versions advance +1 per refresh. Marker I/O is on the critical path but unmodeled by the evaluator;
+post-ack flush is outside e2e. Flush confirms location+table id+version>=hint, putAllViews is max-only, pending entries
+removed in finally; forgetSource is JVM-local. On a failed flush the candidate acks ok/incremental_executed (baseline:
+refresh_failed); a fresh driver reconciles from the MV log. Sub-second TOCTOU between storedVersions and putAllViews.
+Darwin evolve was not run.
