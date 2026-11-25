@@ -1,0 +1,22 @@
+{
+ "lane": "e",
+ "changes": [
+  {
+   "path": "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateDeltaWriter.scala",
+   "status": "A",
+   "old_mode": "100644",
+   "new_mode": "100644",
+   "binary": false
+  },
+  {
+   "path": "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateSyncCodecV2.scala",
+   "status": "A",
+   "old_mode": "100644",
+   "new_mode": "100644",
+   "binary": false
+  }
+ ],
+ "ok": true,
+ "violations": [],
+ "shared_touched": 0
+}

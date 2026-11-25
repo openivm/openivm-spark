@@ -1,0 +1,17 @@
+{
+ "lane": "a",
+ "changes": [
+  {
+   "path": "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmNewHelper.scala",
+   "status": "A",
+   "old_mode": "100644",
+   "new_mode": "100644",
+   "binary": false
+  }
+ ],
+ "ok": false,
+ "violations": [
+  "new file outside lane A allowlist"
+ ],
+ "shared_touched": 0
+}

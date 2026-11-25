@@ -38,6 +38,7 @@ Commands:
   verify [sbt-args]         pins-sync, lint, compile, inventory, assembly, test.
   verify-all [sbt-args]     Verify both targets and compare inventories.
   window-benchmark          Run the WindowNoopWriteHarness micro-benchmark.
+  state-guard-perf          Run the opt-in state-guard concurrent-refresh perf and crash-recovery suite.
   openivm-test [make-args]  Run upstream tests from a baked or mounted source.
   pins-sync                 Align pinned dependency worktrees.
   help                      Print this message.
@@ -343,6 +344,14 @@ cmd_verify_all() {
     "$0" compare-test-inventory
 }
 
+cmd_state_guard_perf() {
+    prepare_sbt 1
+    setup_test_log_dir
+    run_sbt "$@" \
+        "ivmIt/testOnly org.openivm.spark.perf.StateGuardConcurrentRefreshPerfSpec -- -n org.openivm.spark.tags.StateGuardPerf" \
+        "ivmIt/testOnly org.openivm.spark.common.rocksdb.StateGuardCrashRecoverySpec -- -n org.openivm.spark.tags.StateGuardPerf"
+}
+
 cmd_window_benchmark() {
     prepare_sbt 1
     setup_test_log_dir
@@ -396,6 +405,8 @@ case "$COMMAND" in
     verify-all|verify_all)          cmd_verify_all "$@" ;;
     window-benchmark|window_benchmark)
                                     cmd_window_benchmark "$@" ;;
+    state-guard-perf|state_guard_perf)
+                                    cmd_state_guard_perf "$@" ;;
     openivm-test|openivm_test)      cmd_openivm_test "$@" ;;
     pins-sync|pins_sync)            cmd_pins_sync "$@" ;;
     help)                           usage ;;

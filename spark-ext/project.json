@@ -176,6 +176,24 @@
         }
       }
     },
+    "state-guard-perf": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "spark-3.5",
+      "options": {
+        "cwd": "spark-ext",
+        "command": "./dev/run.sh state-guard-perf",
+        "forwardAllArgs": true
+      },
+      "configurations": {
+        "spark-3.5": {
+          "command": "./dev/run.sh --target spark-3.5 state-guard-perf"
+        },
+        "spark-4.1": {
+          "command": "./dev/run.sh --target spark-4.1 state-guard-perf"
+        }
+      }
+    },
     "openivm-test": {
       "executor": "nx:run-commands",
       "cache": false,

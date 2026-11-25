@@ -1,0 +1,9 @@
+{
+ "exit_code": 1,
+ "log": [
+  "[info] Run completed in 8 minutes.",
+  "[info] - MV6 matches the EXCEPT ALL oracle *** FAILED ***",
+  "[info]   1 did not equal 0 (StateGuardPerfSpec.scala:212)",
+  "[error] Failed: Total 5, Failed 1, Errors 0, Passed 4"
+ ]
+}

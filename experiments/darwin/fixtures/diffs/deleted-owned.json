@@ -1,0 +1,17 @@
+{
+ "lane": "a",
+ "changes": [
+  {
+   "path": "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateBarrier.scala",
+   "status": "D",
+   "old_mode": "100644",
+   "new_mode": "100644",
+   "binary": false
+  }
+ ],
+ "ok": false,
+ "violations": [
+  "deleted"
+ ],
+ "shared_touched": 0
+}

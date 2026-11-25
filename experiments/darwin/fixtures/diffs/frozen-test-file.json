@@ -1,0 +1,17 @@
+{
+ "lane": "a",
+ "changes": [
+  {
+   "path": "spark-ext/ivm-it/src/test/scala/org/openivm/spark/perf/StateGuardPerfSpec.scala",
+   "status": "M",
+   "old_mode": "100644",
+   "new_mode": "100644",
+   "binary": false
+  }
+ ],
+ "ok": false,
+ "violations": [
+  "frozen"
+ ],
+ "shared_touched": 0
+}
