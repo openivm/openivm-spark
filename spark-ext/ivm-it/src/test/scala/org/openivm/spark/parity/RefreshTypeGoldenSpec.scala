@@ -17,11 +17,11 @@ class RefreshTypeGoldenSpec extends AnyFunSpec with Matchers with BeforeAndAfter
 
   private var sharedCompiler: OpenIvmCompiler = _
 
-  // Pinned to native OPENIVM_COMMIT 1b128fec (spark-ext/dev/pins.env). Against 57b21876 every case
-  // now constant-folds translate(...) literals and group-recompute names its derived table; both are
-  // cosmetic. aggregate-group also changes semantically: its group-retirement DELETE additionally
-  // requires openivm_nonnull_sum_count_1 = 0. Every count lies in [0, COUNT(*)], so both predicates
-  // retire the same groups; AggregateGroupNonnullCountScenarios checks that invariant.
+  // Pinned to native OPENIVM_COMMIT dbcc8788 (spark-ext/dev/pins.env); its upstream 4a7dd303 merge leaves these
+  // hashes unchanged. Against 57b21876 every case now constant-folds translate(...) literals and group-recompute
+  // names its derived table; both are cosmetic. aggregate-group also changes semantically: its group-retirement
+  // DELETE additionally requires openivm_nonnull_sum_count_1 = 0. Every count lies in [0, COUNT(*)], so both
+  // predicates retire the same groups; AggregateGroupNonnullCountScenarios checks that invariant.
   private val goldenHashes: Map[String, String] = Map(
     "aggregate-group"   -> "3c6b645ea76f167774962119edd2f07235ac2267097808ddc452131a4b450785",
     "simple-aggregate"  -> "ea266f0312086ec1487d8bb5ef15ab912820dab8e30c89256a7bc42743a2104b",
