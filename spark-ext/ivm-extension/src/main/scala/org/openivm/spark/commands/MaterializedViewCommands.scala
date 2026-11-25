@@ -8446,6 +8446,8 @@ case class RefreshMaterializedViewCommand(
                   s"Rewritten SQL:\n$sqlSnippet",
                 t
               )
+          } finally {
+            rewritten.aggregateInputPath.foreach(deletePathIfExists)
           }
 
           if (preparedSourceAdvance.nonEmpty)

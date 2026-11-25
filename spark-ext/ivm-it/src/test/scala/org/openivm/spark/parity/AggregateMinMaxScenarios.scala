@@ -65,6 +65,29 @@ abstract class AggregateMinMaxScenarios extends IvmParitySpecBase("aggregate-min
     MvCatalog.lookup(spark, id).getOrElse(fail(s"MV $name not found in catalog")).refreshType
   }
 
+  it("cascades the old and new rows of a derived grouped MIN/MAX after append") {
+    sql("CREATE TABLE mm_history(id INT, status STRING, event_at INT) USING DELTA")
+    sql("INSERT INTO mm_history VALUES (NULL, 'Activate', 10), (1, 'Activate', 15), (2, 'Activate', 20)")
+    val watches =
+      """SELECT id, MIN(CASE WHEN status = 'Activate' THEN event_at END) AS placed,
+        |       MAX(CASE WHEN status = 'Cancelled' THEN event_at END) AS removed,
+        |       CASE WHEN MAX(CASE WHEN status = 'Cancelled' THEN event_at END) IS NULL
+        |            THEN 'Active' ELSE 'Cancelled' END AS watch_status
+        |FROM mm_history GROUP BY id""".stripMargin
+    sql(s"CREATE MATERIALIZED VIEW mm_watches AS $watches")
+    sql(
+      "CREATE MATERIALIZED VIEW mm_active_watches AS " +
+        "SELECT id, placed FROM mm_watches WHERE watch_status = 'Active'"
+    )
+    mvRefreshType("mm_watches") shouldBe RefreshTypeCode.AggregateGroup
+
+    sql("INSERT INTO mm_history VALUES (NULL, 'Cancelled', 30), (1, 'Activate', 5), (3, 'Activate', 40)")
+    refreshMv("mm_watches")
+    assertMvCorrect("mm_watches", watches)
+    refreshMv("mm_active_watches")
+    assertMvCorrect("mm_active_watches", s"SELECT id, placed FROM ($watches) w WHERE watch_status = 'Active'")
+  }
+
   // ── Shape 1: SELECT region, MIN(amount) FROM sales GROUP BY region — basic MIN
 
   describe("(1) GROUP BY region, MIN(amount) — basic grouped MIN over insert-only delta") {

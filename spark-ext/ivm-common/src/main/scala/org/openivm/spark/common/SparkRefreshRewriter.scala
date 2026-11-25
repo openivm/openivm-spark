@@ -12,7 +12,8 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 final case class RewrittenRefresh(
     statements: Seq[String],
     lineage: Option[RewriteLineage.Snapshot] = None,
-    hasRunningWindowProgram: Boolean = false
+    hasRunningWindowProgram: Boolean = false,
+    aggregateInputPath: Option[String] = None
 )
 
 /** Opt-in structural provenance for one rewriter invocation.
@@ -710,6 +711,10 @@ object SparkRefreshRewriter {
         .map(_.trim)
         .filter(_.nonEmpty)
         .map(s => expandSelectStarExcept(s, sourceSchemas))
+      val cascade =
+        affectedGroupCascade(stmts, viewLogicalName, viewDeltaPath, mvName, mvLocation, mvVersionBeforeRefresh)
+      val aggregateInputPath = cascade.map(_.inputPath)
+      val inputPath          = aggregateInputPath.getOrElse(viewDeltaPath)
       val lineageEvidence = lineageCapture match {
         case Some(capture) => Some(capture.evidenceFor(compiledSql))
         case None          => None
@@ -717,12 +722,19 @@ object SparkRefreshRewriter {
       val lineageInputs = lineageCapture match {
         case Some(_) =>
           Some(
-            sourceSqlStatements.filter(_.trim.nonEmpty).zip(lineageEvidence.get._4).zipWithIndex.map {
-              case ((normalized, raw), ordinal) =>
+            sourceSqlStatements
+              .filter(_.trim.nonEmpty)
+              .zip(lineageEvidence.get._4)
+              .zipWithIndex
+              .map { case ((normalized, raw), ordinal) =>
                 val statement = expandSelectStarExcept(normalized.trim, sourceSchemas)
                 val kind      = classify(statement, viewLogicalName)
-                SourceInput(statement, ordinal, RewriteLineage.sha256Utf8(raw), kind.toString, lineageRule(kind))
-            }
+                val rule =
+                  if (cascade.exists(_.statements.contains(statement)))
+                    LineageRule("affected-group-cascade", "1", RewriteLineage.Unknown)
+                  else lineageRule(kind)
+                SourceInput(statement, ordinal, RewriteLineage.sha256Utf8(raw), kind.toString, rule)
+              }
           )
         case None => None
       }
@@ -734,7 +746,7 @@ object SparkRefreshRewriter {
 
       var viewDeltaMaterialized   = false
       var hasRunningWindowProgram = false
-      def rewriteOne(stmt: String): Seq[String] = {
+      def rewriteDefault(stmt: String): Seq[String] = {
         val kind = classify(stmt, viewLogicalName)
         val emitted = kind match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
@@ -745,7 +757,7 @@ object SparkRefreshRewriter {
                 rewriteViewDeltaInsert(
                   stmt,
                   viewLogicalName,
-                  viewDeltaPath,
+                  inputPath,
                   deltaShape,
                   semiJoinPruneEnabled,
                   fkTermPruneEnabled,
@@ -757,13 +769,13 @@ object SparkRefreshRewriter {
                   sourceSnapshotRelations
                 )
               } else {
-                rewriteAdditionalViewDeltaInsert(stmt, viewLogicalName, viewDeltaPath)
+                rewriteAdditionalViewDeltaInsert(stmt, viewLogicalName, inputPath)
               }
             Seq(rewritten)
           case StatementKind.ViewDeltaCompanion =>
-            Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, viewDeltaPath))
+            Seq(rewriteViewDeltaCompanion(stmt, viewLogicalName, mvName, inputPath))
           case StatementKind.MvMerge =>
-            Seq(rewriteMvMerge(stmt, viewLogicalName, mvName, viewDeltaPath))
+            Seq(rewriteMvMerge(stmt, viewLogicalName, mvName, inputPath))
           case StatementKind.SimpleProjectionDataInsert =>
             rewriteSimpleProjectionDataInsert(
               stmt,
@@ -840,6 +852,9 @@ object SparkRefreshRewriter {
         emitted.map(s => if (marker.isEmpty) s else s"$marker\n$s")
       }
 
+      def rewriteOne(stmt: String): Seq[String] =
+        cascade.flatMap(_.statements.get(stmt)).getOrElse(rewriteDefault(stmt))
+
       val pendingLineage = lineageCapture match {
         case Some(_) => Some(scala.collection.mutable.ArrayBuffer.empty[PendingOutput])
         case None    => None
@@ -869,7 +884,12 @@ object SparkRefreshRewriter {
       val withPublishedSnapshotReuse = reuseFullyReplacedTargetInCascade(withSemiJoinRewrite, mvName, viewLogicalName)
       val finalStatements            = withPublishedSnapshotReuse.map(postProcess)
       lineageCapture match {
-        case None => RewrittenRefresh(finalStatements, hasRunningWindowProgram = hasRunningWindowProgram)
+        case None =>
+          RewrittenRefresh(
+            finalStatements,
+            hasRunningWindowProgram = hasRunningWindowProgram,
+            aggregateInputPath = aggregateInputPath
+          )
         case Some(_) =>
           val outputs = pendingLineage.get.zipWithIndex.map { case (pending, outputIndex) =>
             RewriteLineage.OutputStatement(
@@ -908,7 +928,8 @@ object SparkRefreshRewriter {
                 outputs
               )
             ),
-            hasRunningWindowProgram
+            hasRunningWindowProgram,
+            aggregateInputPath
           )
       }
     } finally {
@@ -974,6 +995,68 @@ object SparkRefreshRewriter {
       case _ => RewriteLineage.Unknown
     }
     LineageRule(name, "1", classification)
+  }
+
+  /** Lower the native affected-key snapshot and its signed publication together.
+    * The MERGE input has its own path so publishing the cascade cannot change
+    * the affected keys. Both signed sides read those keys, and the negative side
+    * reads the backing table at its pre-refresh Delta version.
+    */
+  private case class AffectedGroupCascade(inputPath: String, statements: Map[String, Seq[String]])
+
+  private def affectedGroupCascade(
+      stmts: Seq[String],
+      view: String,
+      outputPath: String,
+      mvName: TableIdentifier,
+      mvLocation: String,
+      mvVersion: Option[Long]
+  ): Option[AffectedGroupCascade] = {
+    val viewName       = java.util.regex.Pattern.quote(view)
+    val affectedCreate = s"(?is)CREATE\\s+(?:TEMP\\s+)?TABLE\\s+(openivm_old_affected_$viewName)\\s+AS\\s+(.+)".r
+    val snapshotCreate = s"(?is)CREATE\\s+(?:TEMP\\s+)?TABLE\\s+(openivm_old_snapshot_$viewName)\\s+AS\\s+(.+)".r
+    stmts.zipWithIndex.collectFirst { case (affectedStmt @ affectedCreate(affected, keys), affectedIdx) =>
+      val delta   = s"openivm_delta_$viewName"
+      val publish = s"(?is)INSERT\\s+INTO\\s+$delta\\s*\\(([^)]+)\\)\\s+(SELECT.+)".r
+      val reset   = s"(?is)DELETE\\s+FROM\\s+$delta\\s+WHERE\\s+1\\s*=\\s*1(?:\\s+AND\\s+.+)?".r
+      val program = for {
+        snapshotStmt <- stmts.drop(affectedIdx + 1).find(s => snapshotCreate.pattern.matcher(s).matches())
+        snapshotCreate(snapshot, oldRows) <- Some(snapshotStmt)
+        resetIdx     <- stmts.indices.drop(affectedIdx + 2).find(i => reset.pattern.matcher(stmts(i)).matches())
+        negativeStmt <- stmts.lift(resetIdx + 1)
+        publish(columns, negative)    <- Some(negativeStmt)
+        positiveStmt                  <- stmts.lift(resetIdx + 2)
+        publish(newColumns, positive) <- Some(positiveStmt)
+        if columns == newColumns && negative.contains(snapshot) && positive.contains(affected)
+      } yield {
+        val inputPath = s"$outputPath-input"
+        val input     = s"delta.`${inputPath.replace("`", "``")}`"
+        // Dry compilation has no live MV version. Execution supplies the version
+        // captured before applying the refresh.
+        val oldVersion = mvVersion.fold("")(v => s" VERSION AS OF $v")
+        val oldMv      = s"delta.`${mvLocation.replace("`", "``")}`$oldVersion"
+        val deltaRef   = s"(?i)\\b$delta\\b".r
+        val dataRef    = s"(?i)\\bopenivm_data_$viewName\\b".r
+        val rewrittenKeys =
+          deltaRef.replaceAllIn(stripTimestampPredicate(keys), java.util.regex.Matcher.quoteReplacement(input))
+        val rewrittenOld = dataRef.replaceAllIn(oldRows, java.util.regex.Matcher.quoteReplacement(oldMv))
+        val rewrittenNew =
+          dataRef.replaceAllIn(positive, java.util.regex.Matcher.quoteReplacement(backtickMvName(mvName)))
+        val publication =
+          s"""CREATE OR REPLACE TABLE delta.`${outputPath.replace("`", "``")}` USING DELTA AS
+             |WITH $affected AS ($rewrittenKeys),
+             |     $snapshot AS ($rewrittenOld),
+             |     openivm_signed ($columns) AS ($negative UNION ALL $rewrittenNew)
+             |SELECT * FROM openivm_signed""".stripMargin
+        val drops =
+          s"(?i)DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:${java.util.regex.Pattern.quote(affected)}|${java.util.regex.Pattern
+              .quote(snapshot)})".r
+        val skipped = Seq(affectedStmt, snapshotStmt, stmts(resetIdx), negativeStmt) ++
+          stmts.filter(s => drops.pattern.matcher(s).matches())
+        AffectedGroupCascade(inputPath, skipped.map(_ -> Seq.empty[String]).toMap + (positiveStmt -> Seq(publication)))
+      }
+      program.getOrElse(throw new IllegalStateException(s"Incomplete affected-group cascade for '$view'"))
+    }
   }
 
   // ── Statement classification ─────────────────────────────────────────────
