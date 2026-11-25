@@ -4,7 +4,7 @@ import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.util.UUID
-import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.{Callable, ConcurrentHashMap, CountDownLatch, Executors, TimeUnit}
 
 import com.codahale.metrics.MetricRegistry
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -91,6 +91,46 @@ class BoundedTelemetryQueueSpec extends AnyFunSpec with Matchers {
       h.destinations("abfss").dropped shouldBe 3L
       h.destinations("local").exportFailures shouldBe 2L
       h.destinations("abfss").published shouldBe 2L
+    }
+
+    it("accepts racing producers without dropping records when capacity is available") {
+      val producers = 8
+      val perThread = 1000
+      val received  = ConcurrentHashMap.newKeySet[String]()
+      val writer = new BoundedTelemetryQueue.Writer {
+        override def record(line: String): Unit    = { received.add(line); () }
+        override def manifest(value: String): Unit = ()
+      }
+      val q       = new BoundedTelemetryQueue(producers * perThread, 100, writer)
+      val pool    = Executors.newFixedThreadPool(producers)
+      val ready   = new CountDownLatch(producers)
+      val release = new CountDownLatch(1)
+      try {
+        val offers = (0 until producers).map { producer =>
+          pool.submit(new Callable[Int] {
+            override def call(): Int = {
+              ready.countDown()
+              release.await()
+              (0 until perThread).count(i => q.offer(s"""{"id":${producer * perThread + i}}"""))
+            }
+          })
+        }
+        ready.await(10, TimeUnit.SECONDS) shouldBe true
+        release.countDown()
+        offers.map(_.get(10, TimeUnit.SECONDS)).sum shouldBe producers * perThread
+        q.shutdown(10000) shouldBe true
+        received.size() shouldBe producers * perThread
+        q.health.accepted shouldBe producers.toLong * perThread
+        q.health.published shouldBe q.health.accepted
+        q.health.droppedContended shouldBe 0L
+        q.health.droppedFull shouldBe 0L
+        q.offer("{}") shouldBe false
+        q.health.droppedClosed shouldBe 1L
+      } finally {
+        release.countDown()
+        pool.shutdownNow()
+        q.shutdown(10000)
+      }
     }
 
     it("counts malformed JSON and a failed manifest without exposing exception content") {

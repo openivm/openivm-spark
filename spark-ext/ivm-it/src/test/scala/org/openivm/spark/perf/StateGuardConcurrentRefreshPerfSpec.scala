@@ -8,7 +8,7 @@ import org.openivm.spark.telemetry.OpenIvmExecutionSpan.{
   StateSyncPublicationEvidence,
   StateSyncRequestEvidence
 }
-import org.openivm.spark.telemetry.{BoundedTelemetryQueue, OpenIvmExecutionSpan}
+import org.openivm.spark.telemetry.{BoundedTelemetryQueue, BoundedTelemetryRuntime, OpenIvmExecutionSpan}
 import org.openivm.spark.testkit.TestPools
 import org.scalatest.concurrent.Eventually
 import org.scalatest.time.{Seconds, Span}
@@ -85,6 +85,24 @@ class StateGuardConcurrentRefreshPerfSpec extends IvmParitySpecBase("state-guard
       StateGuardFsInjection.disable()
       StateGuardFsInjection.reset()
       OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(null)
+      val drained = BoundedTelemetryRuntime.awaitDrain(10000L)
+      BoundedTelemetryRuntime.health.foreach { health =>
+        StateGuardReport.write(
+          "state-guard-telemetry.json",
+          Map[String, Any](
+            "drained"           -> drained,
+            "accepted"          -> health.accepted,
+            "published"         -> health.published,
+            "dropped_contended" -> health.droppedContended,
+            "dropped_full"      -> health.droppedFull,
+            "dropped_closed"    -> health.droppedClosed,
+            "dropped_oversized" -> health.droppedOversized,
+            "export_failures"   -> health.exportFailures,
+            "worker_failures"   -> health.workerFailures,
+            "queued"            -> health.queued
+          )
+        )
+      }
     } finally {
       try super.afterAll()
       finally deleteDir(workDir)

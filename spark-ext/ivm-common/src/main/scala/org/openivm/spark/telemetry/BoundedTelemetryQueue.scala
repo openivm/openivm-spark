@@ -58,10 +58,8 @@ final class BoundedTelemetryQueue private[telemetry] (
     if (line == null || line.length > maxChars) {
       oversized.incrementAndGet()
       false
-    } else if (!gate.tryLock()) {
-      contended.incrementAndGet()
-      false
     } else {
+      gate.lock()
       try {
         if (!accepting.get()) {
           closed.incrementAndGet()

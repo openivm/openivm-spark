@@ -1,9 +1,18 @@
 package org.openivm.spark.common.rocksdb
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
+import org.apache.hadoop.fs.{FileStatus, LocalFileSystem, Path => HadoopPath}
 import org.apache.spark.sql.SparkSession
 import org.openivm.spark.commands.CommandConcurrencyInjection
-import org.openivm.spark.common.{DeltaTableVersion, FeatureGate, MvCatalog, RefreshTypeCode}
+import org.openivm.spark.common.{
+  CdfWatermarkCatalog,
+  ChangeWatermark,
+  DeltaTableVersion,
+  FeatureGate,
+  MvCatalog,
+  MvMetadata,
+  RefreshTypeCode
+}
 import org.openivm.spark.perf.{StateGuardPerfTag, StateGuardReport}
 import org.openivm.spark.telemetry.BoundedTelemetryRuntime
 import org.openivm.spark.testkit.TestPools
@@ -19,17 +28,39 @@ import scala.concurrent.duration._
 import scala.concurrent.{Await, Future}
 import scala.jdk.CollectionConverters._
 
+class StateGuardCdfGapFileSystem extends LocalFileSystem {
+  private def beforeRead(path: HadoopPath): Unit = {
+    val hook = StateGuardCrashProbe.beforeCdfWatermarkWrite
+    if (hook != null && path.toString.contains("/cdf_watermarks")) {
+      val stack = Thread.currentThread().getStackTrace.toVector
+      if (
+        stack
+          .exists(f => f.getClassName.contains("CdfChangePropagation") && f.getMethodName.contains("markConsumed")) &&
+        stack.exists(_.getMethodName.contains("postRefreshCleanup"))
+      ) {
+        StateGuardCrashProbe.beforeCdfWatermarkWrite = null
+        hook()
+      }
+    }
+  }
+
+  override def getFileStatus(path: HadoopPath): FileStatus     = { beforeRead(path); super.getFileStatus(path) }
+  override def listStatus(path: HadoopPath): Array[FileStatus] = { beforeRead(path); super.listStatus(path) }
+}
+
 /** Child process for [[StateGuardCrashRecoverySpec]]: the `crash` phase kills itself at a state transition, the
   * `recover` phase runs in a fresh JVM against the same warehouse, metastore and state-sync remote.
   */
 private[rocksdb] object StateGuardCrashProbe {
   val CrashExit = 73
 
-  private val BeforeCommit = "state_sync_before_snapshot_commit"
-  private val AfterCommit  = "state_sync_after_snapshot_commit"
-  private val BeforeFinal  = "refresh_before_finalize"
-  private val AckedRefresh = "acked_refresh_durable"
-  val Points: Seq[String]  = Seq(BeforeCommit, AfterCommit, BeforeFinal, AckedRefresh)
+  private val BeforeCommit                            = "state_sync_before_snapshot_commit"
+  private val AfterCommit                             = "state_sync_after_snapshot_commit"
+  private val BeforeFinal                             = "refresh_before_finalize"
+  private val AckedRefresh                            = "acked_refresh_durable"
+  val CdfWatermarkGap                                 = "mv_version_and_cdf_watermark_gap"
+  val Points: Seq[String]                             = Seq(BeforeCommit, AfterCommit, BeforeFinal, AckedRefresh)
+  @volatile var beforeCdfWatermarkWrite: (() => Unit) = _
 
   private val source = "default.sgcrash_events"
   private val mv     = "default.sgcrash_mv"
@@ -39,9 +70,23 @@ private[rocksdb] object StateGuardCrashProbe {
     private val mapper = new ObjectMapper()
     val cdf            = mode == "cdf"
 
-    def sql(text: String): Unit = { spark.sql(text).collect(); () }
-    def metadata                = MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)).get
-    def mvVersion(): Long       = DeltaTableVersion.requireLatest(spark, metadata.location)
+    def sql(text: String): Unit   = { spark.sql(text).collect(); () }
+    def metadata                  = MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)).get
+    def mvVersion(): Long         = DeltaTableVersion.requireLatest(spark, metadata.location)
+    def sourceVersion(): Long     = spark.sql(s"DESCRIBE HISTORY $source LIMIT 1").head().getLong(0)
+    def watermark(): Option[Long] = CdfWatermarkCatalog.get(spark, mv, metadata.sourceTables.head)
+
+    def requireCdfGap(beforeMv: Long, beforeWatermark: Long, pendingVersion: Long): Unit = {
+      val meta = metadata
+      require(mvVersion() > beforeMv && converged(), "MV data and catalog advance must commit before the crash")
+      require(watermark().contains(beforeWatermark), "the separate CDF watermark advanced before the crash")
+      val persisted = meta.properties
+        .get(s"${MvMetadata.WatermarkKeyPrefix}${meta.sourceTables.head}")
+        .flatMap(ChangeWatermark.decodeDeltaVersion)
+        .map(_.version)
+      require(persisted.contains(pendingVersion), "MV metadata did not durably record the applied CDF version")
+      require(parity(), "MV data diverged before the watermark crash")
+    }
 
     def parity(): Boolean = {
       val actual   = spark.sql(s"SELECT symbol, events, total FROM $mv")
@@ -115,6 +160,8 @@ private[rocksdb] object StateGuardCrashProbe {
       .config("spark.sql.catalogImplementation", "hive")
       .config("spark.hadoop.javax.jdo.option.ConnectionURL", s"jdbc:derby:;databaseName=$root/metastore;create=true")
       .config("spark.sql.warehouse.dir", root.resolve("warehouse").toString)
+      .config("spark.hadoop.fs.file.impl", classOf[StateGuardCdfGapFileSystem].getName)
+      .config("spark.hadoop.fs.file.impl.disable.cache", "true")
       .config(FeatureGate.EnabledKey, "true")
       .config(FeatureGate.ChangeFeedModeKey, mode)
       .config(FeatureGate.QueryLogEnabledKey, (mode == "cdf").toString)
@@ -159,6 +206,33 @@ private[rocksdb] object StateGuardCrashProbe {
         f.refresh("sgcrash-crash")
         require(f.parity(), "acknowledged refresh did not produce a correct MV")
         die(root, point)
+      case CdfWatermarkGap =>
+        require(f.cdf, "the watermark gap requires CDF mode")
+        val beforeMv        = f.mvVersion()
+        val beforeWatermark = f.watermark().get
+        val pendingVersion  = f.sourceVersion()
+        require(pendingVersion > beforeWatermark, "the crash must interrupt a nonempty CDF batch")
+        Files.write(
+          root.resolve("gap-receipt"),
+          Seq(beforeMv.toString, beforeWatermark.toString, pendingVersion.toString).asJava,
+          UTF_8
+        )
+        val interrupt = () => {
+          f.requireCdfGap(beforeMv, beforeWatermark, pendingVersion)
+          die(root, point)
+        }
+        beforeCdfWatermarkWrite = interrupt
+        OpenIvmRocksDBRegistry.setAfterSlotSelectionHookForTesting { _ =>
+          val stack = Thread.currentThread().getStackTrace.toVector
+          if (
+            stack.exists(f => f.getClassName.contains("RocksDbCdfWatermarkBackend") && f.getMethodName == "putAll") &&
+            stack.exists(_.getMethodName.contains("postRefreshCleanup"))
+          ) {
+            OpenIvmRocksDBRegistry.setAfterSlotSelectionHookForTesting(_ => ())
+            interrupt()
+          }
+        }
+        f.refresh("sgcrash-crash")
       case other => sys.error(s"unknown crash point $other")
     }
     sys.error(s"crash point $point did not fire")
@@ -173,6 +247,10 @@ private[rocksdb] object StateGuardCrashProbe {
     val meta = f.metadata
     require(meta.refreshType != RefreshTypeCode.FullRefresh, "recovered MV lost its incremental refresh type")
     val beforeRecovery = f.mvVersion()
+    if (point == CdfWatermarkGap) {
+      val saved = Files.readAllLines(root.resolve("gap-receipt"), UTF_8).asScala.map(_.toLong)
+      f.requireCdfGap(saved(0), saved(1), saved(2))
+    }
     f.refresh("sgcrash-recover-1")
     val restored      = Files.isDirectory(root.resolve("state"))
     val afterRecovery = f.mvVersion()
@@ -184,9 +262,13 @@ private[rocksdb] object StateGuardCrashProbe {
     val outcome     = f.outcome("sgcrash-recover-3")
     val incremental = outcome != "missing" && outcome.nonEmpty && !outcome.contains("full_refresh")
     val finalOk     = f.parity() && f.converged()
-    val ackedKept   = point != AckedRefresh || afterRecovery == beforeRecovery
+    val ackedKept   = !Seq(AckedRefresh, CdfWatermarkGap).contains(point) || afterRecovery == beforeRecovery
 
     val result = new java.util.LinkedHashMap[String, AnyRef]()
+    result.put("crash_pid", java.lang.Long.valueOf(new String(Files.readAllBytes(root.resolve("receipt")), UTF_8)))
+    result.put("recovery_pid", java.lang.Long.valueOf(ProcessHandle.current().pid()))
+    result.put("mv_version_before_recovery", java.lang.Long.valueOf(beforeRecovery))
+    result.put("mv_version_after_recovery", java.lang.Long.valueOf(afterRecovery))
     result.put("parity", java.lang.Boolean.valueOf(recoveredOk && finalOk))
     result.put("metadata_converged", java.lang.Boolean.valueOf(recoveredOk && finalOk))
     result.put("incremental_after_recovery", java.lang.Boolean.valueOf(incremental && retryClean && ackedKept))
@@ -298,29 +380,31 @@ class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
       "parity"                     -> flag("parity"),
       "metadata_converged"         -> flag("metadata_converged"),
       "incremental_after_recovery" -> flag("incremental_after_recovery"),
-      "known_gap"                  -> false,
+      "known_gap"                  -> (point.name == StateGuardCrashProbe.CdfWatermarkGap),
       "notes"                      -> (point.notes + diagnostics)
     )
+    val evidence = StateGuardReport.reportDir.toPath.resolve("crash-probes").resolve(s"${point.mode}-${point.name}")
+    Files.createDirectories(evidence)
+    Seq("crash.log", "recover.log", "crash-marker", "receipt", "gap-receipt", "recover-result.json").foreach { name =>
+      val file = root.resolve(name)
+      if (Files.isRegularFile(file)) Files.copy(file, evidence.resolve(name))
+    }
     (report, root)
   }
 
-  private val knownGap = Map[String, Any](
-    "name"                       -> "mv_version_and_cdf_watermark_gap",
-    "mode"                       -> "cdf",
-    "crashed"                    -> false,
-    "recovered"                  -> false,
-    "parity"                     -> false,
-    "metadata_converged"         -> false,
-    "incremental_after_recovery" -> false,
-    "known_gap"                  -> true,
-    "notes" -> ("documented gap between the MV-version write and the CDF-watermark write; not gated here, " +
-      "see CdfFinalizationCrashSpec")
+  private val watermarkGap = Point(
+    StateGuardCrashProbe.CdfWatermarkGap,
+    "cdf",
+    wipeLocalState = false,
+    "killed after durable MV-version publication and before the separate CDF-watermark write; " +
+      "fresh-process recovery must preserve parity and retry without replay; retained as known_gap by the frozen evaluator"
   )
 
   it("recovers in a fresh process from kills at state-sync and refresh finalization transitions", StateGuardPerfTag) {
-    val backend = StateGuardReport.catalogBackend
-    val runs = TestPools.withPool(points.size) { implicit ec =>
-      Await.result(Future.sequence(points.map(p => Future(runPoint(p, backend)))), 40.minutes)
+    val backend   = StateGuardReport.catalogBackend
+    val exercised = points :+ watermarkGap
+    val runs = TestPools.withPool(exercised.size) { implicit ec =>
+      Await.result(Future.sequence(exercised.map(p => Future(runPoint(p, backend)))), 40.minutes)
     }
     val reports = runs.map(_._1)
     StateGuardReport.write(
@@ -330,7 +414,7 @@ class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
         "spark_target"    -> StateGuardReport.sparkTarget,
         "head_sha"        -> StateGuardReport.headSha,
         "catalog_backend" -> backend,
-        "points"          -> (reports :+ knownGap)
+        "points"          -> reports
       )
     )
     val failing = reports.filterNot(r =>
