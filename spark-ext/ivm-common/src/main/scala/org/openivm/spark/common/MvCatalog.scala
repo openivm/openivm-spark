@@ -986,6 +986,14 @@ object MvCatalog {
   def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
     backend(spark).advance(spark, lookup(spark, name).map(_.name).getOrElse(name), newVersion)
 
+  private[spark] def advanceWithInterceptWitness(
+      spark: SparkSession,
+      name: TableIdentifier,
+      newVersion: Long,
+      token: String
+  ): Unit =
+    DeltaMvCatalogBackend.advanceWithInterceptWitness(spark, lookup(spark, name).map(_.name).getOrElse(name), newVersion, token)
+
   def advanceWithCdfWatermarks(
       spark: SparkSession,
       name: TableIdentifier,

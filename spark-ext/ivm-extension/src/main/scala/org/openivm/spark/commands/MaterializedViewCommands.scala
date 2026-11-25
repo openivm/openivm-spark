@@ -994,6 +994,11 @@ private[commands] object MvCommandHelper {
   def mvLockKeys(spark: SparkSession, name: TableIdentifier, meta: Option[MvMetadata]): Seq[String] =
     (Seq(metaName(MvCatalog.qualifiedName(spark, name))) ++ meta.map(m => metaName(m.name))).distinct
 
+  def interceptWitnessEnabled(spark: SparkSession): Boolean =
+    FeatureGate.deltaCatalogEnabled(spark) && ChangePropagationFactory.forSession(spark).requiresDmlInterception &&
+      (FeatureGate.stateSyncUri(spark).nonEmpty || OpenIvmStateSync.guardedSqlEnabled(spark))
+
+
   /** The verified friendly<->resolved snapshot-pin binding for one command.
     *
     * `resolvedPins` associate each pinned relation in the body to its RESOLVED
@@ -4203,6 +4208,8 @@ case class CreateMaterializedViewCommand(
           val version = DeltaTableVersion.requireLatest(spark, dataLocation)
           OpenIvmStateBarrier.withMutation(spark) {
             beforeMetadataPublication()
+            val witnessToken =
+              if (interceptWitnessEnabled(spark)) Some(UUID.randomUUID().toString) else None
             groupedInitial.foreach { initial =>
               profile.timeStep("create_grouped_window_commit", s"version=$version") {
                 initial.commit(dataLocation, version)
@@ -4212,9 +4219,12 @@ case class CreateMaterializedViewCommand(
               spark,
               meta.copy(
                 lastVersion = version,
-                properties = meta.properties + (MvMetadata.TargetDeltaTableIdKey -> writtenDataTableId.get)
+                properties = meta.properties ++ Map(MvMetadata.TargetDeltaTableIdKey -> writtenDataTableId.get) ++
+                  witnessToken.map(StagingCatalog.CompletedRefreshTokenKey -> _)
               )
             )
+            witnessToken.foreach(token =>
+              StagingCatalog.recordCompletedRefresh(spark, metaName(meta.name), token, version, writtenDataTableId.get))
             publicationCommitted = true
           }
         }
@@ -4542,6 +4552,24 @@ case class RefreshMaterializedViewCommand(
         val currentMeta = MvCatalog.lookupForRelation(spark, name)
         if (currentMeta.exists(meta => !viewLockKeys.contains(metaName(meta.name))))
           throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} changed while acquiring locks")
+        if (interceptWitnessEnabled(spark)) {
+          currentMeta.filterNot(_.properties.contains(StagingCatalog.CompletedRefreshTokenKey)).foreach { legacy =>
+            val tableId = deltaIdentityAt(spark, legacy.location).flatMap(_._1).filter(_.nonEmpty)
+            tableId.foreach { id =>
+              OpenIvmStateBarrier.withMutation(spark) {
+                val stored = StagingCatalog.completedRefreshWitness(spark, metaName(legacy.name))
+                val witness = stored.getOrElse(
+                  StagingCatalog.CompletedRefreshWitness(UUID.randomUUID().toString, legacy.lastVersion, id)
+                )
+                if (witness.dataVersion != legacy.lastVersion || witness.tableId != id)
+                  throw new IllegalStateException(s"Legacy materialized view ${sqlIdent(name)} has inconsistent state")
+                StagingCatalog.recordCompletedRefresh(
+                  spark, metaName(legacy.name), witness.token, witness.dataVersion, witness.tableId)
+              }
+              OpenIvmStateSync.backupNow(spark)
+            }
+          }
+        }
         val missing = expectedQueryHash.isDefined && currentMeta.isEmpty
         if (missing) {
           if (expectedTableId.isDefined)
@@ -5176,7 +5204,25 @@ case class RefreshMaterializedViewCommand(
           recordTargetId(tableId)
         }
       }
-      val meta = recoverInterruptedSourceVersionAdvance(spark, loadedMeta)
+      val recoveredMeta = recoverInterruptedSourceVersionAdvance(spark, loadedMeta)
+      val staleWitness =
+        if (!interceptWitnessEnabled(spark)) None
+        else recoveredMeta.properties.get(StagingCatalog.CompletedRefreshTokenKey).flatMap { token =>
+          val witness = StagingCatalog.completedRefreshWitness(spark, metaName(recoveredMeta.name)).getOrElse(
+            throw new IllegalStateException(s"Missing completed refresh witness for ${sqlIdent(name)}")
+          )
+          if (!deltaIdentityAt(spark, recoveredMeta.location).flatMap(_._1).contains(witness.tableId))
+            throw new IllegalStateException(s"Completed refresh witness target changed for ${sqlIdent(name)}")
+          if (witness.dataVersion > recoveredMeta.lastVersion)
+            throw new IllegalStateException(s"Invalid completed refresh version for ${sqlIdent(name)}")
+          if (witness.token != token || witness.dataVersion != recoveredMeta.lastVersion) Some(witness)
+          else None
+        }
+      if (staleWitness.nonEmpty && sourceVersionAdvance.nonEmpty)
+        throw new IllegalStateException(
+          s"Materialized view ${sqlIdent(name)} requires recovery before advancing source versions"
+        )
+      val meta = staleWitness.fold(recoveredMeta)(witness => recoveredMeta.copy(lastVersion = witness.dataVersion))
       val compileRefreshType = meta.properties
         .get(MvMetadata.CompileRefreshTypeKey)
         .map(_.trim)
@@ -5430,7 +5476,9 @@ case class RefreshMaterializedViewCommand(
       val stateLag: Option[MvStateLag] =
         profile.timeObservedStep("state_lag_check") {
           if (preparedSourceAdvance.nonEmpty) None
-          else MvStateLag.detect(spark, meta)
+          else MvStateLag.detect(spark, meta).orElse {
+            staleWitness.map(_ => MvStateLag(DeltaTableVersion.requireLatest(spark, meta.location)))
+          }
         }
       stateLag.foreach { lag =>
         logWarning(
@@ -9757,9 +9805,16 @@ case class RefreshMaterializedViewCommand(
     val newVersion = committedDataVersion.getOrElse {
       DeltaTableVersion.requireLatest(spark, meta.location)
     }
+    val previousWitness =
+      if (interceptWitnessEnabled(spark)) StagingCatalog.completedRefreshWitness(spark, viewNameStr) else None
+    val witnessToken = previousWitness.map(_ => UUID.randomUUID().toString)
     profile.timeObservedStep("finalize_catalog_advance") {
       replacementMeta match {
-        case Some(updated) => MvCatalog.upsert(spark, updated.copy(lastVersion = newVersion))
+        case Some(updated) =>
+          MvCatalog.upsert(spark, updated.copy(
+            lastVersion = newVersion,
+            properties = updated.properties ++ witnessToken.map(StagingCatalog.CompletedRefreshTokenKey -> _)
+          ))
         case None if propagation.mode == ChangeFeedMode.Cdf =>
           val cdfWatermarks = changeBatches
             .collect {
@@ -9769,12 +9824,22 @@ case class RefreshMaterializedViewCommand(
             .groupBy(_._1)
             .map { case (baseTable, versions) => baseTable -> versions.map(_._2).max }
           MvCatalog.advanceWithCdfWatermarks(spark, name, newVersion, cdfWatermarks)
+        case None if witnessToken.isDefined =>
+          MvCatalog.advanceWithInterceptWitness(spark, name, newVersion, witnessToken.get)
         case None => MvCatalog.advance(spark, name, newVersion)
       }
     }
 
     profile.timeObservedStep("finalize_mark_consumed") {
+      witnessToken.foreach { token =>
+        val actual = MvCatalog.lookupStored(spark, meta.name)
+          .flatMap(_.properties.get(StagingCatalog.CompletedRefreshTokenKey))
+        if (!actual.contains(token))
+          throw new IllegalStateException(s"Catalog did not commit the refresh witness for $viewNameStr")
+      }
       propagation.markConsumed(spark, viewNameStr, changeBatches)
+      witnessToken.foreach(token =>
+        StagingCatalog.recordCompletedRefresh(spark, viewNameStr, token, newVersion, previousWitness.get.tableId))
     }
 
     // Non-cascade trigger synthesis is intercept-mode only.  Under CDF mode
