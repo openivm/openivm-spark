@@ -88,11 +88,47 @@ object StagingCatalog {
   private val MvDbColumnFamilies   = OpenIvmStatePaths.PerMvColumnFamilies
   private val BaseDbColumnFamilies = OpenIvmStatePaths.BaseTableColumnFamilies
 
-  private val StagingCf  = "staging"
-  private val ConsumedCf = "consumed"
-  private val LedgerCf   = "ledger"
-  private val GcCf       = "gc"
-  private val LedgerKey  = RocksDBCodec.utf8("source")
+  private val StagingCf                = "staging"
+  private val ConsumedCf               = "consumed"
+  private val MetaCf                   = "meta"
+  private val LedgerCf                 = "ledger"
+  private val GcCf                     = "gc"
+  private val LedgerKey                = RocksDBCodec.utf8("source")
+  private val CompletedRefreshKey      = RocksDBCodec.utf8("_ivm_completed_refresh_witness")
+  val CompletedRefreshTokenKey: String = "_ivm_completed_refresh_token"
+
+  final case class CompletedRefreshWitness(token: String, dataVersion: Long, tableId: String)
+
+  def completedRefreshWitness(spark: SparkSession, viewName: String): Option[CompletedRefreshWitness] =
+    openTrackedMvDb(spark, viewName).flatMap(_.get(MetaCf, CompletedRefreshKey)).map { value =>
+      val parts = RocksDBCodec.splitComposite(value, 3)
+      require(parts.length == 3, s"Invalid completed refresh witness for $viewName")
+      val token = RocksDBCodec.fromUtf8(parts.head)
+      require(token.nonEmpty, s"Empty completed refresh witness for $viewName")
+      val tableId = RocksDBCodec.fromUtf8(parts(2))
+      require(tableId.nonEmpty, s"Empty completed refresh table identity for $viewName")
+      CompletedRefreshWitness(token, RocksDBCodec.decodeLongBE(parts(1)), tableId)
+    }
+
+  def recordCompletedRefresh(
+      spark: SparkSession,
+      viewName: String,
+      token: String,
+      dataVersion: Long,
+      tableId: String
+  ): Unit = {
+    require(token.nonEmpty, "Completed refresh token must not be empty")
+    require(tableId.nonEmpty, "Completed refresh table identity must not be empty")
+    val db = OpenIvmRocksDBRegistry.getOrOpen(
+      spark,
+      OpenIvmStatePaths.perMvDbPath(spark, viewName),
+      MvDbColumnFamilies
+    )
+    val value = RocksDBCodec.compositeKey(
+      Seq(RocksDBCodec.utf8(token), RocksDBCodec.encodeLongBE(dataVersion), RocksDBCodec.utf8(tableId))
+    )
+    db.withBatch(batch => OpenIvmRocksDBBatchOps.put(db, batch, MetaCf, CompletedRefreshKey, value))
+  }
 
   private def baseTableDbPath(spark: SparkSession, baseTable: String): String =
     OpenIvmStatePaths.baseTableDbPath(spark, baseTable)
