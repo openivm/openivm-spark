@@ -23,7 +23,7 @@ experiments:
     evaluator:
       timeout: 7200
       commands:
-        - python3 "${OPENIVM_DARWIN_TRUSTED:?set OPENIVM_DARWIN_TRUSTED}/experiments/darwin/evaluator/state_guard_eval.py" --mode candidate --lane c --workspace . --baseline-repo "${OPENIVM_DARWIN_TRUSTED}" --baseline-ref "${OPENIVM_DARWIN_BASELINE_SHA:?set OPENIVM_DARWIN_BASELINE_SHA}" --lock-sha256 "${OPENIVM_DARWIN_LOCK_SHA256:?set OPENIVM_DARWIN_LOCK_SHA256}" --pairs 3
+        - python3 "${OPENIVM_DARWIN_TRUSTED:?set OPENIVM_DARWIN_TRUSTED}/experiments/darwin/evaluator/state_guard_eval.py" --mode candidate --lane c --workspace "$PWD" --baseline-repo "${OPENIVM_DARWIN_TRUSTED}" --baseline-ref "${OPENIVM_DARWIN_BASELINE_SHA:?set OPENIVM_DARWIN_BASELINE_SHA}" --lock-sha256 "${OPENIVM_DARWIN_LOCK_SHA256:?set OPENIVM_DARWIN_LOCK_SHA256}" --pairs 3
       metrics:
         combined_score: !eval float([l for l in stdout if l.startswith('@RESULT combined_score=')][0].split('=', 1)[1])
         allowlist_gate: !eval float([l for l in stdout if l.startswith('@RESULT allowlist_gate=')][0].split('=', 1)[1])

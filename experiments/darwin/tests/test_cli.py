@@ -1,10 +1,12 @@
 import contextlib
 import io
 import math
+import os
 import re
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 
 import lock
 import runner
@@ -301,6 +303,28 @@ class TrustGateTests(unittest.TestCase):
             with open(copy / "evaluator" / "scoring.py", "a", encoding="utf-8") as handle:
                 handle.write("\nCLAMP = 1e308\n")
             self.assertEqual(lock.verify(copy), ["evaluator/scoring.py: digest mismatch"])
+
+
+class WorkspaceTests(unittest.TestCase):
+    def test_a_relative_workspace_is_resolved_before_any_path_is_derived_from_it(self):
+        with scratch_dir() as tmp:
+            previous = os.getcwd()
+            os.chdir(tmp)
+            try:
+                args = state_guard_eval.parse_args(["--mode", "candidate", "--lane", "a", "--workspace", "."])
+            finally:
+                os.chdir(previous)
+            self.assertTrue(os.path.isabs(args.workspace))
+            self.assertEqual(Path(args.workspace), tmp.resolve())
+
+    def test_the_result_block_is_retained_on_disk_because_darwin_drops_the_seed_stdout(self):
+        with scratch_dir() as tmp:
+            args = state_guard_eval.parse_args(
+                ["--mode", "candidate", "--lane", "b", "--workspace", ".", "--cache-dir", str(tmp)]
+            )
+            state_guard_eval.retain_output(args, "@RESULT combined_score=0.000000\n")
+            kept = (tmp / "last-evaluation" / "b-candidate.txt").read_text(encoding="utf-8")
+        self.assertEqual(kept.strip(), "@RESULT combined_score=0.000000")
 
 
 class SubprocessTests(unittest.TestCase):

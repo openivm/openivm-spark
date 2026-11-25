@@ -70,7 +70,7 @@ class LaneConfigTests(unittest.TestCase):
                 self.assertIn("/experiments/darwin/evaluator/state_guard_eval.py", command)
                 self.assertIn("--mode candidate", command)
                 self.assertIn(f"--lane {lane} ", command)
-                self.assertIn("--workspace .", command)
+                self.assertIn('--workspace "$PWD"', command)
                 self.assertIn('--baseline-repo "${OPENIVM_DARWIN_TRUSTED}"', command)
                 self.assertIn('--baseline-ref "${OPENIVM_DARWIN_BASELINE_SHA:?', command)
                 self.assertIn('--lock-sha256 "${OPENIVM_DARWIN_LOCK_SHA256:?', command)

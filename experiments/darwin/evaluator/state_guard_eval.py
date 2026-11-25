@@ -9,6 +9,7 @@ outcome (invalid => score 0.0), 2 for evaluator infrastructure errors.
 """
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -117,7 +118,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--offline-fixtures", default="", help="directory of fixture report sets; skips Nx and git")
     parser.add_argument("--offline-baseline-set", default="baseline")
     parser.add_argument("--offline-candidate-set", default="good-candidate")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.workspace = str(Path(args.workspace).resolve())
+    return args
 
 
 def pct(value: float) -> str:
@@ -528,8 +531,24 @@ def main(argv: list[str] | None = None, run: Any = None, stream: TextIO | None =
         out.say(f"infra: unexpected {type(exc).__name__}: {exc}")
         code = 2
     out.results["combined_score"] = 0.0 if out.failed() or code else out.results["combined_score"]
-    out.emit(stream)
+    block = io.StringIO()
+    out.emit(block)
+    stream.write(block.getvalue())
+    stream.flush()
+    retain_output(args, block.getvalue())
     return code
+
+
+def retain_output(args: argparse.Namespace, text: str) -> None:
+    # Darwin 0.3.0 drops the evaluator's stdout for the seed program, so keep the last result block on disk.
+    if args.offline_fixtures:
+        return
+    try:
+        target = Path(args.cache_dir).expanduser() / "last-evaluation" / f"{args.lane}-{args.mode}.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        log(f"could not retain the result block: {exc}")
 
 
 if __name__ == "__main__":

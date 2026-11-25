@@ -111,9 +111,15 @@ Evaluator commands (inside each config) shape:
 
 ```bash
 python3 "$OPENIVM_DARWIN_TRUSTED/experiments/darwin/evaluator/state_guard_eval.py" --mode candidate --lane a \
-  --workspace . --baseline-repo "$OPENIVM_DARWIN_TRUSTED" --baseline-ref "$OPENIVM_DARWIN_BASELINE_SHA" \
+  --workspace "$PWD" --baseline-repo "$OPENIVM_DARWIN_TRUSTED" --baseline-ref "$OPENIVM_DARWIN_BASELINE_SHA" \
   --lock-sha256 "$OPENIVM_DARWIN_LOCK_SHA256" --pairs 3
 ```
+
+`--workspace "$PWD"` is deliberate: Darwin runs the command inside the candidate checkout, and the evaluator resolves the
+path to an absolute one before anything derives from it (a relative path used to put the test JVM's crash report
+under `spark-ext/` where the evaluator never looked, scoring every candidate 0). Darwin 0.3.0 also discards the
+evaluator's stdout for the *initial* (seed) program, so the evaluator keeps its last result block in
+`~/.cache/openivm-darwin/last-evaluation/<lane>-<mode>.txt`.
 
 Metrics are strict lookups of `@RESULT` lines: a missing metric makes Darwin treat the evaluation as failed
 instead of silently scoring 0. **Darwin 0.3.0 counts failed evaluations toward `max_iterations_without_improvement`
