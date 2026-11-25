@@ -35,12 +35,13 @@ private[rocksdb] object StateGuardCrashProbe {
   private val mv     = "default.sgcrash_mv"
   private val query  = s"SELECT symbol, COUNT(*) AS events, SUM(amount) AS total FROM $source GROUP BY symbol"
 
-  private final class Fixture(spark: SparkSession, root: Path) {
+  private final class Fixture(spark: SparkSession, root: Path, mode: String) {
     private val mapper = new ObjectMapper()
+    val cdf            = mode == "cdf"
 
-    def sql(text: String): Unit      = { spark.sql(text).collect(); () }
-    def version(table: String): Long = spark.sql(s"DESCRIBE HISTORY $table LIMIT 1").head().getLong(0)
-    def metadata = MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)).get
+    def sql(text: String): Unit       = { spark.sql(text).collect(); () }
+    def metadata                      = MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)).get
+    def mvVersion(): Long             = DeltaTableVersion.requireLatest(spark, metadata.location)
 
     def parity(): Boolean = {
       val actual   = spark.sql(s"SELECT symbol, events, total FROM $mv")
@@ -94,10 +95,11 @@ private[rocksdb] object StateGuardCrashProbe {
     val phase   = args(1)
     val point   = args(2)
     val backend = args(3)
+    val mode    = args(4)
     val spark = SparkSession
       .builder()
       .master("local[1]")
-      .appName(s"state-guard-crash-$phase-$point")
+      .appName(s"state-guard-crash-$mode-$phase-$point")
       .config("spark.ui.enabled", "false")
       .config("spark.plugins", "org.openivm.spark.plugin.metrics.OpenIvmMetricsPlugin")
       .config("spark.openivm.telemetry.queue.enabled", "true")
@@ -114,7 +116,8 @@ private[rocksdb] object StateGuardCrashProbe {
       .config("spark.hadoop.javax.jdo.option.ConnectionURL", s"jdbc:derby:;databaseName=$root/metastore;create=true")
       .config("spark.sql.warehouse.dir", root.resolve("warehouse").toString)
       .config(FeatureGate.EnabledKey, "true")
-      .config("spark.openivm.changeFeed.mode", "cdf")
+      .config(FeatureGate.ChangeFeedModeKey, mode)
+      .config(FeatureGate.QueryLogEnabledKey, (mode == "cdf").toString)
       .config(FeatureGate.CatalogBackendKey, backend)
       .config(FeatureGate.StatePathKey, root.resolve("state").toString)
       .config(FeatureGate.StateSyncUriKey, root.resolve("remote").toUri.toString)
@@ -122,7 +125,7 @@ private[rocksdb] object StateGuardCrashProbe {
       .config(FeatureGate.GcEnabledKey, "false")
       .getOrCreate()
     try {
-      val fixture = new Fixture(spark, root)
+      val fixture = new Fixture(spark, root, mode)
       if (phase == "crash") crash(fixture, root, point) else recover(fixture, root, point)
     } finally spark.stop()
   }
@@ -133,7 +136,8 @@ private[rocksdb] object StateGuardCrashProbe {
   }
 
   private def crash(f: Fixture, root: Path, point: String): Unit = {
-    f.sql(s"CREATE TABLE $source(symbol STRING, amount INT) USING DELTA TBLPROPERTIES ('delta.enableChangeDataFeed'='true')")
+    val props = if (f.cdf) " TBLPROPERTIES ('delta.enableChangeDataFeed'='true')" else ""
+    f.sql(s"CREATE TABLE $source(symbol STRING, amount INT) USING DELTA$props")
     f.sql(s"INSERT INTO $source SELECT concat('sym_', cast(id % 10 as string)), cast(id as int) FROM range(100)")
     f.sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
     require(f.metadata.refreshType != RefreshTypeCode.FullRefresh, "fixture MV must be incremental")
@@ -168,14 +172,13 @@ private[rocksdb] object StateGuardCrashProbe {
     )
     val meta = f.metadata
     require(meta.refreshType != RefreshTypeCode.FullRefresh, "recovered MV lost its incremental refresh type")
-    val restored = Files.isDirectory(root.resolve("state"))
-
-    val beforeRecovery = f.version(mv)
+    val beforeRecovery = f.mvVersion()
     f.refresh("sgcrash-recover-1")
-    val afterRecovery = f.version(mv)
+    val restored      = Files.isDirectory(root.resolve("state"))
+    val afterRecovery = f.mvVersion()
     val recoveredOk   = f.parity() && f.converged()
     f.refresh("sgcrash-recover-2")
-    val retryClean = f.version(mv) == afterRecovery && f.parity()
+    val retryClean = f.mvVersion() == afterRecovery && f.parity()
     f.delta(3)
     f.refresh("sgcrash-recover-3")
     val outcome     = f.outcome("sgcrash-recover-3")
@@ -194,7 +197,7 @@ private[rocksdb] object StateGuardCrashProbe {
 }
 
 private[rocksdb] object StateGuardCrashRecoverySpec {
-  final case class Point(name: String, wipeLocalState: Boolean, notes: String)
+  final case class Point(name: String, mode: String, wipeLocalState: Boolean, notes: String)
 }
 
 /** Fresh-process recovery of the state transitions the state-guard candidates touch. Each point kills a JVM at the
@@ -204,30 +207,38 @@ private[rocksdb] object StateGuardCrashRecoverySpec {
 class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
   import StateGuardCrashRecoverySpec.Point
 
-  private val points = Seq(
+  private val Modes = Seq("intercept", "cdf")
+
+  private val points = Modes.flatMap(mode => basePoints.map(_.copy(mode = mode)))
+
+  private def basePoints = Seq(
     Point(
       "state_sync_before_snapshot_commit",
+      "",
       wipeLocalState = true,
       "killed after the candidate snapshot upload and before its commit record; local state wiped, restored from remote"
     ),
     Point(
       "state_sync_after_snapshot_commit",
+      "",
       wipeLocalState = true,
       "killed after the snapshot commit and before the refresh returned; local state wiped, restored from remote"
     ),
     Point(
       "refresh_before_finalize",
+      "",
       wipeLocalState = false,
       "killed after the MV data apply and before consume, catalog advance and publication; local state kept"
     ),
     Point(
       "acked_refresh_durable",
+      "",
       wipeLocalState = true,
       "killed right after a synchronous acknowledgment; local state wiped, the acknowledged refresh must not replay"
     )
   )
 
-  private def launch(root: Path, phase: String, point: String, backend: String): Option[Int] = {
+  private def launch(root: Path, phase: String, point: Point, backend: String): Option[Int] = {
     val java = Paths.get(System.getProperty("java.home"), "bin", "java").toString
     val modules = ManagementFactory.getRuntimeMXBean.getInputArguments.asScala
       .filter(arg => arg.startsWith("--add-opens=") || arg.startsWith("--add-exports="))
@@ -238,8 +249,9 @@ class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
         "org.openivm.spark.common.rocksdb.StateGuardCrashProbe",
         root.toString,
         phase,
-        point,
-        backend
+        point.name,
+        backend,
+        point.mode
       )): _*
     ).redirectErrorStream(true).redirectOutput(root.resolve(s"$phase.log").toFile).start()
     try if (process.waitFor(300, TimeUnit.SECONDS)) Some(process.exitValue()) else None
@@ -256,14 +268,14 @@ class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
   private def runPoint(point: Point, backend: String): (Map[String, Any], Path) = {
     val root = Paths.get("target").toAbsolutePath.resolve(s"state-guard-crash-${UUID.randomUUID().toString.take(8)}")
     Files.createDirectories(root)
-    val crashExit = launch(root, "crash", point.name, backend)
+    val crashExit = launch(root, "crash", point, backend)
     val crashed   = crashExit.contains(StateGuardCrashProbe.CrashExit) && Files.isRegularFile(root.resolve("crash-marker"))
     var recoverExit: Option[Int] = None
     val result: Option[JsonNode] =
       if (!crashed) None
       else {
         if (point.wipeLocalState) deleteTree(root.resolve("state"))
-        recoverExit = launch(root, "recover", point.name, backend)
+        recoverExit = launch(root, "recover", point, backend)
         val file = root.resolve("recover-result.json")
         if (recoverExit.contains(0) && Files.isRegularFile(file)) Some(new ObjectMapper().readTree(file.toFile)) else None
       }
@@ -276,6 +288,7 @@ class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
       else ""
     val report = Map[String, Any](
       "name"                       -> point.name,
+      "mode"                       -> point.mode,
       "crashed"                    -> crashed,
       "recovered"                  -> (result.nonEmpty && restored),
       "parity"                     -> flag("parity"),
@@ -289,6 +302,7 @@ class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
 
   private val knownGap = Map[String, Any](
     "name"                       -> "mv_version_and_cdf_watermark_gap",
+    "mode"                       -> "cdf",
     "crashed"                    -> false,
     "recovered"                  -> false,
     "parity"                     -> false,
@@ -302,7 +316,7 @@ class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
   it("recovers in a fresh process from kills at state-sync and refresh finalization transitions", StateGuardPerfTag) {
     val backend = StateGuardReport.catalogBackend
     val runs = TestPools.withPool(points.size) { implicit ec =>
-      Await.result(Future.sequence(points.map(p => Future(runPoint(p, backend)))), 25.minutes)
+      Await.result(Future.sequence(points.map(p => Future(runPoint(p, backend)))), 40.minutes)
     }
     val reports = runs.map(_._1)
     StateGuardReport.write(
@@ -318,7 +332,7 @@ class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
     val failing = reports.filterNot(r =>
       Seq("crashed", "recovered", "parity", "metadata_converged", "incremental_after_recovery").forall(r(_) == true)
     )
-    withClue(failing.map(r => s"${r("name")}: ${r("notes")}").mkString("; ")) {
+    withClue(failing.map(r => s"${r("mode")}/${r("name")}: ${r("notes")}").mkString("; ")) {
       failing shouldBe empty
     }
     runs.foreach { case (_, root) => deleteTree(root) }
