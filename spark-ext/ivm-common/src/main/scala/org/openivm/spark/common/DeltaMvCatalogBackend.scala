@@ -234,26 +234,29 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
           )
       }
 
-  /** One Delta UPDATE that applies each request's single-view advance to its own row (rows are keyed by name). */
+  /** One Delta UPDATE that applies each request's single-view advance to its own row (rows are keyed by name).
+    *
+    * The condition names only `name` partitions, so Delta rewrites those rows in one pass instead of first scanning
+    * them for matches. The per-row advance condition moves into the assignments: a row whose stored version is not
+    * older keeps its values.
+    */
   private def advanceBatch(spark: SparkSession, requests: Seq[CdfAdvance]): Unit =
     if (requests.map(_.name).distinct.size != requests.size) requests.foreach(advanceOne(spark, _))
     else
       OpenIvmMetrics.time("catalog.mv_catalog.advance_batch") {
         withDeltaRetry {
           ensureTables(spark)
+          def advancing(r: CdfAdvance): Column = col(Name) === lit(r.name) && col(LastVersion) < lit(r.newVersion)
           def byName(value: CdfAdvance => Column, otherwise: Column): Column =
             requests.tail
-              .foldLeft(when(col(Name) === lit(requests.head.name), value(requests.head))) { (acc, r) =>
-                acc.when(col(Name) === lit(r.name), value(r))
+              .foldLeft(when(advancing(requests.head), value(requests.head))) { (acc, r) =>
+                acc.when(advancing(r), value(r))
               }
               .otherwise(otherwise)
-          val advanced = requests
-            .map(r => col(Name) === lit(r.name) && col(LastVersion) < lit(r.newVersion))
-            .reduce(_ || _)
           DeltaTable
             .forPath(spark, path(spark))
             .update(
-              col(Name).isin(requests.map(_.name): _*) && advanced,
+              col(Name).isin(requests.map(_.name): _*),
               Map(
                 LastVersion -> byName(r => lit(r.newVersion), col(LastVersion)),
                 Properties -> byName(
