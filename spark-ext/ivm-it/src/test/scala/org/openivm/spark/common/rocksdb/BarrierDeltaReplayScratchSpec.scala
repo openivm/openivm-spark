@@ -48,5 +48,32 @@ abstract class BarrierReplayScratchBase(backend: String)
   }
 }
 
-class BarrierReplayDeltaScratchSpec extends BarrierReplayScratchBase("delta")
+class BarrierReplayDeltaScratchSpec extends BarrierReplayScratchBase("delta") {
+  it("recovers the upstream delta for a downstream materialized view") {
+    val source = "barrier_delta_cascade_src"
+    val parent = "barrier_delta_cascade_parent"
+    val child = "barrier_delta_cascade_child"
+    val query = s"SELECT id, SUM(amount) AS total FROM $source GROUP BY id"
+    sql(s"CREATE TABLE $source(id INT, amount INT) USING DELTA")
+    sql(s"INSERT INTO $source VALUES (1, 10)")
+    sql(s"CREATE MATERIALIZED VIEW $parent AS $query")
+    sql(s"CREATE MATERIALIZED VIEW $child AS SELECT id, total FROM $parent")
+    OpenIvmStateSync.backupNow(spark)
+    sql(s"INSERT INTO $source VALUES (1, 25), (2, 5)")
+    OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => throw new java.io.IOException("injected crash"))
+    try {
+      intercept[Exception](refreshMv(parent))
+    } finally OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(null)
+    OpenIvmRocksDBRegistry.closeAll()
+    deleteDir(new File(warehouseDir, "_openivm"))
+    OpenIvmStateSync.resetForTesting()
+    refreshMv(parent)
+    refreshMv(child)
+    assertMvCorrect(parent, query)
+    assertMvCorrect(child, query)
+    refreshMv(parent)
+    refreshMv(child)
+    assertMvCorrect(child, query)
+  }
+}
 class BarrierReplayRocksScratchSpec extends BarrierReplayScratchBase("rocksdb")
