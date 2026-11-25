@@ -82,6 +82,11 @@ successful application.
 [Read the architecture overview](docs/architecture/openivm-spark/0.OVERVIEW.md) ·
 [Follow an aggregate refresh end to end](docs/architecture/openivm-spark/13-end-to-end-trace-aggregatesumspec.md)
 
+The Delta and RocksDB state architecture, including how catalog and state-sync
+state are shared across concurrent refreshes, is diagrammed in
+[openivm-delta-rocksdb-architecture.drawio.png](openivm-delta-rocksdb-architecture.drawio.png)
+([editable DrawIO](openivm-delta-rocksdb-architecture.drawio)).
+
 ## Documentation
 
 | Start here | Guides |

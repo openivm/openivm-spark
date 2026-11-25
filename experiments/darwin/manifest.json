@@ -1,0 +1,161 @@
+{
+  "schema": "openivm.darwin-manifest/v1",
+  "evidence_class": "local-relative-modeled-latency",
+  "report_schemas": {
+    "perf": "openivm.state-guard-perf/v1",
+    "crash": "openivm.state-guard-crash/v1"
+  },
+  "nx": {
+    "project": "spark-ext",
+    "target": "state-guard-perf",
+    "spark_targets": ["spark-3.5", "spark-4.1"],
+    "default_spark_target": "spark-3.5",
+    "report_dir_env": "OPENIVM_STATE_GUARD_REPORT_DIR",
+    "run_label_env": "OPENIVM_STATE_GUARD_RUN_LABEL",
+    "perf_report": "state-guard-perf.json",
+    "crash_report": "state-guard-crash.json"
+  },
+  "expected": {
+    "views": 6,
+    "incremental_count": 6,
+    "full_refresh_count": 0,
+    "min_crash_points": 3,
+    "max_report_value": 1000000000000.0
+  },
+  "acceptance": {
+    "min_wait_reduction": 0.8,
+    "min_e2e_improvement": 0.1,
+    "default_pairs": 3,
+    "min_pairs": 3,
+    "concurrency_slack": 1,
+    "min_serial_sum_ratio": 0.5
+  },
+  "scoring": {
+    "e2e_weight": 100.0,
+    "wait_weight": 50.0,
+    "accepted_bonus": 25.0,
+    "valid_floor": 0.001,
+    "ratio_clamp": 1.0
+  },
+  "budget": {
+    "max_iterations": 18,
+    "max_iterations_without_improvement": 8,
+    "metric": "combined_score",
+    "min_improvement": 0.5,
+    "improvement_type": "absolute",
+    "iteration_timeout_s": 5400,
+    "run_timeout_s": 1200,
+    "deadline_s": 5000
+  },
+  "frozen": {
+    "globs": [
+      "experiments/**",
+      "spark-ext/**/src/test/**",
+      "spark-ext/build.sbt",
+      "spark-ext/project/**",
+      "spark-ext/dev/**",
+      "spark-ext/project.json",
+      ".github/**",
+      "project.json",
+      "nx.json",
+      "package.json",
+      "package-lock.json",
+      ".devcontainer/**",
+      "contrib/**",
+      "**/telemetry/**",
+      "**/OpenIvmExecutionSpan.scala",
+      "**/RefreshProfile.scala",
+      "**/PhaseTimeline.scala"
+    ],
+    "basename_globs": ["*Perf*Spec*", "state-guard*", ".gitattributes"]
+  },
+  "protocol_files": ["output/*.json", "output/*.md"],
+  "known_gap": {
+    "name": "MV-version/CDF-watermark",
+    "text": "documented known gap: MV-version/CDF-watermark (crash between the MV-version write and the CDF-watermark write); only exercised when a candidate changes that path (lanes B, D)",
+    "lanes_that_may_touch": ["b", "d"]
+  },
+  "reference_evidence": {
+    "evidence_class": "local-relative-modeled-latency",
+    "note": "Modeled latency; spans are nested and non-additive; NOT OneLake proof; never used for scoring.",
+    "mv6_capture_wait_s": 5.509,
+    "mv5_catalog_finalization_span_s": 12.439,
+    "mv1_publication_queue_wait_s": 5.817,
+    "mv6_publication_s": 6.119,
+    "engine_execution_overlap_s": 31.809
+  },
+  "lanes": {
+    "a": {
+      "name": "shared barrier/lock scope",
+      "targeted": {"kind": "view_fields", "fields": ["state_barrier_wait_ms", "capture_wait_ms"]},
+      "informational": [],
+      "owned": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateBarrier.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmRocksDBRegistry.scala"
+      ],
+      "shared": [
+        "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala"
+      ],
+      "new_files": []
+    },
+    "b": {
+      "name": "catalog finalization",
+      "targeted": {"kind": "view_fields", "fields": ["catalog_finalize_ms"]},
+      "informational": [],
+      "owned": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/CdfWatermarkBackend.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/StagingCatalog.scala"
+      ],
+      "shared": [
+        "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaMvCatalogBackend.scala"
+      ],
+      "new_files": []
+    },
+    "c": {
+      "name": "per-MV publication/queue",
+      "targeted": {"kind": "view_fields", "fields": ["publication_queue_wait_ms", "publication_ms"]},
+      "informational": [],
+      "owned": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateSync.scala"
+      ],
+      "shared": [
+        "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateBarrier.scala"
+      ],
+      "new_files": []
+    },
+    "d": {
+      "name": "whole-path efficiency and catalog backend",
+      "targeted": {"kind": "view_fields", "fields": ["wall_ms"]},
+      "informational": [
+        {"name": "catalog_fs_ops_total", "path": "counts.fs_ops.catalog"}
+      ],
+      "owned": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalogBackend.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/FeatureGate.scala"
+      ],
+      "shared": [
+        "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaMvCatalogBackend.scala"
+      ],
+      "new_files": []
+    },
+    "e": {
+      "name": "incremental state shipping",
+      "targeted": {"kind": "path", "path": "counts.state_sync.bytes_uploaded"},
+      "informational": [
+        {"name": "state_sync_write_ops", "path": "counts.fs_ops.state_sync.write"}
+      ],
+      "owned": [],
+      "shared": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateSync.scala"
+      ],
+      "new_files": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateDelta*.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateSyncCodec*.scala"
+      ]
+    }
+  }
+}

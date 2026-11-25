@@ -1,0 +1,16 @@
+[
+ {
+  "path": "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateBarrier.scala",
+  "status": "M",
+  "old_mode": "100644",
+  "new_mode": "100644",
+  "binary": false
+ },
+ {
+  "path": "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala",
+  "status": "M",
+  "old_mode": "100644",
+  "new_mode": "100644",
+  "binary": false
+ }
+]

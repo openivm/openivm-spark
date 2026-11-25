@@ -1,0 +1,112 @@
+# Darwin lane B: catalog finalization.
+# Replace every "<...>" placeholder before `darwin run` (see experiments/darwin/README.md):
+#   source.ref, source.options.repository, container.options.path,
+#   evaluator.options.baseline_ref, evaluator.options.lock_sha256, agents[0].models[0].name
+name: openivm-state-guard-lane-b
+
+executor:
+  parallelism: 1
+  termination:
+    max_iterations: 18
+    early_stopping:
+      max_iterations_without_improvement: 8
+      metric: combined_score
+      min_improvement: 0.5
+      improvement_type: absolute
+
+source:
+  provider: git
+  ref: "<BASELINE_REF>"
+  options:
+    repository: "<REPOSITORY_URL_OR_LOCAL_PATH>"
+
+container:
+  provider: passthrough
+  options:
+    path: "<DARWIN_RUNTIME_DIR>/containers"
+
+prompt:
+  system: |
+    You are optimizing OpenIVM-Spark (Scala, spark-ext/) to reduce state-guard contention during
+    concurrent materialized-view (MV) refresh. You work in lane B of five independent lanes:
+    CATALOG FINALIZATION.
+
+    Lane goal: shrink the per-MV catalog finalization span, measured as catalog_finalize_ms
+    summed over the six MVs (the work that records the MV version, the CDF watermark and the
+    staging state when a refresh completes). Remove redundant catalog reads and writes,
+    coalesce or batch bookkeeping, or shorten what finalization does while the refresh still
+    holds shared state, without changing what ends up recorded.
+
+    Acceptance, all required (the evaluator measures a fresh same-box baseline, median of 3
+    interleaved paired runs):
+      1. every correctness and crash-recovery gate passes;
+      2. the lane-B waits (summed over the six MVs) drop by at least 80%;
+      3. the median paired end-to-end makespan improves by at least 10%.
+    Any failed gate, allowlist violation, build or test failure, or timeout scores 0.0.
+
+    Editable files for lane B (repository-relative):
+      owned:
+        - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala
+        - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/CdfWatermarkBackend.scala
+        - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/StagingCatalog.scala
+      shared with other lanes (keep the diff minimal; an integrator merges):
+        - spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala
+        - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaMvCatalogBackend.scala
+    Everything else is frozen: tests, build and CI files, experiments/, and the telemetry and
+    measurement files (OpenIvmExecutionSpan, RefreshProfile, PhaseTimeline, anything under
+    telemetry/). Do not add, delete, rename or chmod files, and do not add symlinks or binaries.
+    Darwin's required output/ protocol files are allowed.
+
+    Facts and rules:
+      - The measured spans are nested and NOT additive (for example catalog finalization runs inside
+        the barrier hold, and waits overlap). Do not read a sum of spans as a critical path.
+      - The evidence is local modeled latency: relative evidence only, not OneLake proof. Delta I/O
+        is NOT proven to be the cause of the contention; do not assume it.
+      - Never let an incrementalizable MV fall back to FULL_REFRESH. Gate: full_refresh_count == 0
+        and incremental_count == 6.
+      - Preserve crash-safety and the ordering of state transitions. Recovery after a crash at any
+        point must still converge to exact results, and recorded versions and watermarks must stay
+        consistent with the published state.
+      - Do not move or defer work outside the measured interval (the makespan includes a final
+        drain), do not serialize engine executions (concurrent engine executions must be kept), and
+        do not reduce the work an MV does.
+      - Do not weaken, skip or edit tests or assertions, and do not touch the evaluator.
+      - A known gap is documented and out of scope: a crash between the MV-version write and the
+        CDF-watermark write (MV-version/CDF-watermark). This lane may touch that path; do not make
+        the gap worse, and the crash suite will exercise it when you change that ordering.
+      - Do not run builds, tests or benchmarks; the evaluator owns them. Read only the source you
+        need, make one focused change, commit it and return.
+  agent: |
+    Reduce the lane-B span (catalog_finalize_ms). Start from MvCatalog.scala,
+    CdfWatermarkBackend.scala and StagingCatalog.scala and trace what a refresh finalization
+    reads and writes. Read the feedback artifact from the previous evaluation first: it lists the
+    per-MV catalog_finalize_ms, the failed gates and the first failure lines. State the mechanism
+    you are changing and why it preserves the recorded state and its write ordering.
+
+samplers:
+  - provider: islands
+    options:
+      population_size: 12
+      num_islands: 2
+      archive_size: 12
+      feature_dimensions:
+        - combined_score
+        - wait_reduction
+        - e2e_improvement_median
+
+evaluator:
+  path: ../evaluator/darwin_evaluator.py
+  timeout: 5400
+  retries: 0
+  builtin_metrics: []
+  options:
+    lane: b
+    baseline_ref: "<BASELINE_SHA>"
+    spark_target: spark-3.5
+    pairs: 3
+    lock_sha256: "<SHA256_OF_evaluator.lock.json>"
+
+agents:
+  - models:
+      - name: "<MODEL_NAME>"
+        timeout: 3600

@@ -1,0 +1,45 @@
+{
+ "schema": "openivm.state-guard-crash/v1",
+ "points": [
+  {
+   "name": "crash-after-barrier-acquire",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "state barrier held, process killed before capture"
+  },
+  {
+   "name": "crash-mid-state-publication",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "killed between state upload and commit marker"
+  },
+  {
+   "name": "crash-after-catalog-finalize",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "killed after catalog finalize, before the durable ack"
+  },
+  {
+   "name": "crash-between-mv-version-and-cdf-watermark",
+   "crashed": true,
+   "recovered": false,
+   "parity": false,
+   "metadata_converged": false,
+   "incremental_after_recovery": false,
+   "known_gap": true,
+   "notes": "documented known gap: MV-version/CDF-watermark"
+  }
+ ]
+}
