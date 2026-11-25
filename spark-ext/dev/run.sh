@@ -347,8 +347,14 @@ cmd_verify_all() {
 
 cmd_state_guard_perf() {
     local perf="ivmIt/testOnly org.openivm.spark.perf.StateGuardConcurrentRefreshPerfSpec -- -n org.openivm.spark.tags.StateGuardPerf"
-    local crash="ivmIt/testOnly org.openivm.spark.common.rocksdb.StateGuardCrashRecoverySpec -- -n org.openivm.spark.tags.StateGuardPerf"
+    local rocks="org.openivm.spark.common.rocksdb"
+    local crash="ivmIt/testOnly $rocks.StateGuardCrashRecoverySpec $rocks.InterceptStaleSnapshotCrashSpec $rocks.InterceptStaleSnapshotDeltaSpec $rocks.InterceptStaleSnapshotRocksSpec $rocks.LegacyInterceptWitnessSpec"
     local suites=()
+
+    if [[ -n "${OPENIVM_STATE_GUARD_REPORT_DIR:-}" ]]; then
+        mkdir -p "$OPENIVM_STATE_GUARD_REPORT_DIR/junit"
+        crash+=" -- -u $OPENIVM_STATE_GUARD_REPORT_DIR/junit"
+    fi
 
     case "${OPENIVM_STATE_GUARD_SUITE:-all}" in
         all)   suites=("$perf" "$crash") ;;

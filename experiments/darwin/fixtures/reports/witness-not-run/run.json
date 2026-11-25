@@ -1,0 +1,18 @@
+{
+ "exit_codes": {
+  "perf": 0,
+  "crash": 1
+ },
+ "outcomes": {
+  "InterceptStaleSnapshotCrashSpec: recovers delta after a pre-input snapshot": "passed",
+  "InterceptStaleSnapshotCrashSpec: recovers delta after a post-input snapshot": "passed",
+  "InterceptStaleSnapshotCrashSpec: recovers rocksdb after a pre-input snapshot": "passed",
+  "InterceptStaleSnapshotCrashSpec: recovers rocksdb after a post-input snapshot": "passed",
+  "InterceptStaleSnapshotDeltaSpec: recovers when the last snapshot contains the staged input": "passed",
+  "InterceptStaleSnapshotDeltaSpec: recovers when the last snapshot predates the staged input": "passed",
+  "InterceptStaleSnapshotDeltaSpec: recovers the upstream delta for a downstream materialized view": "passed",
+  "InterceptStaleSnapshotRocksSpec: recovers when the last snapshot contains the staged input": "passed",
+  "InterceptStaleSnapshotRocksSpec: recovers when the last snapshot predates the staged input": "passed",
+  "LegacyInterceptWitnessSpec: fails explicitly if a legacy view's target identity cannot be read": "skipped"
+ }
+}

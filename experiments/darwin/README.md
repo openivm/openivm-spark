@@ -149,6 +149,16 @@ The crash report has one point per `mode/name` where `mode` is `intercept` or `c
   until then speed is exploratory and cannot be accepted. `crash_fixed_points` counts baseline failures the
   candidate fixes.
 
+**Named witness cases.** `manifest.json` `witness_cases` lists ordinary ScalaTest cases that are gated crash points too:
+the fresh-JVM pre/post-DML recoveries on both backends (`InterceptStaleSnapshotCrashSpec`), the stale-snapshot replays
+(`InterceptStaleSnapshotDeltaSpec`, `InterceptStaleSnapshotRocksSpec`) and the legacy-intercept bootstrap cases
+(`LegacyInterceptWitnessSpec`). The crash suite selector runs them next to `StateGuardCrashRecoverySpec` with
+ScalaTest's JUnit XML reporter (`-u <report dir>/junit`); the evaluator reads one `TEST-<suite>.xml` per suite, keys each
+case by simple suite name plus test name, and appends one `intercept/witness_<name>` point per case. A case that failed,
+was skipped or did not run fails its own point (all five flags false), so a candidate that deletes, ignores or breaks a
+witness is a regression against a baseline that passes it, and it can never qualify recovery. The suite's own points are
+validated first, so a dropped suite point still fails the minimum-gated-points check.
+
 **Known gap.** The point `cdf/mv_version_and_cdf_watermark_gap` (`known_gap=true`) documents the crash between the
 MV-version write and the CDF-watermark write. It is documentation only: it is reported separately, never counted as a
 pass, never contributes to recovery qualification, and never excuses another point. Stale-snapshot and every other
@@ -271,8 +281,9 @@ the last ack, and `max_concurrent_engine` matches the per-view engine offsets.
 
 ## Offline fixtures
 
-`fixtures/reports/<set>/` holds `state-guard-perf.json` and `state-guard-crash.json`, plus optional `run.json`
-(`exit_codes` per suite, failure lines) and `changes.json` (candidate diff as
+`fixtures/reports/<set>/` holds `state-guard-perf.json` and `state-guard-crash.json`, plus `run.json`
+(`exit_codes` per suite, failure lines, and the JUnit `outcomes` map of `"<suite>: <test>"` to
+`passed|failed|skipped`) and optional `changes.json` (candidate diff as
 `[{"path", "status", "old_mode", "new_mode", "binary"}]`; absent means no changes). `fixtures/diffs/*.json` are policy
 cases. Regenerate with `python3 experiments/darwin/fixtures/make_fixtures.py`.
 

@@ -110,6 +110,49 @@ class GateTests(unittest.TestCase):
         self.assertFalse(report.is_full_refresh("WINDOW_PARTITION"))
 
 
+class WitnessPointTests(unittest.TestCase):
+    CASES = MANIFEST["witness_cases"]
+
+    def passed(self):
+        return {f"{c['spec']}: {c['test']}": "passed" for c in self.CASES}
+
+    def augmented(self, outcomes):
+        doc = crash("good-candidate")
+        merged = report.with_witness_points(doc, outcomes, MANIFEST)
+        self.assertEqual(len(doc["points"]), 9, "the input report is not mutated")
+        self.assertEqual(report.validate_crash(merged, MANIFEST), [])
+        return report.crash_verdict(merged, MANIFEST)
+
+    def test_every_named_case_becomes_one_gated_intercept_point(self):
+        verdict = self.augmented(self.passed())
+        self.assertEqual((verdict.gated, verdict.failing, verdict.problems), (8 + len(self.CASES), {}, []))
+        self.assertTrue(all(f"intercept/witness_{c['name']}" in verdict.keys for c in self.CASES))
+
+    def test_failed_skipped_and_missing_cases_fail_their_own_point_only(self):
+        outcomes = self.passed()
+        first, second, third = self.CASES[:3]
+        outcomes[f"{first['spec']}: {first['test']}"] = "failed"
+        outcomes[f"{second['spec']}: {second['test']}"] = "skipped"
+        del outcomes[f"{third['spec']}: {third['test']}"]
+        verdict = self.augmented(outcomes)
+        self.assertEqual(
+            sorted(verdict.failing), sorted(f"intercept/witness_{c['name']}" for c in (first, second, third))
+        )
+
+    def test_equal_test_names_in_different_suites_are_not_confused(self):
+        by_test = {}
+        for case in self.CASES:
+            by_test.setdefault(case["test"], []).append(case)
+        first, second = next(group for group in by_test.values() if len(group) > 1)[:2]
+        outcomes = self.passed()
+        outcomes[f"{first['spec']}: {first['test']}"] = "failed"
+        self.assertEqual(list(self.augmented(outcomes).failing), [f"intercept/witness_{first['name']}"])
+        self.assertNotEqual(first["spec"], second["spec"])
+
+    def test_an_unusable_crash_report_is_passed_through(self):
+        self.assertIsNone(report.with_witness_points(None, {}, MANIFEST))
+
+
 class CrashTests(unittest.TestCase):
     STALE = "intercept/state_sync_before_snapshot_commit"
 

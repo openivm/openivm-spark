@@ -13,6 +13,7 @@ import state_guard_eval
 from . import DARWIN, EVALUATOR, FIXTURES, MANIFEST, scratch_dir
 
 REPORTS = FIXTURES / "reports"
+GATED = float(8 + len(MANIFEST["witness_cases"]))
 LINE = re.compile(r"^(@RESULT [a-z0-9_]+=-?\d+\.\d{6}|@FEEDBACK \S.*)$")
 
 
@@ -77,7 +78,7 @@ class AcceptedCandidateTests(unittest.TestCase):
                     places=2,
                 )
                 self.assertTrue(any(line.startswith("verdict: ACCEPTED") for line in feedback))
-                self.assertEqual((results["recovery_qualified"], results["crash_gated_points"]), (1.0, 8.0))
+                self.assertEqual((results["recovery_qualified"], results["crash_gated_points"]), (1.0, GATED))
 
     def test_per_mv_raw_outputs_come_from_the_candidate_median(self):
         _, results, _ = run_cli()
@@ -123,6 +124,21 @@ class InvalidCandidateTests(unittest.TestCase):
 
     def test_dropped_or_malformed_crash_report_is_a_failed_gate(self):
         self.assert_invalid("crash-point-dropped", "crash_gate", "need at least 8 gated")
+
+    def test_a_failed_named_witness_case_is_a_regression_that_names_the_case(self):
+        results = self.assert_invalid(
+            "witness-failed",
+            "crash_gate",
+            "crash point 'intercept/witness_fresh_jvm_delta_post_input_snapshot'",
+        )
+        self.assertEqual((results["pairs_completed"], results["recovery_qualified"]), (0.0, 0.0))
+
+    def test_a_witness_case_that_did_not_run_or_was_skipped_is_not_a_pass(self):
+        _, _, feedback = run_cli(candidate="witness-not-run")
+        text = "\n".join(feedback)
+        self.assertIn("witness_legacy_intercept_bootstrap_stays_incremental", text)
+        self.assertIn("witness_legacy_intercept_unreadable_identity_fails", text)
+        self.assert_invalid("witness-not-run", "crash_gate", "crash point 'intercept/witness_legacy_intercept_bootstrap")
 
     def test_crash_suite_timeout_is_a_failed_gate(self):
         timed_out = runner.RunResult(exit_code=None, timed_out=True)
@@ -172,7 +188,7 @@ class ValidButNotAcceptedTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(results["crash_gate"], 1.0, "no regression versus the baseline")
         self.assertEqual((results["recovery_qualified"], results["accepted"]), (0.0, 0.0))
-        self.assertEqual((results["crash_gated_points"], results["crash_failing_points"]), (8.0, 1.0))
+        self.assertEqual((results["crash_gated_points"], results["crash_failing_points"]), (GATED, 1.0))
         self.assertEqual((results["crash_baseline_failing_points"], results["crash_fixed_points"]), (1.0, 0.0))
         self.assertGreater(results["e2e_improvement_median"], 0.1)
         self.assertGreaterEqual(results["wait_reduction"], 0.8)
@@ -249,7 +265,7 @@ class BaselineModeTests(unittest.TestCase):
         self.assertEqual(results["baseline_e2e_spread"], 0.0)
         self.assertEqual(results["max_concurrent_engine_baseline_median"], 6.0)
         self.assertTrue(any("baseline mode" in line for line in feedback))
-        self.assertEqual((results["crash_gated_points"], results["crash_baseline_failing_points"]), (8.0, 1.0))
+        self.assertEqual((results["crash_gated_points"], results["crash_baseline_failing_points"]), (GATED, 1.0))
         self.assertEqual(results["recovery_qualified"], 0.0)
         text = "\n".join(feedback)
         self.assertIn("real product failures, never filtered or scored as success", text)
