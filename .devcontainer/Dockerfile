@@ -36,7 +36,7 @@ RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \
     && rm /tmp/toolchain-key \
     && echo 'deb [signed-by=/usr/share/keyrings/ubuntu-toolchain.gpg] https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu jammy main' > /etc/apt/sources.list.d/ubuntu-toolchain.list \
     && apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=60 \
-    && apt-get install -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends -o Acquire::ForceIPv4=true -o Acquire::Retries=10 -o Acquire::http::Timeout=60 \
       build-essential \
       ca-certificates \
       gcc-13 \

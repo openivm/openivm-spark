@@ -33,7 +33,7 @@ jobs:
     runs-on: [self-hosted, openivm-spark-azure]
     timeout-minutes: 120
     container:
-      image: ghcr.io/openivm/openivm-spark-devcontainer:9f18de8d8d46d569305f2d304aae004cb9785e57519c592551a7d2684ad04bc3
+      image: ghcr.io/openivm/openivm-spark-devcontainer:f84e03dd7f8c841591cd290ad22d08ec349dd7cb3a4d0e573aaf93e32528f44e
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
