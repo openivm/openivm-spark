@@ -143,7 +143,7 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
   }
 
   describe("downstream identity") {
-    itCdf("publishes the complete change feed for a downstream consumer with one MERGE") {
+    itCdf("uses one direct MERGE and publishes both images to a real downstream consumer") {
       sql("CREATE TABLE aio_real_cascade_source (grp INT, value INT) USING DELTA")
       sql("INSERT INTO aio_real_cascade_source VALUES (1, 10)")
       val upstreamBody   = "SELECT grp, SUM(value) AS total FROM aio_real_cascade_source GROUP BY grp"
@@ -158,15 +158,15 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
       assertMvCorrect("aio_real_cascade_rollup", upstreamBody)
       assertMvCorrect("aio_rollup_consumer", downstreamBody)
 
-      val statements = rewrittenSql("aio_real_cascade_rollup")
-      statements should have size 1
-      val merge = statements.head.toUpperCase
-      merge should include("MERGE INTO")
-      merge should include("__OPENIVM_DIRECT_DELTA")
-      merge should not include "WHEN MATCHED THEN DELETE"
+      val cascadingSql = rewrittenSql("aio_real_cascade_rollup").map(_.toUpperCase)
+      cascadingSql should have size 1
+      cascadingSql.head should include("MERGE INTO")
+      cascadingSql.head should include("__OPENIVM_DIRECT_DELTA")
+      cascadingSql.head should not include "CREATE OR REPLACE TABLE"
+      cascadingSql.head should not include "WHEN MATCHED THEN DELETE"
 
       val id       = spark.sessionState.sqlParser.parseTableIdentifier("aio_real_cascade_rollup")
-      val location = MvCatalog.lookup(spark, id).getOrElse(fail("missing upstream metadata")).location
+      val location = MvCatalog.lookup(spark, id).getOrElse(fail("missing rollup metadata")).location
       val version  = DeltaTableVersion.requireLatest(spark, location)
       val changes = spark.read
         .format("delta")
@@ -176,7 +176,10 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
         .load(location)
         .select("grp", "total", "_change_type")
       val expected = sql(
-        """SELECT * FROM VALUES (1, 10L, 'update_preimage'), (1, 12L, 'update_postimage'), (3, 30L, 'insert')
+        """SELECT * FROM VALUES
+          |  (1, CAST(10 AS BIGINT), 'update_preimage'),
+          |  (1, CAST(12 AS BIGINT), 'update_postimage'),
+          |  (3, CAST(30 AS BIGINT), 'insert')
           |AS changes(grp, total, _change_type)""".stripMargin
       )
       changes.exceptAll(expected).count() shouldBe 0L
