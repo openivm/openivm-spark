@@ -152,7 +152,8 @@ The crash report has one point per `mode/name` where `mode` is `intercept` or `c
 **Named witness cases.** `manifest.json` `witness_cases` lists ordinary ScalaTest cases that are gated crash points too:
 the fresh-JVM pre/post-DML recoveries on both backends (`InterceptStaleSnapshotCrashSpec`), the stale-snapshot replays
 (`InterceptStaleSnapshotDeltaSpec`, `InterceptStaleSnapshotRocksSpec`) and the legacy-intercept bootstrap cases
-(`LegacyInterceptWitnessSpec`). The crash suite selector runs them next to `StateGuardCrashRecoverySpec` with
+(`LegacyInterceptWitnessSpec`). The crash suite selector runs them next to `StateGuardCrashRecoverySpec`, one forked JVM
+at a time (`state-guard-perf` defaults `OPENIVM_TEST_FORKS` to 1: the crash phases time out when specs fork in parallel), with
 ScalaTest's JUnit XML reporter (`-u <report dir>/junit`); the evaluator reads one `TEST-<suite>.xml` per suite, keys each
 case by simple suite name plus test name, and appends one `intercept/witness_<name>` point per case. A case that failed,
 was skipped or did not run fails its own point (all five flags false), so a candidate that deletes, ignores or breaks a
@@ -298,6 +299,8 @@ the single PR (#108). Nothing in this directory pushes, commits or opens PRs.
 Verified offline: policy, report validation, scoring, the CLI end to end against synthetic fixtures, the runner against a
 fake suite process, redaction, and config/manifest consistency. Verified on the devbox: the Darwin 0.3.0 wheel, Copilot CLI
 1.0.67 and one real agent iteration with the GHE identity; the shape of the workspace and environment Darwin hands an
-evaluator (a git repo with the candidate as HEAD, no remotes, env expansion); the crash suite on Spark 3.5. Not verified:
-absolute OneLake behaviour (the latency is modeled), models other than `claude-haiku-4.5`, and the report fields the real
-suite emits beyond what `report.py` validates.
+evaluator (a git repo with the candidate as HEAD, no remotes, env expansion); the crash gate on Spark 3.5 and 4.1 with
+the Delta catalog backend: `StateGuardCrashRecoverySpec` plus the 11 named witness cases all pass, 19 gated points, zero
+failing, and only `cdf/mv_version_and_cdf_watermark_gap` reported as the known gap. The JUnit reader was checked against
+real ScalaTest XML. Not verified: absolute OneLake behaviour (the latency is modeled), models other than
+`claude-haiku-4.5`, and the report fields the real suite emits beyond what `report.py` validates.
