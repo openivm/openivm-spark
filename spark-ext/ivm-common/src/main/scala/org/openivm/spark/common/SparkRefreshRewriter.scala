@@ -550,7 +550,7 @@ object SparkRefreshRewriter {
 
   /** Inline a view-delta CTAS body into its single aggregate MERGE consumer.
     *
-    * Eligible insert-only terminal aggregates do not need a durable cascade
+    * Eligible insert-only aggregates do not need a durable cascade
     * delta. Replacing the one scratch-path scan with the CTAS query turns the
     * two-statement write/read program into one Spark pipeline. Return `None`
     * unless the shape is exact so callers can execute the original program.
@@ -579,6 +579,11 @@ object SparkRefreshRewriter {
         refPattern.matcher(strippedMerge).replaceFirst(replacement)
       }
   }
+
+  private[spark] def restrictAggregateMergeTarget(merge: String, predicate: String): String =
+    findTopLevelSqlKeyword(merge, 0, merge.length, "WHEN").fold(merge) { when =>
+      merge.substring(0, when) + s" AND ($predicate) " + merge.substring(when)
+    }
 
   /** Replace every occurrence of `` delta.`<viewDeltaPath>` `` in `sql` with
     * `` `<tempViewName>` ``. Anchored on the exact escaped path (the path is
