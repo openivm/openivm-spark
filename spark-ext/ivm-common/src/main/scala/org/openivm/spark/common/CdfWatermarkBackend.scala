@@ -1,9 +1,9 @@
 package org.openivm.spark.common
 
 import io.delta.tables.DeltaTable
-import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.functions.{col, greatest, lit, when}
 import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.{Column, Row, SparkSession}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 private[common] trait CdfWatermarkBackend {
@@ -22,7 +22,13 @@ private[common] object CdfWatermarkBackend {
     else RocksDbCdfWatermarkBackend
 }
 
-/** Delta CDF watermarks whose concurrent `putAll` calls in this JVM share one MERGE per group commit. */
+/** Delta CDF watermarks whose concurrent `putAll` calls in this JVM share one write per group commit.
+  *
+  * When every row in a batch is already stored, the write is one UPDATE that names only `view_name` partitions, so
+  * Delta rewrites them in one pass. Otherwise it is one MERGE that also inserts the new rows. A MERGE with inserts
+  * joins source and target in a full outer join, which adaptive execution plans as one task that writes every touched
+  * partition in turn.
+  */
 private[common] object GroupCommitDeltaCdfWatermarkBackend extends CdfWatermarkBackend {
   private val Delegate = DeltaCdfWatermarkBackend
   private val ViewName = "view_name"
@@ -38,6 +44,7 @@ private[common] object GroupCommitDeltaCdfWatermarkBackend extends CdfWatermarkB
   )
 
   private final case class Put(viewName: String, versionsBySource: Map[String, Long])
+  private final case class Watermark(viewName: String, source: String, version: Long)
 
   private def path(spark: SparkSession): String = FeatureGate.catalogPath(spark).stripSuffix("/") + "/cdf_watermarks"
 
@@ -56,38 +63,63 @@ private[common] object GroupCommitDeltaCdfWatermarkBackend extends CdfWatermarkB
     if (versionsBySource.nonEmpty)
       DeltaGroupCommit
         .forPath[Put](path(spark))
-        .submit(Put(viewName, versionsBySource))(p => Delegate.putAll(spark, p.viewName, p.versionsBySource))(
-          putBatch(spark, _)
-        )
+        .submit(Put(viewName, versionsBySource))(p => putBatch(spark, Seq(p)))(putBatch(spark, _))
 
-  /** One MERGE with the same per-row semantics as sequential `putAll`s: a watermark only moves forward. */
+  /** Applies the puts with the same per-row semantics as sequential `putAll`s: a watermark only moves forward. */
   private def putBatch(spark: SparkSession, puts: Seq[Put]): Unit =
     OpenIvmMetrics.time("catalog.cdf_watermark.put_all_batch") {
-      val rows = puts
+      val watermarks = puts
         .flatMap(p => p.versionsBySource.toSeq.map { case (source, version) => (p.viewName, source) -> version })
         .groupBy(_._1)
         .toSeq
-        .map { case ((view, source), versions) => Row(view, source, versions.map(_._2).max) }
-      val views = puts.map(_.viewName).distinct
+        .map { case ((view, source), versions) => Watermark(view, source, versions.map(_._2).max) }
+      val views = watermarks.map(_.viewName).distinct
       Delegate.withDeltaRetry {
         Delegate.ensureTables(spark)
-        val incoming = spark.createDataFrame(spark.sparkContext.parallelize(rows, 1), schema)
-        DeltaTable
-          .forPath(spark, path(spark))
-          .as("target")
-          .merge(
-            incoming.as("incoming"),
-            col(s"target.$ViewName").isin(views: _*) &&
-              col(s"target.$ViewName") === col(s"incoming.$ViewName") &&
-              col(s"target.$Source") === col(s"incoming.$Source")
-          )
-          .whenMatched(s"incoming.$Version > target.$Version")
-          .updateAll()
-          .whenNotMatched()
-          .insertAll()
-          .execute()
+        val stored = spark.read
+          .format("delta")
+          .load(path(spark))
+          .filter(col(ViewName).isin(views: _*))
+          .select(ViewName, Source)
+          .collect()
+          .map(row => row.getString(0) -> row.getString(1))
+          .toSet
+        if (watermarks.forall(w => stored.contains(w.viewName -> w.source))) update(spark, views, watermarks)
+        else merge(spark, views, watermarks)
       }
     }
+
+  private def update(spark: SparkSession, views: Seq[String], watermarks: Seq[Watermark]): Unit = {
+    def forward(w: Watermark): (Column, Column) =
+      (col(ViewName) === lit(w.viewName) && col(Source) === lit(w.source), greatest(col(Version), lit(w.version)))
+    val (firstKey, firstVersion) = forward(watermarks.head)
+    val version = watermarks.tail
+      .foldLeft(when(firstKey, firstVersion)) { (acc, w) =>
+        val (key, forwarded) = forward(w)
+        acc.when(key, forwarded)
+      }
+      .otherwise(col(Version))
+    DeltaTable.forPath(spark, path(spark)).update(col(ViewName).isin(views: _*), Map(Version -> version))
+  }
+
+  private def merge(spark: SparkSession, views: Seq[String], watermarks: Seq[Watermark]): Unit = {
+    val rows     = watermarks.map(w => Row(w.viewName, w.source, w.version))
+    val incoming = spark.createDataFrame(spark.sparkContext.parallelize(rows, 1), schema)
+    DeltaTable
+      .forPath(spark, path(spark))
+      .as("target")
+      .merge(
+        incoming.as("incoming"),
+        col(s"target.$ViewName").isin(views: _*) &&
+          col(s"target.$ViewName") === col(s"incoming.$ViewName") &&
+          col(s"target.$Source") === col(s"incoming.$Source")
+      )
+      .whenMatched(s"incoming.$Version > target.$Version")
+      .updateAll()
+      .whenNotMatched()
+      .insertAll()
+      .execute()
+  }
 
   override def removeForBaseTable(spark: SparkSession, baseTable: String): Unit =
     Delegate.removeForBaseTable(spark, baseTable)
