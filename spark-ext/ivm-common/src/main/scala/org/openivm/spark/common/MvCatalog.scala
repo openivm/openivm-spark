@@ -1,9 +1,11 @@
 package org.openivm.spark.common
 
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.UTF8String
 import org.openivm.spark.common.rocksdb.{
   OpenIvmRocksDB,
   OpenIvmRocksDBBatchOps,
@@ -942,6 +944,84 @@ object MvCatalog {
     }
   }
 
+  /** The rows of one committed Delta catalog version. A Delta version is immutable, so the rows stay exact for the
+    * (table id, version) they were read at; callers revalidate that key against `DeltaLog.update()` on every read.
+    */
+  private final class CatalogVersion(val tableId: String, val version: Long, rows: Array[Row]) {
+    private val byName = rows.reverseIterator.map(row => row.getAs[String]("name") -> row).toMap
+
+    def lookup(name: TableIdentifier): Option[MvMetadata] =
+      byName.get(name.database.fold(name.identifier)(db => s"$db.${name.identifier}")).map(decodeCatalogRow)
+
+    def views: Seq[MvMetadata] =
+      rows.toSeq
+        .sortWith((a, b) =>
+          UTF8String.fromString(a.getAs[String]("name")).compareTo(UTF8String.fromString(b.getAs[String]("name"))) < 0
+        )
+        .map(decodeCatalogRow)
+  }
+
+  private val catalogVersions = new java.util.concurrent.ConcurrentHashMap[String, CatalogVersion]()
+  private val catalogLoads    = new java.util.concurrent.ConcurrentHashMap[String, Object]()
+
+  private def decodeCatalogRow(row: Row): MvMetadata = {
+    import scala.jdk.CollectionConverters._
+    MvMetadata(
+      name = CatalystSqlParser.parseTableIdentifier(row.getAs[String]("name")),
+      querySql = row.getAs[String]("query_sql"),
+      refreshType = row.getAs[Int]("refresh_type"),
+      refreshTypeName = row.getAs[String]("refresh_type_name"),
+      lastVersion = row.getAs[Long]("last_version"),
+      sourceTables = row.getSeq[String](row.fieldIndex("source_tables")).toSeq,
+      sourceSchemaFingerprint = row.getAs[String]("source_schema_fingerprint"),
+      location = row.getAs[String]("location"),
+      createdAt = row.getAs[Timestamp]("created_at"),
+      properties = row.getJavaMap[String, String](row.fieldIndex("properties")).asScala.toMap
+    )
+  }
+
+  /** The shared Delta catalog at its latest committed version. Every call lists the Delta log, so a commit by any
+    * driver is visible to the next read; only the row scan is shared between reads of the same (table id, version).
+    * `None` sends the caller down the backend path, which also creates a missing catalog table.
+    */
+  private def committedCatalog(spark: SparkSession): Option[CatalogVersion] =
+    if (!FeatureGate.deltaCatalogEnabled(spark)) None
+    else
+      try {
+        val path = FeatureGate.catalogPath(spark).stripSuffix("/") + "/mv_metadata"
+        val log  = DeltaLog.forTable(spark, new org.apache.hadoop.fs.Path(path))
+        def latest(): Option[(String, Long)] = {
+          val snapshot = log.update()
+          if (snapshot.version < 0L) None else Some(snapshot.metadata.id -> snapshot.version)
+        }
+        def cached(key: (String, Long)): Option[CatalogVersion] =
+          Option(catalogVersions.get(path)).filter(entry => entry.tableId == key._1 && entry.version == key._2)
+        latest().flatMap { key =>
+          cached(key).orElse {
+            catalogLoads.computeIfAbsent(path, _ => new Object).synchronized {
+              latest().map { current =>
+                cached(current).getOrElse {
+                  val rows  = spark.read.format("delta").load(path).collect()
+                  val entry = new CatalogVersion(current._1, current._2, rows)
+                  if (latest().contains(current)) catalogVersions.put(path, entry)
+                  entry
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        case scala.util.control.NonFatal(_) => None
+      }
+
+  private def storedReader(spark: SparkSession): TableIdentifier => Option[MvMetadata] =
+    committedCatalog(spark) match {
+      case Some(catalog) => catalog.lookup
+      case None =>
+        val selected = backend(spark)
+        selected.lookup(spark, _)
+    }
+
   def ensureTables(spark: SparkSession): Unit = backend(spark).ensureTables(spark)
 
   def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit = {
@@ -960,25 +1040,22 @@ object MvCatalog {
   def upsert(spark: SparkSession, meta: MvMetadata): Unit =
     OpenIvmStateBarrier.withMutation(spark) { backend(spark).upsert(spark, meta) }
 
-  def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
-    val selected = backend(spark)
-    resolveLookup(spark, name, selected.lookup(spark, _), allowUnresolvedLegacy = true)
-  }
+  def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
+    resolveLookup(spark, name, storedReader(spark), allowUnresolvedLegacy = true)
 
-  private[spark] def lookupForRelation(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
-    val selected = backend(spark)
-    resolveLookup(spark, name, selected.lookup(spark, _), allowUnresolvedLegacy = false)
-  }
+  private[spark] def lookupForRelation(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
+    resolveLookup(spark, name, storedReader(spark), allowUnresolvedLegacy = false)
 
   private[spark] def lookupStored(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
-    backend(spark).lookup(spark, name)
+    storedReader(spark)(name)
 
   def lookupReadOnly(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
     val selected = backend(spark)
     resolveLookup(spark, name, selected.lookupReadOnly(spark, _), allowUnresolvedLegacy = false)
   }
 
-  def list(spark: SparkSession): Seq[MvMetadata] = backend(spark).list(spark)
+  def list(spark: SparkSession): Seq[MvMetadata] =
+    committedCatalog(spark).fold(backend(spark).list(spark))(_.views)
 
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] =
     OpenIvmStateBarrier.withMutation(spark) { backend(spark).viewsForSource(spark, table) }
