@@ -8090,7 +8090,11 @@ case class RefreshMaterializedViewCommand(
                               }
                               // The compensation restores the recorded rows at a new version;
                               // record it so the next refresh does not mistake it for a state lag.
-                              MvCatalog.advance(spark, name, DeltaTableVersion.requireLatest(spark, meta.location))
+                              MvCatalog.advanceStored(
+                                spark,
+                                meta.name,
+                                DeltaTableVersion.requireLatest(spark, meta.location)
+                              )
                               logInfo(
                                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                                   "outcome='window_cascade_compensated' reason='target_write_failed'"
@@ -9839,10 +9843,10 @@ case class RefreshMaterializedViewCommand(
             }
             .groupBy(_._1)
             .map { case (baseTable, versions) => baseTable -> versions.map(_._2).max }
-          MvCatalog.advanceWithCdfWatermarks(spark, name, newVersion, cdfWatermarks)
+          MvCatalog.advanceStoredWithCdfWatermarks(spark, meta.name, newVersion, cdfWatermarks)
         case None if witnessToken.isDefined =>
           MvCatalog.advanceWithInterceptWitness(spark, meta.name, newVersion, witnessToken.get)
-        case None => MvCatalog.advance(spark, name, newVersion)
+        case None => MvCatalog.advanceStored(spark, meta.name, newVersion)
       }
     }
 
