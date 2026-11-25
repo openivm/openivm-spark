@@ -6,10 +6,12 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException}
+import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTableException, UnresolvedAttribute}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
+  And,
   AttributeReference,
+  EqualNullSafe,
   Expression,
   NamedExpression,
   RowOrdering,
@@ -24,6 +26,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{
   Join,
   LocalLimit,
   LogicalPlan,
+  MergeIntoTable,
   Offset,
   Sort,
   Tail,
@@ -34,7 +37,7 @@ import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.functions.{col, lit, sum, when}
 import org.apache.spark.sql.delta.DeltaLog
-import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructType}
+import org.apache.spark.sql.types.{ArrayType, ByteType, DataType, IntegerType, LongType, MapType, ShortType, StructType}
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
@@ -5219,12 +5222,8 @@ case class RefreshMaterializedViewCommand(
           .toSet
       }
 
-      // Base-table inserts are not sufficient to prove a view delta monotone:
-      // an outer join can retract a NULL-padded row, and multi-source joins can
-      // generate cross terms. Restrict insert-only aggregate compilation to the
-      // single-source, join-free shape whose output is monotone under inserts.
-      // Downstream consumers do not affect this proof; they only determine
-      // whether the cascade delta must remain materialized.
+      // Restrict insert-only aggregation to a single source without joins.
+      // Appends to one side of an outer join can retract NULL-padded input rows.
       lazy val insertOnlyAggregateShapeCandidate: Boolean =
         !propagation.requiresDmlInterception &&
           meta.refreshType == RefreshTypeCode.AggregateGroup &&
@@ -5253,19 +5252,11 @@ case class RefreshMaterializedViewCommand(
           (batchInsertOnly || cdfRowsInsertOnly) &&
           changeBatches.nonEmpty
 
-      // CDF consumers discover an upstream MV through its Delta change feed.
-      // Only a grouped aggregate with no consumer may inline and discard its
-      // durable cascade delta. Non-terminal aggregates still use the same
-      // insert-only MIN/MAX merge, but retain OpenIVM's signed cascade output.
-      lazy val terminalInsertOnlyAggregate: Boolean =
-        insertOnlyAggregate && downstreamSourceKeysForThisMv.isEmpty
-
       profile.appendStep(
         "generate_refresh_sql.eligibility",
         s"batch_insert_only=$batchInsertOnly;cdf_rows_insert_only=$cdfRowsInsertOnly;" +
           s"insert_only_aggregate_shape_candidate=$insertOnlyAggregateShapeCandidate;" +
           s"insert_only_aggregate=$insertOnlyAggregate;" +
-          s"terminal_insert_only_aggregate=$terminalInsertOnlyAggregate;" +
           s"requires_dml_interception=${propagation.requiresDmlInterception};" +
           s"source_delta_shape=${sourceDeltaShape.toSeq.sortBy(_._1).mkString("|")};" +
           s"downstream_sources=${downstreamSourceKeysForThisMv.toSeq.sorted.mkString("|")}",
@@ -5561,7 +5552,8 @@ case class RefreshMaterializedViewCommand(
       val constraintFacts          = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
       val runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark)
       val compileFacts = WorkloadFacts(
-        forceViewDeltaCascade = !terminalInsertOnlyAggregate,
+        // Delta CDF supplies pre/post images to downstream consumers of these grouped aggregates.
+        forceViewDeltaCascade = !insertOnlyAggregate,
         assumeInsertOnly = insertOnlyAggregate ||
           (runningWindowIncremental && meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
         runningWindowIncremental = runningWindowIncremental,
@@ -6100,7 +6092,7 @@ case class RefreshMaterializedViewCommand(
             lazy val hasSimpleProjectionDeletes = hasNegativeSimpleProjectionRows(spark, viewDeltaPath)
 
             val directAggregateMerge: Option[String] =
-              if (terminalInsertOnlyAggregate && rewritten.statements.size == 2)
+              if (insertOnlyAggregate && rewritten.statements.size == 2)
                 SparkRefreshRewriter.inlineViewDeltaCtasIntoMerge(
                   rewritten.statements.head,
                   rewritten.statements(1),
@@ -6252,16 +6244,27 @@ case class RefreshMaterializedViewCommand(
               RefreshPerf.logStmt(refreshId, viewLabel, 0, "view_delta_inlined", 0L)
               profile.appendStep(
                 "execute_refresh_sql_stmt",
-                "statement=1;stmt_kind=view_delta_inlined;terminal=true;insert_only=true",
+                "statement=1;stmt_kind=view_delta_inlined;insert_only=true",
                 0L
               )
               RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='direct_insert_only_aggregate'")
               logInfo(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                  "outcome='direct_insert_only_aggregate' reason='terminal_insert_only_batch'"
+                  "outcome='direct_insert_only_aggregate' reason='insert_only_batch'"
               )
+              val merge = directAggregateMerge.get
+              val prunedMerge = profile.timeStep("prune_insert_only_aggregate_target") {
+                pruneInsertOnlyAggregateTarget(
+                  spark,
+                  meta.location,
+                  merge,
+                  rewritten.statements.head,
+                  viewDeltaPath,
+                  cdfChangeBatches
+                )
+              }
               withPlanTimeBroadcastDisabled {
-                executeSqlAt(directAggregateMerge.get, 1)
+                executeSqlAt(prunedMerge, 1)
               }
             } else if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
               // ── Scratch-CTAS fuse fast path ────────────────────────────────────
@@ -6872,7 +6875,7 @@ case class RefreshMaterializedViewCommand(
             // used as the bookkeeping count is either openivm_count_star
             // (added by openivm when the user query has no COUNT(*)) or the
             // user's COUNT(*) alias (extracted at CREATE time).
-            if (isCountMonoid(meta.refreshType) && !terminalInsertOnlyAggregate) {
+            if (isCountMonoid(meta.refreshType) && !insertOnlyAggregate) {
               countMonoidColumn(spark, mergeTargetId, meta).foreach { col =>
                 val q         = col.replace("`", "``")
                 val deleteSql = s"DELETE FROM ${sqlIdent(mergeTargetId)} WHERE `$q` = 0"
@@ -7454,6 +7457,68 @@ case class RefreshMaterializedViewCommand(
             |HAVING SUM(CAST(`openivm_multiplicity` AS BIGINT)) <> 0
             |LIMIT 1""".stripMargin
       )
+    }
+  }
+
+  private def pruneInsertOnlyAggregateTarget(
+      spark: SparkSession,
+      targetLocation: String,
+      merge: String,
+      deltaCtas: String,
+      deltaPath: String,
+      batches: Seq[CdfChangeBatch]
+  ): String = {
+    // Only spend a Spark job collecting keys when CDF statistics indicate a small
+    // delta and there are enough target files to benefit from file skipping.
+    val maxKeys = 8
+    if (batches.size != 1) return merge
+    try {
+      val snapshot = DeltaLog.forTable(spark, new Path(targetLocation)).update()
+      if (snapshot.numOfFiles <= maxKeys) return merge
+      val stats = SparkDeltaStatsService.forRefresh().deltaStatsFor(spark, batches)
+      if (!stats.get(batches.head.baseTable).flatMap(_.rowCount).exists(rows => rows > 0 && rows <= 128)) return merge
+
+      def keyColumns(condition: Expression): Seq[String] = condition match {
+        case And(left, right) => keyColumns(left) ++ keyColumns(right)
+        case EqualNullSafe(v: UnresolvedAttribute, d: UnresolvedAttribute) =>
+          (v.nameParts, d.nameParts) match {
+            case (Seq("v", target), Seq("d", source)) if target == source => Seq(target)
+            case _                                                        => Nil
+          }
+        case _ => Nil
+      }
+
+      val keys = spark.sessionState.sqlParser
+        .parsePlan(merge)
+        .collect {
+          case m: MergeIntoTable if m.notMatchedBySourceActions.isEmpty => keyColumns(m.mergeCondition)
+        }
+        .flatten
+      if (keys.isEmpty) return merge
+      val source = SparkRefreshRewriter.extractViewDeltaCtasBody(deltaCtas, deltaPath).map(spark.sql)
+      val pruned = for {
+        delta <- source
+        key <- keys.find(k =>
+          delta.schema.fields.exists { field =>
+            field.name == k && Set[DataType](ByteType, ShortType, IntegerType, LongType)(field.dataType)
+          }
+        )
+        values = delta.select(col(quoteCol(key))).distinct().limit(maxKeys + 1).collect()
+        if values.nonEmpty && values.length <= maxKeys
+      } yield {
+        val target = s"v.${quoteCol(key)}"
+        // Delta reduces an IN list to a min/max range for file skipping.
+        val predicate = values
+          .map(row => if (row.isNullAt(0)) s"$target IS NULL" else s"$target = ${row.get(0)}")
+          .sorted
+          .mkString(" OR ")
+        SparkRefreshRewriter.restrictAggregateMergeTarget(merge, predicate)
+      }
+      pruned.getOrElse(merge)
+    } catch {
+      case NonFatal(e) =>
+        logWarning(s"[openivm-mv] aggregate MERGE file pruning skipped: ${e.getMessage}")
+        merge
     }
   }
 
