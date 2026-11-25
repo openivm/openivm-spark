@@ -1,7 +1,7 @@
 package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
-import org.openivm.spark.common.RefreshSqlLogCatalog
+import org.openivm.spark.common.{DeltaTableVersion, MvCatalog, RefreshSqlLogCatalog}
 
 /** Split-off from `AggregateSpec.scala` so that each chunk of ~10 tests runs
   * in its own forked JVM (see `spark-ext/project/Settings.scala`). All table
@@ -295,16 +295,23 @@ abstract class AggregateScalarAvgMinMaxScenarios extends IvmParitySpecBase("aggr
   }
 
   describe("Cascading insert-only MIN/MAX with derived status — watches DAG") {
-    it("uses the MIN/MAX merge while preserving the signed delta for its downstream MV") {
+    it("uses the MIN/MAX merge and gives the downstream MV both images of updated groups") {
       sql(
         "CREATE TABLE aggsmm_watch_dag_events " +
           "(customer_id INT, symbol STRING, action STRING, event_ts TIMESTAMP) USING DELTA"
       )
       sql(
         "INSERT INTO aggsmm_watch_dag_events VALUES " +
-          "(1, 'A', 'Activate', TIMESTAMP'2026-03-01 10:00:00'), " +
+          "(NULL, NULL, 'Activate', TIMESTAMP'2026-03-01 10:00:00'), " +
           "(2, 'B', 'Activate', TIMESTAMP'2026-03-01 11:00:00')"
       )
+      if (modeLabel == "cdf") {
+        sql(
+          "INSERT INTO aggsmm_watch_dag_events " +
+            "SELECT CAST(id AS INT), 'Seed', 'Activate', TIMESTAMP'2026-03-01 09:00:00' FROM range(10, 20)"
+        )
+        sql("ALTER TABLE aggsmm_watch_dag_events SET TBLPROPERTIES ('delta.dataSkippingNumIndexedCols' = '4')")
+      }
       val watchesBody =
         "WITH grouped AS (" +
           "SELECT customer_id, symbol, " +
@@ -314,16 +321,24 @@ abstract class AggregateScalarAvgMinMaxScenarios extends IvmParitySpecBase("aggr
           "SELECT *, CASE WHEN removed_at IS NULL THEN 'Active' ELSE 'Inactive' END AS status FROM grouped"
       val downstreamBody =
         "SELECT customer_id, symbol, status FROM aggsmm_mv_watch_dag"
-      sql(s"CREATE MATERIALIZED VIEW aggsmm_mv_watch_dag AS $watchesBody")
+      val recordsPerFile = spark.conf.get("spark.sql.files.maxRecordsPerFile")
+      if (modeLabel == "cdf") spark.conf.set("spark.sql.files.maxRecordsPerFile", 1)
+      try sql(s"CREATE MATERIALIZED VIEW aggsmm_mv_watch_dag AS $watchesBody")
+      finally spark.conf.set("spark.sql.files.maxRecordsPerFile", recordsPerFile)
       sql(s"CREATE MATERIALIZED VIEW aggsmm_mv_watch_dag_downstream AS $downstreamBody")
 
       RefreshSqlLogCatalog.ensureTables(spark)
       RefreshSqlLogCatalog.removeAll(spark)
-      sql(
-        "INSERT INTO aggsmm_watch_dag_events VALUES " +
-          "(1, 'A', 'Cancelled', TIMESTAMP'2026-03-02 10:00:00'), " +
-          "(3, 'C', 'Activate', TIMESTAMP'2026-03-02 12:00:00')"
-      )
+      val statsCollect         = "spark.databricks.delta.stats.collect"
+      val previousStatsCollect = spark.conf.get(statsCollect)
+      if (modeLabel == "cdf") spark.conf.set(statsCollect, true)
+      try
+        sql(
+          "INSERT INTO aggsmm_watch_dag_events VALUES " +
+            "(NULL, NULL, 'Cancelled', TIMESTAMP'2026-03-02 10:00:00'), " +
+            "(3, 'C', 'Activate', TIMESTAMP'2026-03-02 12:00:00')"
+        )
+      finally spark.conf.set(statsCollect, previousStatsCollect)
       refreshMv("aggsmm_mv_watch_dag")
       refreshMv("aggsmm_mv_watch_dag_downstream")
       assertMvCorrect("aggsmm_mv_watch_dag", watchesBody)
@@ -336,15 +351,38 @@ abstract class AggregateScalarAvgMinMaxScenarios extends IvmParitySpecBase("aggr
           .filter(_.getString(1).split("\\.").last == "aggsmm_mv_watch_dag")
           .filter(_.getString(6) == "rewritten_stmt")
           .map(_.getString(9).toUpperCase)
-        rewrittenSql.mkString("\n") should include("MERGE INTO")
-        rewrittenSql.mkString("\n") should include("CREATE OR REPLACE TABLE")
-        rewrittenSql.mkString("\n") should not include "WHEN MATCHED THEN DELETE"
+        rewrittenSql should have size 1
+        rewrittenSql.head should include("MERGE INTO")
+        rewrittenSql.head should not include "CREATE OR REPLACE TABLE"
+        rewrittenSql.head should not include "FROM REFRESH_CTE D LEFT JOIN"
+        rewrittenSql.head should include("V.`CUSTOMER_ID` = 3 OR V.`CUSTOMER_ID` IS NULL")
+        rewrittenSql.head should not include "WHEN MATCHED THEN DELETE"
+
+        val id       = spark.sessionState.sqlParser.parseTableIdentifier("aggsmm_mv_watch_dag")
+        val location = MvCatalog.lookup(spark, id).getOrElse(fail("missing watches metadata")).location
+        val version  = DeltaTableVersion.requireLatest(spark, location)
+        val changes = spark.read
+          .format("delta")
+          .option("readChangeFeed", "true")
+          .option("startingVersion", version)
+          .option("endingVersion", version)
+          .load(location)
+          .select("customer_id", "symbol", "status", "_change_type")
+        val expected = sql(
+          """SELECT * FROM VALUES
+            |  (CAST(NULL AS INT), CAST(NULL AS STRING), 'Active', 'update_preimage'),
+            |  (CAST(NULL AS INT), CAST(NULL AS STRING), 'Inactive', 'update_postimage'),
+            |  (3, 'C', 'Active', 'insert')
+            |AS changes(customer_id, symbol, status, _change_type)""".stripMargin
+        )
+        changes.exceptAll(expected).count() shouldBe 0L
+        expected.exceptAll(changes).count() shouldBe 0L
       }
 
       RefreshSqlLogCatalog.removeAll(spark)
       sql(
         "UPDATE aggsmm_watch_dag_events SET event_ts = TIMESTAMP'2026-03-03 10:00:00' " +
-          "WHERE customer_id = 1 AND action = 'Cancelled'"
+          "WHERE customer_id IS NULL AND action = 'Cancelled'"
       )
       sql(
         "DELETE FROM aggsmm_watch_dag_events " +
