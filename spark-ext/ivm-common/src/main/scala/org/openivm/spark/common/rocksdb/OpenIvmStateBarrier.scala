@@ -17,7 +17,7 @@ import java.util.concurrent.{
   TimeUnit
 }
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
-import java.util.concurrent.locks.ReentrantReadWriteLock
+import java.util.concurrent.locks.{LockSupport, ReentrantReadWriteLock}
 import scala.util.control.NonFatal
 
 private[openivm] object OpenIvmStateBarrier {
@@ -47,9 +47,36 @@ private[openivm] object OpenIvmStateBarrier {
     def recordMutation(): Unit = mutationMonitor.synchronized { mutationGeneration.incrementAndGet() }
   }
 
+  /** An owned refresh admission. Admission waits out captures that are already
+    * queued (as a barrier read would) but then holds nothing. The ticket takes
+    * the root read barrier only when its thread first mutates state under the
+    * root, and keeps that hold until the ticket closes, so a capture observes
+    * either every state write of the refresh or none of them. Until then the
+    * ticket is not an active mutation, so captures requested by other views are
+    * neither delayed by nor waiting for it.
+    *
+    * A ticket thread acquires the read barrier without queueing behind waiting
+    * captures: it may already hold refresh-scoped locks (for example a staging
+    * consumption lock) that an earlier dirty ticket needs before it can close.
+    * Only tickets admitted before a capture was queued can delay it, which is the
+    * same bound a whole-refresh read hold gives.
+    */
+  private final class AdmissionTicket(val state: RootState) {
+    var dirty                 = false
+    var tracked               = false
+    var dirtyRequestedEpochMs = 0L
+    var dirtyRequestedNs      = 0L
+    var dirtyAcquiredEpochMs  = 0L
+    var dirtyAcquiredNs       = 0L
+    val waits                 = scala.collection.mutable.ArrayBuffer.empty[(Long, Long, Long, Long, Long)]
+  }
+
+  private[rocksdb] val OwnedAdmissionKey = "spark.openivm.stateSync.ownedAdmission.enabled"
+
   private val roots                  = new ConcurrentHashMap[NioPath, RootState]()
   private val rootOverrideForTesting = new ThreadLocal[NioPath]()
   private val checkpointWorkerPath   = new ThreadLocal[String]()
+  private val admissionTicket        = new ThreadLocal[AdmissionTicket]()
   @volatile private var stateSyncConfiguredHookForTesting: SparkSession => Boolean = null
 
   private def stateSyncConfigured(spark: SparkSession): Boolean = {
@@ -90,11 +117,64 @@ private[openivm] object OpenIvmStateBarrier {
     state
   }
 
-  private def withRead[A](state: RootState)(body: => A): A = {
+  private def ticketFor(state: RootState): AdmissionTicket = {
+    val ticket = admissionTicket.get()
+    if (ticket != null && (ticket.state eq state)) ticket else null
+  }
+
+  /** Acquires the root read barrier without queueing behind waiting captures;
+    * waits only while a capture holds the barrier. Returns the wait interval
+    * when the acquisition had to wait.
+    */
+  private def bargeRead(state: RootState): Option[(Long, Long, Long, Long)] = {
     val lock = state.lock.readLock()
-    lock.lock()
-    try body
-    finally lock.unlock()
+    if (lock.tryLock()) None
+    else {
+      val requestedEpochMs = System.currentTimeMillis()
+      val requestedNs      = System.nanoTime()
+      var backoffNs        = 20000L
+      var interrupted      = false
+      while (!lock.tryLock()) {
+        LockSupport.parkNanos(backoffNs)
+        if (Thread.interrupted()) interrupted = true
+        backoffNs = math.min(backoffNs * 2, 2000000L)
+      }
+      if (interrupted) Thread.currentThread().interrupt()
+      Some((requestedEpochMs, requestedNs, System.currentTimeMillis(), System.nanoTime()))
+    }
+  }
+
+  private def markDirty(ticket: AdmissionTicket): Unit =
+    if (!ticket.dirty) {
+      ticket.dirtyRequestedEpochMs = System.currentTimeMillis()
+      ticket.dirtyRequestedNs = System.nanoTime()
+      bargeRead(ticket.state)
+      ticket.dirtyAcquiredEpochMs = System.currentTimeMillis()
+      ticket.dirtyAcquiredNs = System.nanoTime()
+      ticket.dirty = true
+      if (ticket.state.trackingEnabled) {
+        ticket.state.beginMutation()
+        ticket.tracked = true
+      }
+    }
+
+  private def withRead[A](state: RootState)(body: => A): A = {
+    val ticket = ticketFor(state)
+    if (ticket == null) {
+      val lock = state.lock.readLock()
+      lock.lock()
+      try body
+      finally lock.unlock()
+    } else if (ticket.dirty) body
+    else {
+      val waited = bargeRead(state)
+      try body
+      finally {
+        val releasedNs = System.nanoTime()
+        state.lock.readLock().unlock()
+        waited.foreach(wait => ticket.waits += ((wait._1, wait._2, wait._3, wait._4, releasedNs)))
+      }
+    }
   }
 
   private def withMutationTracking[A](state: RootState)(body: => A): A =
@@ -105,20 +185,112 @@ private[openivm] object OpenIvmStateBarrier {
       finally state.finishMutation()
     }
 
+  private def withRootMutation[A](state: RootState)(body: => A): A = {
+    val ticket = ticketFor(state)
+    if (ticket == null) withRead(state)(withMutationTracking(state)(body))
+    else {
+      markDirty(ticket)
+      withMutationTracking(state)(body)
+    }
+  }
+
   def withMutation[A](spark: SparkSession)(body: => A): A =
     if (OpenIvmStateSync.guardedSqlEnabled(spark) || stateSyncConfigured(spark)) {
       OpenIvmStateSync.maybeRestore(spark)
       val state = forRoot(root(spark))
       state.trackingEnabled = state.trackingEnabled || trackingEnabled(spark)
-      withRead(state)(withMutationTracking(state)(body))
+      withRootMutation(state)(body)
     } else body
+
+  /** Makes the admitted refresh on this thread hold the root barrier before it
+    * writes files under the state root outside a barrier-wrapped store call.
+    */
+  private[openivm] def admitStateWrite(spark: SparkSession): Unit =
+    if (admissionTicket.get() != null) {
+      val ticket = ticketFor(forRoot(root(spark)))
+      if (ticket != null) markDirty(ticket)
+    }
+
+  private def reportBarrier(
+      report: (Long, Long, Long, Long, Long, Boolean) => Unit,
+      requestedEpochMs: Long,
+      requestedNs: Long,
+      acquiredEpochMs: Long,
+      acquiredNs: Long,
+      releasedNs: Long,
+      succeeded: Boolean
+  ): Unit =
+    try report(requestedEpochMs, requestedNs, acquiredEpochMs, acquiredNs, releasedNs, succeeded)
+    catch { case NonFatal(_) => telemetryLog.warn("OpenIVM state barrier timing export failed") }
+
+  private def withAdmission[A](state: RootState, report: Option[(Long, Long, Long, Long, Long, Boolean) => Unit])(
+      body: => A
+  ): A =
+    if (ticketFor(state) != null) {
+      val startedEpochMs = System.currentTimeMillis()
+      val startedNs      = System.nanoTime()
+      var succeeded      = false
+      try {
+        val result = body
+        succeeded = true
+        result
+      } finally
+        report.foreach(
+          reportBarrier(_, startedEpochMs, startedNs, startedEpochMs, startedNs, System.nanoTime(), succeeded)
+        )
+    } else {
+      val lock             = state.lock.readLock()
+      val requestedEpochMs = System.currentTimeMillis()
+      val requestedNs      = System.nanoTime()
+      lock.lock()
+      lock.unlock()
+      val admittedEpochMs = System.currentTimeMillis()
+      val admittedNs      = System.nanoTime()
+      val ticket          = new AdmissionTicket(state)
+      val previous        = admissionTicket.get()
+      admissionTicket.set(ticket)
+      var succeeded = false
+      try {
+        val result = body
+        succeeded = true
+        result
+      } finally {
+        if (previous == null) admissionTicket.remove() else admissionTicket.set(previous)
+        val releasedNs = System.nanoTime()
+        if (ticket.dirty)
+          try if (ticket.tracked) state.finishMutation()
+          finally lock.unlock()
+        report.foreach { sink =>
+          reportBarrier(sink, requestedEpochMs, requestedNs, admittedEpochMs, admittedNs, admittedNs, succeeded)
+          if (ticket.dirty)
+            reportBarrier(
+              sink,
+              ticket.dirtyRequestedEpochMs,
+              ticket.dirtyRequestedNs,
+              ticket.dirtyAcquiredEpochMs,
+              ticket.dirtyAcquiredNs,
+              releasedNs,
+              succeeded
+            )
+          ticket.waits.foreach { wait =>
+            reportBarrier(sink, wait._1, wait._2, wait._3, wait._4, wait._5, succeeded)
+          }
+        }
+      }
+    }
 
   def withMeasuredMutation[A](spark: SparkSession)(
       report: (Long, Long, Long, Long, Long, Boolean) => Unit
-  )(body: => A): A =
-    if (!spark.sparkContext.getConf.getBoolean(BoundedTelemetryQueue.EnabledKey, false))
-      withMutation(spark)(body)
-    else if (OpenIvmStateSync.guardedSqlEnabled(spark) || stateSyncConfigured(spark)) {
+  )(body: => A): A = {
+    val measured = spark.sparkContext.getConf.getBoolean(BoundedTelemetryQueue.EnabledKey, false)
+    if (!(OpenIvmStateSync.guardedSqlEnabled(spark) || stateSyncConfigured(spark))) body
+    else if (spark.conf.get(OwnedAdmissionKey, "true").toBoolean) {
+      OpenIvmStateSync.maybeRestore(spark)
+      val state = forRoot(root(spark))
+      state.trackingEnabled = state.trackingEnabled || trackingEnabled(spark)
+      withAdmission(state, if (measured) Some(report) else None)(body)
+    } else if (!measured) withMutation(spark)(body)
+    else {
       OpenIvmStateSync.maybeRestore(spark)
       val state = forRoot(root(spark))
       state.trackingEnabled = state.trackingEnabled || trackingEnabled(spark)
@@ -136,10 +308,10 @@ private[openivm] object OpenIvmStateBarrier {
       } finally {
         val releasedNs = System.nanoTime()
         lock.unlock()
-        try report(requestedEpochMs, requestedNs, acquiredEpochMs, acquiredNs, releasedNs, succeeded)
-        catch { case NonFatal(_) => telemetryLog.warn("OpenIVM state barrier timing export failed") }
+        reportBarrier(report, requestedEpochMs, requestedNs, acquiredEpochMs, acquiredNs, releasedNs, succeeded)
       }
-    } else body
+    }
+  }
 
   private[rocksdb] def withCurrentMutationGeneration[A](spark: SparkSession)(body: Long => A): A =
     if (trackingEnabled(spark)) {
@@ -176,7 +348,7 @@ private[openivm] object OpenIvmStateBarrier {
     if (checkpointWorkerPath.get() != null)
       throw new IllegalStateException("Checkpoint worker attempted to mutate database state")
     val state = forDbPath(dbPath)
-    if (state == null) body else withRead(state)(withMutationTracking(state)(body))
+    if (state == null) body else withRootMutation(state)(body)
   }
 
   private[rocksdb] val ParallelCaptureKey = "spark.openivm.stateSync.parallelCapture.enabled"
