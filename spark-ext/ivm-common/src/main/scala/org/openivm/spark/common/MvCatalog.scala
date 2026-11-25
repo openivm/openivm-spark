@@ -986,6 +986,9 @@ object MvCatalog {
   def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
     backend(spark).advance(spark, lookup(spark, name).map(_.name).getOrElse(name), newVersion)
 
+  private[spark] def advanceStored(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
+    backend(spark).advance(spark, name, newVersion)
+
   def advanceWithCdfWatermarks(
       spark: SparkSession,
       name: TableIdentifier,
@@ -998,6 +1001,14 @@ object MvCatalog {
       newVersion,
       watermarks
     )
+
+  private[spark] def advanceStoredWithCdfWatermarks(
+      spark: SparkSession,
+      name: TableIdentifier,
+      newVersion: Long,
+      watermarks: Map[String, Long]
+  ): Unit =
+    backend(spark).advanceWithCdfWatermarks(spark, name, newVersion, watermarks)
 
   def updateProperties(
       spark: SparkSession,

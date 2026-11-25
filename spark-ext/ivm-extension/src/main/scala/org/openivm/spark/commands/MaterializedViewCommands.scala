@@ -9757,6 +9757,7 @@ case class RefreshMaterializedViewCommand(
     val newVersion = committedDataVersion.getOrElse {
       DeltaTableVersion.requireLatest(spark, meta.location)
     }
+    val hasQualifiedStoredName = MvCatalog.qualifiedName(spark, name) == meta.name
     profile.timeObservedStep("finalize_catalog_advance") {
       replacementMeta match {
         case Some(updated) => MvCatalog.upsert(spark, updated.copy(lastVersion = newVersion))
@@ -9768,8 +9769,12 @@ case class RefreshMaterializedViewCommand(
             }
             .groupBy(_._1)
             .map { case (baseTable, versions) => baseTable -> versions.map(_._2).max }
-          MvCatalog.advanceWithCdfWatermarks(spark, name, newVersion, cdfWatermarks)
-        case None => MvCatalog.advance(spark, name, newVersion)
+          if (hasQualifiedStoredName)
+            MvCatalog.advanceStoredWithCdfWatermarks(spark, meta.name, newVersion, cdfWatermarks)
+          else MvCatalog.advanceWithCdfWatermarks(spark, name, newVersion, cdfWatermarks)
+        case None =>
+          if (hasQualifiedStoredName) MvCatalog.advanceStored(spark, meta.name, newVersion)
+          else MvCatalog.advance(spark, name, newVersion)
       }
     }
 
