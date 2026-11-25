@@ -365,6 +365,8 @@ cmd_state_guard_perf() {
             exit 2
             ;;
     esac
+    # The crash cases start many JVMs and time out under contention, so the specs run one after another.
+    export OPENIVM_TEST_FORKS="${OPENIVM_TEST_FORKS:-1}"
     prepare_sbt 1
     setup_test_log_dir
     run_sbt "$@" "${suites[@]}"
