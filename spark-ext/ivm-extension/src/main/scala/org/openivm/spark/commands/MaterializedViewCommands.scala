@@ -4554,25 +4554,28 @@ case class RefreshMaterializedViewCommand(
           throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} changed while acquiring locks")
         if (interceptWitnessEnabled(spark)) {
           currentMeta.filterNot(_.properties.contains(StagingCatalog.CompletedRefreshTokenKey)).foreach { legacy =>
-            val tableId = deltaIdentityAt(spark, legacy.location).flatMap(_._1).filter(_.nonEmpty)
-            tableId.foreach { id =>
-              OpenIvmStateBarrier.withMutation(spark) {
-                val stored = StagingCatalog.completedRefreshWitness(spark, metaName(legacy.name))
-                val witness = stored.getOrElse(
-                  StagingCatalog.CompletedRefreshWitness(UUID.randomUUID().toString, legacy.lastVersion, id)
-                )
-                if (witness.dataVersion != legacy.lastVersion || witness.tableId != id)
-                  throw new IllegalStateException(s"Legacy materialized view ${sqlIdent(name)} has inconsistent state")
-                StagingCatalog.recordCompletedRefresh(
-                  spark,
-                  metaName(legacy.name),
-                  witness.token,
-                  witness.dataVersion,
-                  witness.tableId
-                )
-              }
-              OpenIvmStateSync.backupNow(spark)
+            val id = deltaIdentityAt(spark, legacy.location)
+              .flatMap(_._1)
+              .filter(_.nonEmpty)
+              .getOrElse(
+                throw new IllegalStateException(s"Cannot identify legacy materialized view ${sqlIdent(name)}")
+              )
+            OpenIvmStateBarrier.withMutation(spark) {
+              val stored = StagingCatalog.completedRefreshWitness(spark, metaName(legacy.name))
+              val witness = stored.getOrElse(
+                StagingCatalog.CompletedRefreshWitness(UUID.randomUUID().toString, legacy.lastVersion, id)
+              )
+              if (witness.dataVersion != legacy.lastVersion || witness.tableId != id)
+                throw new IllegalStateException(s"Legacy materialized view ${sqlIdent(name)} has inconsistent state")
+              StagingCatalog.recordCompletedRefresh(
+                spark,
+                metaName(legacy.name),
+                witness.token,
+                witness.dataVersion,
+                witness.tableId
+              )
             }
+            OpenIvmStateSync.backupNow(spark)
           }
         }
         val missing = expectedQueryHash.isDefined && currentMeta.isEmpty
