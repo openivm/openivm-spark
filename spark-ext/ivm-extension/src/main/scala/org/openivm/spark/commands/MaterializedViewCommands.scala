@@ -998,7 +998,6 @@ private[commands] object MvCommandHelper {
     FeatureGate.deltaCatalogEnabled(spark) && ChangePropagationFactory.forSession(spark).requiresDmlInterception &&
       (FeatureGate.stateSyncUri(spark).nonEmpty || OpenIvmStateSync.guardedSqlEnabled(spark))
 
-
   /** The verified friendly<->resolved snapshot-pin binding for one command.
     *
     * `resolvedPins` associate each pinned relation in the body to its RESOLVED
@@ -4224,7 +4223,8 @@ case class CreateMaterializedViewCommand(
               )
             )
             witnessToken.foreach(token =>
-              StagingCatalog.recordCompletedRefresh(spark, metaName(meta.name), token, version, writtenDataTableId.get))
+              StagingCatalog.recordCompletedRefresh(spark, metaName(meta.name), token, version, writtenDataTableId.get)
+            )
             publicationCommitted = true
           }
         }
@@ -4564,7 +4564,12 @@ case class RefreshMaterializedViewCommand(
                 if (witness.dataVersion != legacy.lastVersion || witness.tableId != id)
                   throw new IllegalStateException(s"Legacy materialized view ${sqlIdent(name)} has inconsistent state")
                 StagingCatalog.recordCompletedRefresh(
-                  spark, metaName(legacy.name), witness.token, witness.dataVersion, witness.tableId)
+                  spark,
+                  metaName(legacy.name),
+                  witness.token,
+                  witness.dataVersion,
+                  witness.tableId
+                )
               }
               OpenIvmStateSync.backupNow(spark)
             }
@@ -5207,17 +5212,20 @@ case class RefreshMaterializedViewCommand(
       val recoveredMeta = recoverInterruptedSourceVersionAdvance(spark, loadedMeta)
       val staleWitness =
         if (!interceptWitnessEnabled(spark)) None
-        else recoveredMeta.properties.get(StagingCatalog.CompletedRefreshTokenKey).flatMap { token =>
-          val witness = StagingCatalog.completedRefreshWitness(spark, metaName(recoveredMeta.name)).getOrElse(
-            throw new IllegalStateException(s"Missing completed refresh witness for ${sqlIdent(name)}")
-          )
-          if (!deltaIdentityAt(spark, recoveredMeta.location).flatMap(_._1).contains(witness.tableId))
-            throw new IllegalStateException(s"Completed refresh witness target changed for ${sqlIdent(name)}")
-          if (witness.dataVersion > recoveredMeta.lastVersion)
-            throw new IllegalStateException(s"Invalid completed refresh version for ${sqlIdent(name)}")
-          if (witness.token != token || witness.dataVersion != recoveredMeta.lastVersion) Some(witness)
-          else None
-        }
+        else
+          recoveredMeta.properties.get(StagingCatalog.CompletedRefreshTokenKey).flatMap { token =>
+            val witness = StagingCatalog
+              .completedRefreshWitness(spark, metaName(recoveredMeta.name))
+              .getOrElse(
+                throw new IllegalStateException(s"Missing completed refresh witness for ${sqlIdent(name)}")
+              )
+            if (!deltaIdentityAt(spark, recoveredMeta.location).flatMap(_._1).contains(witness.tableId))
+              throw new IllegalStateException(s"Completed refresh witness target changed for ${sqlIdent(name)}")
+            if (witness.dataVersion > recoveredMeta.lastVersion)
+              throw new IllegalStateException(s"Invalid completed refresh version for ${sqlIdent(name)}")
+            if (witness.token != token || witness.dataVersion != recoveredMeta.lastVersion) Some(witness)
+            else None
+          }
       if (staleWitness.nonEmpty && sourceVersionAdvance.nonEmpty)
         throw new IllegalStateException(
           s"Materialized view ${sqlIdent(name)} requires recovery before advancing source versions"
@@ -5476,9 +5484,10 @@ case class RefreshMaterializedViewCommand(
       val stateLag: Option[MvStateLag] =
         profile.timeObservedStep("state_lag_check") {
           if (preparedSourceAdvance.nonEmpty) None
-          else MvStateLag.detect(spark, meta).orElse {
-            staleWitness.map(_ => MvStateLag(DeltaTableVersion.requireLatest(spark, meta.location)))
-          }
+          else
+            MvStateLag.detect(spark, meta).orElse {
+              staleWitness.map(_ => MvStateLag(DeltaTableVersion.requireLatest(spark, meta.location)))
+            }
         }
       stateLag.foreach { lag =>
         logWarning(
@@ -9811,10 +9820,13 @@ case class RefreshMaterializedViewCommand(
     profile.timeObservedStep("finalize_catalog_advance") {
       replacementMeta match {
         case Some(updated) =>
-          MvCatalog.upsert(spark, updated.copy(
-            lastVersion = newVersion,
-            properties = updated.properties ++ witnessToken.map(StagingCatalog.CompletedRefreshTokenKey -> _)
-          ))
+          MvCatalog.upsert(
+            spark,
+            updated.copy(
+              lastVersion = newVersion,
+              properties = updated.properties ++ witnessToken.map(StagingCatalog.CompletedRefreshTokenKey -> _)
+            )
+          )
         case None if propagation.mode == ChangeFeedMode.Cdf =>
           val cdfWatermarks = changeBatches
             .collect {
@@ -9832,7 +9844,8 @@ case class RefreshMaterializedViewCommand(
 
     profile.timeObservedStep("finalize_mark_consumed") {
       witnessToken.foreach { token =>
-        val actual = MvCatalog.lookupStored(spark, meta.name)
+        val actual = MvCatalog
+          .lookupStored(spark, meta.name)
           .flatMap(_.properties.get(StagingCatalog.CompletedRefreshTokenKey))
         if (!actual.contains(token))
           throw new IllegalStateException(s"Catalog did not commit the refresh witness for $viewNameStr")
@@ -9921,7 +9934,8 @@ case class RefreshMaterializedViewCommand(
       }
     }
     witnessToken.foreach(token =>
-      StagingCatalog.recordCompletedRefresh(spark, viewNameStr, token, newVersion, previousWitness.get.tableId))
+      StagingCatalog.recordCompletedRefresh(spark, viewNameStr, token, newVersion, previousWitness.get.tableId)
+    )
   }
 
   /** Consume source changes after proving their materialized runtime delta views

@@ -8,16 +8,16 @@ import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
 class LegacyInterceptWitnessSpec extends IvmParitySpecBase("legacy-intercept-witness") with InterceptMode {
   override protected def extraSparkConf: Map[String, String] = Map(
     FeatureGate.CatalogBackendKey -> "delta",
-    FeatureGate.CatalogPathKey -> new File(warehouseDir, "delta-catalog").toURI.toString,
+    FeatureGate.CatalogPathKey    -> new File(warehouseDir, "delta-catalog").toURI.toString,
     FeatureGate.ProfileRefreshKey -> "true",
-    FeatureGate.GcEnabledKey -> "false"
+    FeatureGate.GcEnabledKey      -> "false"
   )
 
   it("bootstraps an existing view without changing its incremental refresh path") {
     val source = "legacy_witness_src"
-    val mv = "legacy_witness_mv"
-    val query = s"SELECT id, SUM(amount) AS total FROM $source GROUP BY id"
-    val id = spark.sessionState.sqlParser.parseTableIdentifier(mv)
+    val mv     = "legacy_witness_mv"
+    val query  = s"SELECT id, SUM(amount) AS total FROM $source GROUP BY id"
+    val id     = spark.sessionState.sqlParser.parseTableIdentifier(mv)
 
     sql(s"CREATE TABLE $source(id INT, amount INT) USING DELTA")
     sql(s"INSERT INTO $source VALUES (1, 10)")

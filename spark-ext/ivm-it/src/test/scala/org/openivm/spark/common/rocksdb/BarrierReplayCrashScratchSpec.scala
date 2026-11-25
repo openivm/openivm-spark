@@ -16,21 +16,25 @@ import scala.jdk.CollectionConverters._
 
 private[rocksdb] object BarrierReplayCrashScratchProbe {
   def main(args: Array[String]): Unit = {
-    val root = Paths.get(args(0))
-    val phase = args(1)
-    val backend = args(2)
+    val root                = Paths.get(args(0))
+    val phase               = args(1)
+    val backend             = args(2)
     val snapshotAfterInsert = args(3).toBoolean
-    val source = "default.barrier_crash_source"
-    val mv = "default.barrier_crash_mv"
-    val query = s"SELECT id, SUM(amount) AS total FROM $source GROUP BY id"
-    val spark = SparkSession.builder()
+    val source              = "default.barrier_crash_source"
+    val mv                  = "default.barrier_crash_mv"
+    val query               = s"SELECT id, SUM(amount) AS total FROM $source GROUP BY id"
+    val spark = SparkSession
+      .builder()
       .master("local[1]")
       .appName(s"barrier-replay-crash-$phase")
       .config("spark.ui.enabled", "false")
       .config("spark.driver.host", "localhost")
       .config("spark.driver.bindAddress", "127.0.0.1")
       .config("spark.sql.shuffle.partitions", "1")
-      .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions")
+      .config(
+        "spark.sql.extensions",
+        "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions"
+      )
       .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
       .config("spark.sql.catalogImplementation", "hive")
       .config("spark.hadoop.javax.jdo.option.ConnectionURL", s"jdbc:derby:;databaseName=$root/metastore;create=true")
@@ -46,10 +50,12 @@ private[rocksdb] object BarrierReplayCrashScratchProbe {
       .getOrCreate()
     def sql(text: String): Unit = { spark.sql(text).collect(); () }
     def parity(): Unit = {
-      val actual = spark.sql(s"SELECT id, total FROM $mv")
+      val actual   = spark.sql(s"SELECT id, total FROM $mv")
       val expected = spark.sql(query)
-      require(actual.exceptAll(expected).count() == 0L && expected.exceptAll(actual).count() == 0L,
-        "materialized view differs from full recomputation")
+      require(
+        actual.exceptAll(expected).count() == 0L && expected.exceptAll(actual).count() == 0L,
+        "materialized view differs from full recomputation"
+      )
     }
     try {
       if (phase == "crash") {
@@ -92,11 +98,17 @@ class BarrierReplayCrashScratchSpec extends AnyFunSpec with Matchers {
       .filter(arg => arg.startsWith("--add-opens=") || arg.startsWith("--add-exports="))
     def run(phase: String, expected: Int): Unit = {
       val log = root.resolve(s"$phase.log")
-      val process = new ProcessBuilder((Seq(javaBin, "-Xmx2g") ++ modules ++ Seq(
-        "-cp", System.getProperty("java.class.path"),
-        "org.openivm.spark.common.rocksdb.BarrierReplayCrashScratchProbe",
-        root.toString, phase, backend, snapshotAfterInsert.toString
-      )): _*).redirectErrorStream(true).redirectOutput(log.toFile).start()
+      val process = new ProcessBuilder(
+        (Seq(javaBin, "-Xmx2g") ++ modules ++ Seq(
+          "-cp",
+          System.getProperty("java.class.path"),
+          "org.openivm.spark.common.rocksdb.BarrierReplayCrashScratchProbe",
+          root.toString,
+          phase,
+          backend,
+          snapshotAfterInsert.toString
+        )): _*
+      ).redirectErrorStream(true).redirectOutput(log.toFile).start()
       try {
         withClue(s"$phase: see $log: ") {
           process.waitFor(240, TimeUnit.SECONDS) shouldBe true
@@ -106,17 +118,21 @@ class BarrierReplayCrashScratchSpec extends AnyFunSpec with Matchers {
     }
     run("crash", 73)
     val local = root.resolve("state").resolve("_openivm")
-    if (Files.exists(local)) Files.walkFileTree(local, new SimpleFileVisitor[Path] {
-      override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult = {
-        Files.delete(file)
-        FileVisitResult.CONTINUE
-      }
-      override def postVisitDirectory(dir: Path, error: java.io.IOException): FileVisitResult = {
-        if (error != null) throw error
-        Files.delete(dir)
-        FileVisitResult.CONTINUE
-      }
-    })
+    if (Files.exists(local))
+      Files.walkFileTree(
+        local,
+        new SimpleFileVisitor[Path] {
+          override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult = {
+            Files.delete(file)
+            FileVisitResult.CONTINUE
+          }
+          override def postVisitDirectory(dir: Path, error: java.io.IOException): FileVisitResult = {
+            if (error != null) throw error
+            Files.delete(dir)
+            FileVisitResult.CONTINUE
+          }
+        }
+      )
     run("recover", 0)
   }
 

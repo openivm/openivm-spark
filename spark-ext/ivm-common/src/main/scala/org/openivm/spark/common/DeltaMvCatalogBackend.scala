@@ -187,9 +187,9 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
       token: String
   ): Unit = withDeltaRetry {
     ensureTables(spark)
-    val key = StagingCatalog.CompletedRefreshTokenKey
+    val key      = StagingCatalog.CompletedRefreshTokenKey
     val retained = map_filter(col(Properties), (existingKey, _) => existingKey =!= lit(key))
-    val proof = map_from_arrays(array(lit(key)), array(lit(token)))
+    val proof    = map_from_arrays(array(lit(key)), array(lit(token)))
     DeltaTable
       .forPath(spark, path(spark))
       .update(

@@ -88,13 +88,13 @@ object StagingCatalog {
   private val MvDbColumnFamilies   = OpenIvmStatePaths.PerMvColumnFamilies
   private val BaseDbColumnFamilies = OpenIvmStatePaths.BaseTableColumnFamilies
 
-  private val StagingCf  = "staging"
-  private val ConsumedCf = "consumed"
-  private val MetaCf     = "meta"
-  private val LedgerCf   = "ledger"
-  private val GcCf       = "gc"
-  private val LedgerKey  = RocksDBCodec.utf8("source")
-  private val CompletedRefreshKey = RocksDBCodec.utf8("_ivm_completed_refresh_witness")
+  private val StagingCf                = "staging"
+  private val ConsumedCf               = "consumed"
+  private val MetaCf                   = "meta"
+  private val LedgerCf                 = "ledger"
+  private val GcCf                     = "gc"
+  private val LedgerKey                = RocksDBCodec.utf8("source")
+  private val CompletedRefreshKey      = RocksDBCodec.utf8("_ivm_completed_refresh_witness")
   val CompletedRefreshTokenKey: String = "_ivm_completed_refresh_token"
 
   final case class CompletedRefreshWitness(token: String, dataVersion: Long, tableId: String)
