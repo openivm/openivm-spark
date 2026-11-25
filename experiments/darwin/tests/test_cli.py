@@ -48,16 +48,16 @@ def run_cli(*args, runner_=None, skip_lock=True, **kwargs):
 
 
 class RecordingRunner:
-    def __init__(self, override=None):
+    def __init__(self, override=None, candidate="good-candidate"):
         self.calls = []
-        self.inner = runner.FixtureRunner(REPORTS, MANIFEST, "baseline", "good-candidate")
+        self.inner = runner.FixtureRunner(REPORTS, MANIFEST, "baseline", candidate)
         self.override = override or {}
 
-    def run(self, role, root, label, spark_target, timeout_s):
-        self.calls.append(role)
-        if role in self.override:
-            return self.override[role]
-        return self.inner.run(role, root, label, spark_target, timeout_s)
+    def run(self, role, root, label, spark_target, timeout_s, suite="all"):
+        self.calls.append(f"{role}:{suite}")
+        if f"{role}:{suite}" in self.override:
+            return self.override[f"{role}:{suite}"]
+        return self.inner.run(role, root, label, spark_target, timeout_s, suite)
 
 
 class AcceptedCandidateTests(unittest.TestCase):
@@ -77,6 +77,7 @@ class AcceptedCandidateTests(unittest.TestCase):
                     places=2,
                 )
                 self.assertTrue(any(line.startswith("verdict: ACCEPTED") for line in feedback))
+                self.assertEqual((results["recovery_qualified"], results["crash_gated_points"]), (1.0, 8.0))
 
     def test_per_mv_raw_outputs_come_from_the_candidate_median(self):
         _, results, _ = run_cli()
@@ -116,7 +117,18 @@ class InvalidCandidateTests(unittest.TestCase):
         self.assertEqual(results["crash_gate"], 1.0)
 
     def test_unrecovered_crash_point(self):
-        self.assert_invalid("bad-crash", "crash_gate", "crash gate: crash point 'crash-mid-state-publication'")
+        results = self.assert_invalid("bad-crash", "crash_gate", "crash gate: crash point 'cdf/refresh_before_finalize'")
+        self.assertEqual(results["pairs_completed"], 0.0)
+        self.assertEqual(results["recovery_qualified"], 0.0)
+
+    def test_dropped_or_malformed_crash_report_is_a_failed_gate(self):
+        self.assert_invalid("crash-point-dropped", "crash_gate", "need at least 8 gated")
+
+    def test_crash_suite_timeout_is_a_failed_gate(self):
+        timed_out = runner.RunResult(exit_code=None, timed_out=True)
+        code, results, feedback = run_cli(runner_=RecordingRunner({"candidate:crash": timed_out}))
+        self.assertEqual((code, results["crash_gate"], results["combined_score"]), (0, 0.0, 0.0))
+        self.assertTrue(any("crash suite timed out" in line for line in feedback))
 
     def test_full_refresh_regression(self):
         self.assert_invalid("full-refresh-regression", "incremental_gate", "full_refresh_count=1")
@@ -140,13 +152,13 @@ class InvalidCandidateTests(unittest.TestCase):
 
     def test_candidate_timeout_is_a_failed_gate(self):
         timed_out = runner.RunResult(exit_code=None, timed_out=True)
-        code, results, feedback = run_cli(runner_=RecordingRunner({"candidate": timed_out}))
+        code, results, feedback = run_cli(runner_=RecordingRunner({"candidate:perf": timed_out}))
         self.assertEqual((code, results["combined_score"], results["correctness_gate"]), (0, 0.0, 0.0))
         self.assertTrue(any("timed out" in line for line in feedback))
 
     def test_secrets_in_suite_output_never_reach_stdout(self):
         failing = runner.RunResult(exit_code=1, failure_lines=["*** FAILED *** token=abc123 ghp_" + "A" * 30])
-        _, results, feedback = run_cli(runner_=RecordingRunner({"candidate": failing}))
+        _, results, feedback = run_cli(runner_=RecordingRunner({"candidate:perf": failing}))
         self.assertEqual(results["combined_score"], 0.0)
         text = "\n".join(feedback)
         self.assertIn("*** FAILED ***", text)
@@ -155,6 +167,27 @@ class InvalidCandidateTests(unittest.TestCase):
 
 
 class ValidButNotAcceptedTests(unittest.TestCase):
+    def test_fast_candidate_cannot_be_accepted_while_recovery_is_unqualified(self):
+        code, results, feedback = run_cli(candidate="unfixed-recovery")
+        self.assertEqual(code, 0)
+        self.assertEqual(results["crash_gate"], 1.0, "no regression versus the baseline")
+        self.assertEqual((results["recovery_qualified"], results["accepted"]), (0.0, 0.0))
+        self.assertEqual((results["crash_gated_points"], results["crash_failing_points"]), (8.0, 1.0))
+        self.assertEqual((results["crash_baseline_failing_points"], results["crash_fixed_points"]), (1.0, 0.0))
+        self.assertGreater(results["e2e_improvement_median"], 0.1)
+        self.assertGreaterEqual(results["wait_reduction"], 0.8)
+        self.assertGreater(results["combined_score"], 0.0)
+        text = "\n".join(feedback)
+        self.assertIn("recovery NOT QUALIFIED", text)
+        self.assertIn("intercept/state_sync_before_snapshot_commit", text)
+        self.assertIn("speed thresholds met but NOT accepted", text)
+
+    def test_fixing_the_baseline_failure_is_reported_and_qualifies_recovery(self):
+        _, results, feedback = run_cli()
+        self.assertEqual((results["recovery_qualified"], results["accepted"]), (1.0, 1.0))
+        self.assertEqual((results["crash_baseline_failing_points"], results["crash_fixed_points"]), (1.0, 1.0))
+        self.assertTrue(any("crash points fixed versus the same-box baseline" in line for line in feedback))
+
     def test_slower_valid_candidate_scores_above_the_invalid_zero(self):
         _, results, _ = run_cli(candidate="slow-valid")
         self.assertEqual(results["accepted"], 0.0)
@@ -173,8 +206,29 @@ class PairingTests(unittest.TestCase):
         recorder = RecordingRunner()
         run_cli(runner_=recorder, pairs=3)
         self.assertEqual(
-            recorder.calls, ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"]
+            recorder.calls,
+            [
+                "baseline:crash",
+                "candidate:crash",
+                "baseline:perf",
+                "candidate:perf",
+                "candidate:perf",
+                "baseline:perf",
+                "baseline:perf",
+                "candidate:perf",
+            ],
         )
+
+    def test_crash_suite_runs_once_per_role_and_never_inside_the_timed_pairs(self):
+        recorder = RecordingRunner()
+        run_cli(runner_=recorder, pairs=5)
+        self.assertEqual(sum(call.endswith(":crash") for call in recorder.calls), 2)
+        self.assertEqual(recorder.calls[:2], ["baseline:crash", "candidate:crash"])
+
+    def test_a_failed_crash_gate_runs_no_timed_pairs(self):
+        recorder = RecordingRunner(candidate="bad-crash")
+        run_cli(candidate="bad-crash", runner_=recorder)
+        self.assertEqual(recorder.calls, ["baseline:crash", "candidate:crash"])
 
     def test_fewer_than_three_pairs_is_an_infrastructure_error(self):
         code, results, feedback = run_cli(pairs=2)
@@ -195,6 +249,11 @@ class BaselineModeTests(unittest.TestCase):
         self.assertEqual(results["baseline_e2e_spread"], 0.0)
         self.assertEqual(results["max_concurrent_engine_baseline_median"], 6.0)
         self.assertTrue(any("baseline mode" in line for line in feedback))
+        self.assertEqual((results["crash_gated_points"], results["crash_baseline_failing_points"]), (8.0, 1.0))
+        self.assertEqual(results["recovery_qualified"], 0.0)
+        text = "\n".join(feedback)
+        self.assertIn("real product failures, never filtered or scored as success", text)
+        self.assertIn("intercept/state_sync_before_snapshot_commit", text)
 
     def test_an_unhealthy_baseline_is_an_infrastructure_error(self):
         code, results, feedback = call(
@@ -241,7 +300,7 @@ class SubprocessTests(unittest.TestCase):
         self.assertTrue(lines)
         for line in lines:
             self.assertRegex(line, LINE)
-        self.assertIn("pair 1/3 baseline run starting", completed.stderr)
+        self.assertIn("pair 1/3 baseline perf run starting", completed.stderr)
 
 
 if __name__ == "__main__":

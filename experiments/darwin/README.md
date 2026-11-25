@@ -2,9 +2,9 @@
 
 Trusted evaluator and lane configs for evolving OpenIVM-Spark product code (Scala) with Darwin so
 that concurrent materialized-view (MV) refresh spends less time contending on the state guard.
-Five independent lanes (A-E) each get their own Darwin run; a candidate is only credited when it is
-correct, recovers from crashes, keeps every MV incremental and is measurably faster than a fresh
-baseline measured on the same box.
+Five independent lanes (A-E) each get their own `darwin evolve` run. A candidate is only credited
+when the crash-recovery and correctness gates pass, every MV stays incremental, and it is measurably
+faster than a fresh baseline measured on the same box.
 
 ## Evidence class (read first)
 
@@ -12,8 +12,8 @@ The suite measures **local modeled latency** (`evidence_class: local-relative-mo
 It is relative evidence for ranking candidates on one box. It is **not** OneLake proof, and it does
 not prove that Delta I/O is the cause of the contention. The measured spans are nested and
 non-additive (catalog finalization runs inside the barrier hold, waits overlap), so a sum of spans
-is not a critical path. Reference numbers from the earlier modeled run, kept in
-`manifest.json` as `reference_evidence` for documentation and feedback only (never scored):
+is not a critical path. Reference numbers from the earlier modeled run, kept in `manifest.json` as
+`reference_evidence` for documentation and feedback only (never scored):
 
 | Observation | Seconds |
 | --- | --- |
@@ -30,106 +30,181 @@ experiments/darwin/
   manifest.json            single machine-read source of truth (allowlists, frozen globs, acceptance, budgets, lane targets)
   manifest.yaml            human mirror; NOT parsed by any code
   evaluator.lock.json      sha256 of evaluator/*.py + manifest.json (the trust anchor)
-  evaluator/               state_guard_eval.py (CLI), darwin_evaluator.py (Darwin wrapper), policy, report, scoring, runner, lock
-  configs/lane-{a..e}.yaml Darwin configs, one per lane
+  evaluator/               state_guard_eval.py (CLI), policy, report, scoring, runner, lock
+  configs/lane-{a..e}.yaml `darwin evolve` experiment files, one per lane
   fixtures/                synthetic report sets + diff cases; make_fixtures.py regenerates them (--check verifies)
-  tests/                   unittest suite (offline, no Darwin, no Nx, no Spark)
-  validate-offline.sh      runs the suite from the repo root
+  tests/                   unittest suite (offline: no Darwin, no Nx, no Spark)
+  provision-agent-tools.sh pinned Copilot CLI (+ optional Darwin wheel) installer with sha256 checks
+  validate-offline.sh      runs the offline suite from the repo root
 ```
 
 ## Prerequisites
 
-- A devbox with the repo's pinned devcontainer. Java, Scala, sbt, Spark and Delta only run there;
-  the evaluator invokes the trusted suite through Nx and never uses host toolchains.
-- `python3` 3.12 and `bash` on the host. The evaluator is stdlib only (no `uv`, no `pip install`).
-- Darwin installed from its clone: `python scripts/xmake.py install` (installs the wheel and
-  persists `COPILOT_CLI_PATH`). Set `COPILOT_CLI_PATH` explicitly if the Copilot CLI is elsewhere.
-  Behaviour of a PyInstaller-built Darwin binary was not verified here.
-- A GitHub/GHE token for the agent in the environment (`COPILOT_GITHUB_TOKEN` or `GITHUB_TOKEN`);
-  never commit it. For GHE set `agents[0].auth.options.hostname`. The evaluator strips
-  `*TOKEN*`/`*SECRET*`/`*PASSWORD*`/`*CREDENTIAL*`/`*API_KEY*` variables before running the suite and
-  redacts token-looking text from everything it prints.
-- The trusted suite from the harness work: Nx target `spark-ext:state-guard-perf`. It does not
-  exist in the repo until the harness lands; scoring cannot run before then.
+The evaluator itself is stdlib-only Python 3.12 plus `bash`. Java, Scala, sbt, Spark and Delta only
+ever run in the pinned devcontainer through Nx (`npx --no-install nx run spark-ext:state-guard-perf`).
 
-Optional environment:
+**Darwin and the Copilot CLI** (verified on Ubuntu 24.04):
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `OPENIVM_DARWIN_EXEC_PREFIX` | empty (run Nx directly) | command prefix that enters the devcontainer, e.g. `npx --no-install nx run devcontainer:exec --` |
-| `OPENIVM_DARWIN_CONTAINER_ROOT` | `/workspaces/openivm-spark` | where a workspace root appears inside the devcontainer (report dirs are translated to it). The container must bind the candidate and baseline worktrees at that path; that binding belongs to the harness/devbox setup, not to this evaluator |
+| Component | Pin |
+| --- | --- |
+| Darwin | `darwin_evolution` 0.3.0 wheel (`darwin --version` prints `0.3.0`), sha256 `e5432cc6457dc6c65272d872082f71cbbd439d869db2d591b773e92cbc915f0e`, source commit `c50a954b7db43522f1f4012572e52e48c97a561c`, built with the project's setuptools backend from that tree |
+| Copilot CLI | **1.0.67** (`github-copilot-sdk` 1.0.5, which Darwin 0.3.0 drives, requires it; CLI 1.0.5 fails with `Unhandled method connect/runtime.shutdown`). Tarball `copilot-linux-x64.tar.gz` of release `v1.0.67` sha256 `c6d251de20d14415ebd6af00bfb6a8e3854094b49fa49fb7f3df2bfa64f6db3b`, extracted binary sha256 `a78b6e40e447fbadf500ac04e05e7f1378e73ffe96c67d3fff46f27200e34bc1` |
 
-## Offline validation
-
-No Darwin, Nx, Spark or network needed:
+The PyInstaller-built Darwin binary does not run on Ubuntu 24.04; use the wheel.
 
 ```bash
-bash experiments/darwin/validate-offline.sh          # = python3 -m unittest discover -s experiments/darwin/tests -t .
-python3 experiments/darwin/fixtures/make_fixtures.py --check   # fixtures match the generator
-python3 experiments/darwin/evaluator/lock.py --verify          # lock matches the evaluator files
+DARWIN_WHEEL=/path/to/darwin_evolution-0.3.0-py3-none-any.whl bash experiments/darwin/provision-agent-tools.sh
 ```
 
-The script is invoked through `bash` (the executable bit is not set). Tests write scratch files to
-`experiments/darwin/.scratch/` (git-ignore it or delete it) and print only test status.
+The script is idempotent, verifies both checksums, installs the CLI under `~/.darwin-tools/copilot-cli/1.0.67/bin/copilot`
+(override with `DARWIN_TOOLS_DIR`), installs Darwin into `~/.darwin-tools/venv`, and prints the `PATH` and
+`COPILOT_CLI_PATH` exports to use. Install the wheel as `python3 -m venv --without-pip V && python3 -m pip --python V/bin/python install pip && V/bin/python -m pip install <wheel>`
+if you prefer to do it by hand.
 
-## Before the first run
+**Identity.** Darwin reads `COPILOT_GITHUB_TOKEN`, `COPILOT_GH_HOST` and `COPILOT_GH_ACCOUNT` (and
+`COPILOT_CLI_PATH`) from an env file. On a devbox that file is the repo's gitignored `.env`, delivered by
+repo-bootstrapper's `sync/<repo>` folder; never put these values in job code, configs or logs. The
+proven setup is GitHub Enterprise: `COPILOT_GH_HOST=msft.ghe.com`, `COPILOT_GH_ACCOUNT=mdrrahman@msft.ghe.com`.
+The agent model in every lane config is `claude-haiku-4.5`, the model proven end to end in the preflight;
+use a local copy of a lane config to try another model. The evaluator strips `*TOKEN*`, `*SECRET*`,
+`*PASSWORD*`, `*CREDENTIAL*` and `*API_KEY*` variables before running the suite and redacts token-looking
+text from everything it prints.
 
-Replace every `<...>` placeholder in the lane configs (`grep -n '<' experiments/darwin/configs/*.yaml`):
+## Trusted evaluator checkout
 
-| Placeholder | Where | Value |
-| --- | --- | --- |
-| `<BASELINE_REF>` | `source.ref` | the committed baseline branch/sha Darwin evolves from |
-| `<REPOSITORY_URL_OR_LOCAL_PATH>` | `source.options.repository` | the repo Darwin clones |
-| `<DARWIN_RUNTIME_DIR>/containers` | `container.options.path` | scratch dir for Darwin workspaces |
-| `<BASELINE_SHA>` | `evaluator.options.baseline_ref` | the SAME baseline commit the paired baseline runs use |
-| `<SHA256_OF_evaluator.lock.json>` | `evaluator.options.lock_sha256` | output of `python3 experiments/darwin/evaluator/lock.py --digest` |
-| `<MODEL_NAME>` | `agents[0].models[0].name` | the one place the agent model is named |
+Candidates edit a workspace copy of the repo, so the evaluator must run from a copy they cannot touch.
+Make one pinned checkout of the **frozen harness commit** outside the lane checkouts, and use that SHA
+as the baseline too:
 
-Optional `evaluator.options` (declared by `StateGuardOptions`): `spark_target` (`spark-3.5` default,
-or `spark-4.1`), `pairs` (default 3, minimum 3), `baseline_repo`, `cache_dir`, `run_timeout_s`
-(per suite run, default 1200), `deadline_s` (all runs, default 5000), `manifest`.
+```bash
+export OPENIVM_DARWIN_BASELINE_SHA=<frozen harness commit, full sha>
+git worktree add /tmp/darwin-trusted "$OPENIVM_DARWIN_BASELINE_SHA"
+export OPENIVM_DARWIN_TRUSTED=/tmp/darwin-trusted
+export OPENIVM_DARWIN_LOCK_SHA256=$(python3 "$OPENIVM_DARWIN_TRUSTED/experiments/darwin/evaluator/lock.py" --digest)
+```
 
-The baseline commit must be fetchable by the evaluator (`baseline_repo` if the workspace has no
-remote). Darwin evaluation clones are shallow, so the baseline sha is fetched at depth 1.
+The lane configs call `$OPENIVM_DARWIN_TRUSTED/experiments/darwin/evaluator/state_guard_eval.py`, which
+recomputes the digest of its own `evaluator/*.py` + `manifest.json` against `evaluator.lock.json` and the
+pinned `OPENIVM_DARWIN_LOCK_SHA256`; a mismatch scores 0.0 with `trust_gate=0`. Any candidate diff under
+`experiments/**` is also a frozen-file violation. After ANY edit to `evaluator/*.py` or `manifest.json`, run
+`python3 experiments/darwin/evaluator/lock.py --write` and re-pin the digest.
 
-## Trusted evaluator copy
-
-Candidates edit a workspace copy of the repo. The evaluator must therefore run from a copy they
-cannot touch:
-
-1. Make a pinned checkout of the baseline commit outside the candidate workspaces, e.g.
-   `git worktree add <TRUSTED_DIR> <BASELINE_SHA>`, and point `darwin run` at the config there.
-   Darwin loads `evaluator.path` (`../evaluator/darwin_evaluator.py`) relative to the config
-   directory, so the wrapper and CLI both come from the trusted copy.
-2. Pin the lock digest: put `python3 experiments/darwin/evaluator/lock.py --digest` into
-   `evaluator.options.lock_sha256`. The CLI recomputes the digest of `evaluator/*.py` and
-   `manifest.json` against `evaluator.lock.json` and against the pinned value; a mismatch scores 0.0
-   with `trust_gate=0`.
-3. Defense in depth: any candidate diff under `experiments/**` is a frozen-file violation (0.0).
-
-After ANY edit to `evaluator/*.py` or `manifest.json`, regenerate the lock and re-pin it:
-`python3 experiments/darwin/evaluator/lock.py --write`, then update `lock_sha256` in the configs.
+The workspace Darwin hands the evaluator is a git repo with the candidate as HEAD and **no remotes**, so
+the configs pass `--baseline-repo "$OPENIVM_DARWIN_TRUSTED"` and the evaluator fetches the baseline SHA from there.
 
 ## Running a lane
 
-Run ONE lane per Darwin daemon (Darwin loads every evaluator as the module `evaluation_module`, so
-two lanes in one daemon collide):
+One lane per branch checkout (Darwin evolves committed HEAD; candidates stay in local refs until promoted):
 
 ```bash
-darwin start --background
-darwin run experiments/darwin/configs/lane-a.yaml     # likewise lane-b .. lane-e, each on its own daemon
+cd <lane checkout>        # contains the frozen harness commit
+darwin evolve experiments/darwin/configs/lane-a.yaml \
+  --home /tmp/darwin-home-a --env-file /workspaces/openivm-spark/.env --repo .
 ```
 
-Each lane: `executor.termination.max_iterations: 18`; early stop after 8 iterations without
-improvement of `combined_score` (absolute `min_improvement: 0.5`, since the score spans roughly
-0-175); evaluator timeout 5400 s per iteration, no retries. Darwin's `darwin evolve <file>`
-experiment format (commands as plain strings) is **not** implemented here; the configs use
-`darwin run` with the Python evaluator.
+Likewise `lane-b` .. `lane-e`. Each lane: `max_iterations: 18`, early stop after 8 iterations without
+improvement of `combined_score` (absolute `min_improvement: 0.5`; the score spans roughly 0-175), agent
+timeout 3600 s, evaluator timeout 7200 s per iteration. The agent only edits files; the evaluator owns builds,
+tests and benchmarks.
+
+Evaluator commands (inside each config) shape:
+
+```bash
+python3 "$OPENIVM_DARWIN_TRUSTED/experiments/darwin/evaluator/state_guard_eval.py" --mode candidate --lane a \
+  --workspace . --baseline-repo "$OPENIVM_DARWIN_TRUSTED" --baseline-ref "$OPENIVM_DARWIN_BASELINE_SHA" \
+  --lock-sha256 "$OPENIVM_DARWIN_LOCK_SHA256" --pairs 3
+```
+
+Metrics are strict lookups of `@RESULT` lines: a missing metric makes Darwin treat the evaluation as failed
+instead of silently scoring 0. **Darwin 0.3.0 counts failed evaluations toward `max_iterations_without_improvement`
+and the evaluator cannot prevent that.** An evaluator infrastructure error (exit 2, no `@RESULT`, `infra_error` in
+the log) is therefore distinguishable but not excluded from patience or budget; re-run or resume a lane whose
+iterations were lost to infrastructure.
+
+## Evaluation flow
+
+1. Trust gate (lock digest) and allowlist gate (changed files vs the lane's lists and the frozen globs).
+2. Crash gate: the **crash suite** runs on the baseline (cached, once per box and SHA) and on the candidate.
+   If the gate fails, no timed pair runs and no speed is awarded.
+3. K >= 3 interleaved pairs of the **perf suite** (baseline-first on even pairs, candidate-first on odd pairs,
+   one box lock across all runs). Timed pairs are perf-only; the crash suite is not part of the timing.
+4. Scoring against the same-box baseline medians.
+
+The baseline runs in an evaluator-owned git worktree under `<cache-dir>/baseline/<sha12>`; every destructive git
+operation (`checkout --force`, `reset --hard`, `clean -fd`) is guarded by `assert_owned_worktree`, which refuses any
+path that is not that cache worktree (full SHA, exact parent/name, an owner marker in a real `.git` directory, not
+overlapping a protected lane checkout). Fresh baseline and candidate worktrees get `node_modules` through
+`npm ci --prefer-offline --no-audit --no-fund` when `node_modules/.bin/nx` is absent.
+
+## Crash gate and recovery qualification
+
+The crash report has one point per `mode/name` where `mode` is `intercept` or `cdf` (reported separately).
+
+- Per point, the candidate is compared with the same-box baseline. The crash gate fails only on a **regression**:
+  a flag that fails for the candidate and not for the baseline at the same point, a gated baseline point that
+  disappeared, an invalid or unusable report, a timeout, a misused or missing known-gap marker.
+- A point the baseline already fails (for example the Delta stale-snapshot replay) stays **visible** in `@FEEDBACK`
+  as `baseline fails too`, is never counted as a pass, and never qualifies recovery.
+- `recovery_qualified = 1` only when the candidate has zero failing non-known-gap points. `accepted` requires it:
+  until then speed is exploratory and cannot be accepted. `crash_fixed_points` counts baseline failures the
+  candidate fixes.
+
+**Known gap.** The point `cdf/mv_version_and_cdf_watermark_gap` (`known_gap=true`) documents the crash between the
+MV-version write and the CDF-watermark write. It is documentation only: it is reported separately, never counted as a
+pass, never contributes to recovery qualification, and never excuses another point. Stale-snapshot and every other
+crash failure stays a visible failure; `known_gap` cannot be used to bypass them.
+
+## Scoring and acceptance
+
+- Invalid (any gate false, allowlist violation, build/test failure, non-finite or missing metrics, timeout,
+  trust mismatch) => `combined_score = 0.0`, with `@FEEDBACK` naming the gate and the first failure lines.
+- Valid: `combined = max(0.001, 100*clamp(e2e_improvement_median,-1,1) + 50*clamp(wait_reduction,-1,1) + (25 if accepted))`.
+  The 0.001 floor keeps a valid-but-slower candidate distinguishable from an invalid 0.0.
+- `e2e_improvement_median` = median over pairs of `(baseline_makespan - candidate_makespan) / baseline_makespan`
+  (`makespan_ms` == `end_to_end_ms`, includes the final async drain).
+- `wait_reduction` = `1 - candidate_targeted / baseline_targeted` (medians over runs of the lane's targeted total).
+- **Accepted** only if all gates pass, `recovery_qualified` is 1, `wait_reduction >= 0.80` and
+  `e2e_improvement_median >= 0.10`.
+- Anti-gaming: `max_concurrent_engine >= baseline median - 1`; `serial_sum_ms` may not fall below 0.5 x baseline while
+  makespan rises; `full_refresh_count == 0` and `incremental_count == 6` (an incrementalizable MV must never fall back
+  to FULL_REFRESH). Early acknowledgement cannot score: the targeted waits and the makespan include the final drain,
+  and parity, metadata and state-sync consistency are checked on the finished run.
+
+Output protocol: stdout carries `@FEEDBACK <one line>` lines then `@RESULT <name>=<finite float>` (clamped to +-1e12).
+`@RESULT` names: `combined_score`; gates `allowlist_gate`, `correctness_gate`, `crash_gate`, `incremental_gate`,
+`concurrency_gate`, `report_gate`, `trust_gate`; `wait_reduction`; `e2e_improvement_median|min|max`;
+`baseline|candidate_targeted_wait_ms`; `baseline|candidate_e2e_ms_median`; `makespan_ms`; `baseline_e2e_spread`;
+`accepted`; `recovery_qualified`; `crash_gated_points`, `crash_failing_points`, `crash_baseline_failing_points`,
+`crash_fixed_points`; `pairs_completed`; `shared_files_touched`; `changed_file_count`; engine-overlap and
+`max_concurrent_engine` medians; lane `info_*_baseline|candidate`; and per MV `mvN_submit_to_ack_ms`,
+`mvN_state_barrier_hold_ms`, `mvN_state_barrier_wait_ms`, `mvN_capture_wait_ms`, `mvN_publication_queue_wait_ms` (N = 1..6).
+Progress logs go to stderr. The `feedback` artifact is the `@FEEDBACK` lines joined by newlines.
+
+## Lanes and ownership
+
+Prefix `CM` = `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/`, `RDB` = `CM/rocksdb/`,
+`MVC` = `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala`.
+`manifest.json` holds the authoritative lists; the evaluator allows owned + shared + `new_files` for the lane and warns
+when a shared file is touched (the coordinator integrates overlapping edits). Lane-owned tests stay frozen and are
+integrated on the trusted side, never as a scored candidate diff.
+
+| Lane | Goal | Targeted waits (sum over 6 MVs) | Owned | Shared | New files |
+| --- | --- | --- | --- | --- | --- |
+| A | shared barrier / lock scope | `state_barrier_wait_ms` + `capture_wait_ms` | `RDB/OpenIvmStateBarrier.scala`, `RDB/OpenIvmRocksDBRegistry.scala` | MVC, `CM/MvCatalog.scala` | none |
+| B | catalog finalization | `catalog_finalize_ms` | `CM/MvCatalog.scala`, `CM/CdfWatermarkBackend.scala`, `CM/StagingCatalog.scala`, `CM/DeltaPathTable.scala` | MVC, `CM/DeltaMvCatalogBackend.scala` | none |
+| C | per-MV publication / queue | `publication_queue_wait_ms` + `publication_ms` | `RDB/OpenIvmStateSync.scala` | MVC, `RDB/OpenIvmStateBarrier.scala` | none |
+| D | whole-path efficiency + catalog backend | `wall_ms` (catalog `fs_ops` total informational) | `CM/MvCatalogBackend.scala`, `CM/FeatureGate.scala` | MVC, `CM/DeltaMvCatalogBackend.scala`, `CM/MvCatalog.scala`, `CM/DeltaPathTable.scala` | none |
+| E | incremental state shipping | `counts.state_sync.bytes_uploaded` (state-sync write ops informational) | none | `RDB/OpenIvmStateSync.scala` | `RDB/OpenIvmStateDelta*.scala`, `RDB/OpenIvmStateSyncCodec*.scala` |
+
+Frozen for every lane (any diff vs the baseline => 0.0): `experiments/**`, `spark-ext/**/src/test/**`,
+`spark-ext/build.sbt`, `spark-ext/project/**`, `spark-ext/dev/**`, `spark-ext/project.json`, `.github/**`, `project.json`,
+`nx.json`, `package.json`, `package-lock.json`, `.devcontainer/**`, `contrib/**`, telemetry/measurement files
+(`**/telemetry/**`, `OpenIvmExecutionSpan.scala`, `RefreshProfile.scala`, `PhaseTimeline.scala`) and any `*Perf*Spec*`,
+`state-guard*` or `.gitattributes` path. Also rejected: deleted files, files outside the lane allowlist, symlinks, binary
+blobs and file-mode changes. The changed set is `git diff --name-status --no-renames <baseline>` plus
+`git ls-files --others --exclude-standard`; Darwin's `output/*.json|md` protocol files are ignored.
 
 ## Manual scoring
-
-Candidate (paired against a fresh same-box baseline, `--pairs >= 3`, alternating baseline-first and
-candidate-first):
 
 ```bash
 python3 experiments/darwin/evaluator/state_guard_eval.py --mode candidate \
@@ -137,108 +212,34 @@ python3 experiments/darwin/evaluator/state_guard_eval.py --mode candidate \
   --lock-sha256 "$(python3 experiments/darwin/evaluator/lock.py --digest)"
 ```
 
-Baseline sanity check (runs the suite once, always prints `combined_score=0.000000`):
-`--mode baseline --workspace <checkout> --lane a`. Offline: add `--offline-fixtures
-experiments/darwin/fixtures/reports --offline-candidate-set good-candidate --skip-lock-check`.
+Baseline sanity check (crash suite once, then K perf runs; always prints `combined_score=0.000000`):
+`--mode baseline --workspace <checkout> --lane a`. Offline: add `--offline-fixtures experiments/darwin/fixtures/reports
+--offline-candidate-set good-candidate --skip-lock-check`. Exit code 0 for every candidate outcome (invalid scores 0.0);
+exit 2 only for evaluator infrastructure errors, still with `combined_score=0.000000`. `--spark-target spark-4.1` selects
+the Spark 4.1 / Delta 4.2 target; both targets use the same discovery and the same suites.
 
-Exit code 0 for every candidate outcome (invalid scores 0.0); exit 2 only for evaluator
-infrastructure errors, still with `combined_score=0.000000`. `darwin_evaluator.py` converts timeouts,
-crashes and exit 2 into a zero-score result with `infra_error=1`; it never raises into Darwin.
+The suites and their report contracts (`state-guard-perf.json`, `state-guard-crash.json`, `state-guard-events.jsonl`) are
+written to `<root>/.logs/state-guard/<label>/` (`OPENIVM_STATE_GUARD_REPORT_DIR`). `OPENIVM_STATE_GUARD_SUITE`
+(`all|perf|crash`) selects which suite the Nx target runs; `OPENIVM_STATE_GUARD_CATALOG_BACKEND` (`delta|rocksdb`) selects the
+catalog backend of the perf suite.
 
-### Output protocol (our own, not Darwin's)
+## Offline validation
 
-stdout carries `@FEEDBACK <one line>` lines (feedback is capped per line) followed by
-`@RESULT <name>=<finite float>`. The wrapper turns `@RESULT` into `EvaluationResult.metrics`
-(every value finite and clamped to +-1e12; a non-1.0 `*_gate` forces `combined_score` to 0.0) and
-`@FEEDBACK` into a `feedback` string artifact the agent reads. Progress logs go to stderr.
+No Darwin, Nx, Spark or network needed:
 
-`@RESULT` names: `combined_score`; gates `allowlist_gate`, `correctness_gate`, `crash_gate`,
-`incremental_gate`, `concurrency_gate`, `report_gate`, `trust_gate` (1.0 pass, 0.0 fail or not
-evaluated); `wait_reduction`; `e2e_improvement_median` (+ `_min`, `_max`); `baseline_targeted_wait_ms`,
-`candidate_targeted_wait_ms`; `baseline_e2e_ms_median`, `candidate_e2e_ms_median`, `makespan_ms`,
-`baseline_e2e_spread`; `accepted` (0/1); `pairs_completed`; `shared_files_touched`;
-`changed_file_count`; engine-overlap and `max_concurrent_engine` medians; lane informational
-`info_*_baseline|candidate`; and per MV `mvN_submit_to_ack_ms`, `mvN_state_barrier_hold_ms`,
-`mvN_state_barrier_wait_ms`, `mvN_capture_wait_ms`, `mvN_publication_queue_wait_ms` (N = 1..6).
+```bash
+bash experiments/darwin/validate-offline.sh                    # = python3 -m unittest discover -s experiments/darwin/tests -t .
+python3 experiments/darwin/fixtures/make_fixtures.py --check   # fixtures match the generator
+python3 experiments/darwin/evaluator/lock.py --verify          # lock matches the evaluator files
+```
 
-## Scoring and acceptance
+Tests write scratch files to `experiments/darwin/.scratch/` (git-ignore it or delete it) and print only test status.
+They also load every lane config with PyYAML and assert the `darwin evolve` schema, the command pieces, the metric list
+(equal to what the evaluator emits) and the absence of credentials.
 
-- Invalid (any gate false, allowlist violation, build/test failure, non-finite or missing metrics,
-  timeout, trust mismatch) => `combined_score = 0.0`, with `@FEEDBACK` naming the gate and the first
-  failure lines.
-- Valid: `combined = max(0.001, 100*clamp(e2e_improvement_median,-1,1) + 50*clamp(wait_reduction,-1,1) + (25 if accepted))`.
-  The 0.001 floor keeps a valid-but-slower candidate distinguishable from an invalid 0.0.
-- `e2e_improvement_median` = median over pairs of `(baseline_makespan - candidate_makespan) / baseline_makespan`
-  (`makespan_ms` == `end_to_end_ms`, includes the final async drain).
-- `wait_reduction` = `1 - candidate_targeted / baseline_targeted`, where each side is the median over its
-  runs of the lane's targeted total (table below).
-- **Accepted** only if all gates pass AND `wait_reduction >= 0.80` AND `e2e_improvement_median >= 0.10`.
-- Anti-gaming gates: `max_concurrent_engine >= baseline median - 1`; `serial_sum_ms` may not fall
-  below 0.5 x baseline while makespan rises (so serializing or deferring work outside the measured
-  interval cannot win); `full_refresh_count == 0` and `incremental_count == 6` (an incrementalizable
-  MV must never fall back to FULL_REFRESH).
-- Crash gate: at least 3 crash points; every point with `known_gap == false` must have `crashed`,
-  `recovered`, `parity`, `metadata_converged` and `incremental_after_recovery` all true. Points with
-  `known_gap == true` never fail the gate and are echoed as "documented known gap:
-  MV-version/CDF-watermark".
+## Report schema
 
-## Lanes and ownership
-
-Prefix `CM` = `spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/`, `RDB` = `CM/rocksdb/`,
-`MVC` = `spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala`.
-`manifest.json` holds the authoritative lists; the evaluator allows owned + shared + `new_files` for the
-lane and emits a warning when a shared file is touched (the coordinator integrates overlapping edits).
-
-| Lane | Goal | Targeted waits (sum over 6 MVs) | Owned | Shared | New files |
-| --- | --- | --- | --- | --- | --- |
-| A | shared barrier / lock scope | `state_barrier_wait_ms` + `capture_wait_ms` | `RDB/OpenIvmStateBarrier.scala`, `RDB/OpenIvmRocksDBRegistry.scala` | MVC | none |
-| B | catalog finalization | `catalog_finalize_ms` | `CM/MvCatalog.scala`, `CM/CdfWatermarkBackend.scala`, `CM/StagingCatalog.scala` | MVC, `CM/DeltaMvCatalogBackend.scala` | none |
-| C | per-MV publication / queue | `publication_queue_wait_ms` + `publication_ms` | `RDB/OpenIvmStateSync.scala` | MVC, `RDB/OpenIvmStateBarrier.scala` | none |
-| D | whole-path efficiency + catalog backend | `wall_ms` (catalog `fs_ops` total informational) | `CM/MvCatalogBackend.scala`, `CM/FeatureGate.scala` | MVC, `CM/DeltaMvCatalogBackend.scala` | none |
-| E | incremental state shipping | `counts.state_sync.bytes_uploaded` (state-sync write ops informational) | none | `RDB/OpenIvmStateSync.scala` | `RDB/OpenIvmStateDelta*.scala`, `RDB/OpenIvmStateSyncCodec*.scala` |
-
-`OpenIvmStateDelta*` and `OpenIvmStateSyncCodec*` do not exist in the repo today; lane E is the only
-lane allowed to add files.
-
-Frozen for every lane (any diff vs the baseline => 0.0): `experiments/**`, `spark-ext/**/src/test/**`,
-`spark-ext/build.sbt`, `spark-ext/project/**`, `spark-ext/dev/**`, `spark-ext/project.json`,
-`.github/**`, `project.json`, `nx.json`, `package.json`, `package-lock.json`, `.devcontainer/**`,
-`contrib/**`, telemetry/measurement files (`**/telemetry/**`, `OpenIvmExecutionSpan.scala`,
-`RefreshProfile.scala`, `PhaseTimeline.scala`) and any `*Perf*Spec*`, `state-guard*` or
-`.gitattributes` path. Also rejected: deleted files, files outside the lane allowlist, symlinks,
-binary blobs and file-mode changes. The changed set is `git diff --name-status --no-renames <baseline>`
-plus `git ls-files --others --exclude-standard`; Darwin's `output/*.json|md` protocol files are
-ignored.
-
-## Known gap
-
-A crash between the MV-version write and the CDF-watermark write is a documented known gap
-(`MV-version/CDF-watermark`). It never fails the crash gate and is always echoed in feedback. It
-only becomes relevant when a candidate changes that path, which lanes B and D may do; the prompts
-for those lanes say so.
-
-## Promotion flow
-
-Candidates live only in Darwin's local refs/workspaces until promoted. The coordinator reviews the
-accepted candidates, integrates overlapping shared-file edits, re-runs the paired measurement on the
-integrated tree and lands everything in a single PR (#108). Nothing in this directory pushes,
-commits or opens PRs.
-
-## What was and was not verified
-
-Verified offline: policy, report validation, scoring, CLI end to end against synthetic fixtures,
-the runner against a fake suite process, wrapper parsing, redaction, and config/manifest
-consistency (`bash experiments/darwin/validate-offline.sh`). Not verified: any run with Darwin
-itself (the configs and wrapper were checked against Darwin's source only), the Nx
-`state-guard-perf` target, the devcontainer binding, PyInstaller-binary behaviour, and the report
-fields the real suite emits beyond the schema this evaluator validates. The `good-candidate`
-fixtures are synthetic. The failure-line regex and the `FULL_REFRESH` vocabulary used on `outcome`
-are best guesses until the suite exists.
-
-## Report schema (`state-guard-perf.json`, `openivm.state-guard-perf/v1`)
-
-Written by the suite into `$OPENIVM_STATE_GUARD_REPORT_DIR`. All numbers finite and `>= 0`; unknown
-`evidence_class` => invalid.
+`state-guard-perf.json` (`openivm.state-guard-perf/v1`), all numbers finite and `>= 0`; an unknown `evidence_class` is invalid:
 
 ```
 { "schema": "openivm.state-guard-perf/v1", "evidence_class": "local-relative-modeled-latency",
@@ -262,19 +263,30 @@ Written by the suite into `$OPENIVM_STATE_GUARD_REPORT_DIR`. All numbers finite 
 ```
 
 `state-guard-crash.json` (`openivm.state-guard-crash/v1`):
-`{"points": [{"name", "crashed", "recovered", "parity", "metadata_converged", "incremental_after_recovery", "known_gap", "notes"}]}`.
-`evaluator/report.py` is the validator and treat it as the exact contract. Beyond field types it checks
-that `end_to_end_ms == makespan_ms`, `serial_sum_ms == sum(submit_to_ack_ms)`, `mv_index` is exactly
-1..6, each interval's end does not precede its start, `submit_to_ack_ms` agrees with
-`ack_at_ms - submit_at_ms`, the makespan does not end before the last ack, and `max_concurrent_engine`
-matches the per-view engine offsets. `engine_overlap_ms` and `barrier_hold_overlap_ms` are validated
-as numbers but not recomputed.
+`{"points": [{"name", "mode", "crashed", "recovered", "parity", "metadata_converged", "incremental_after_recovery", "known_gap", "notes"}]}`.
+`evaluator/report.py` is the validator and the exact contract. Beyond field types it checks that
+`end_to_end_ms == makespan_ms`, `serial_sum_ms == sum(submit_to_ack_ms)`, `mv_index` is exactly 1..6, each interval's end
+does not precede its start, `submit_to_ack_ms` agrees with `ack_at_ms - submit_at_ms`, the makespan does not end before
+the last ack, and `max_concurrent_engine` matches the per-view engine offsets.
 
 ## Offline fixtures
 
-`fixtures/reports/<set>/` holds `state-guard-perf.json` and `state-guard-crash.json`, plus optional
-`run.json` (`exit_code`, failure lines) and `changes.json` (candidate diff as
-`[{"path", "status", "old_mode", "new_mode", "binary"}]`; absent means no changes). Sets: `baseline`,
-`good-candidate`, `lane-a-only`, `slow-valid`, `bad-parity`, `bad-crash`, `full-refresh-regression`,
-`serialized-engines`, `deferred-work`, `nonfinite`, `wrong-evidence-class`, `bad-allowlist`.
-`fixtures/diffs/*.json` are policy cases. Regenerate with `python3 experiments/darwin/fixtures/make_fixtures.py`.
+`fixtures/reports/<set>/` holds `state-guard-perf.json` and `state-guard-crash.json`, plus optional `run.json`
+(`exit_codes` per suite, failure lines) and `changes.json` (candidate diff as
+`[{"path", "status", "old_mode", "new_mode", "binary"}]`; absent means no changes). `fixtures/diffs/*.json` are policy
+cases. Regenerate with `python3 experiments/darwin/fixtures/make_fixtures.py`.
+
+## Promotion flow
+
+Candidates live only in Darwin's local refs/workspaces until promoted. The coordinator reviews the accepted candidates,
+integrates overlapping shared-file edits, re-runs the paired measurement on the integrated tree and lands everything in
+the single PR (#108). Nothing in this directory pushes, commits or opens PRs.
+
+## What was and was not verified
+
+Verified offline: policy, report validation, scoring, the CLI end to end against synthetic fixtures, the runner against a
+fake suite process, redaction, and config/manifest consistency. Verified on the devbox: the Darwin 0.3.0 wheel, Copilot CLI
+1.0.67 and one real agent iteration with the GHE identity; the shape of the workspace and environment Darwin hands an
+evaluator (a git repo with the candidate as HEAD, no remotes, env expansion); the crash suite on Spark 3.5. Not verified:
+absolute OneLake behaviour (the latency is modeled), models other than `claude-haiku-4.5`, and the report fields the real
+suite emits beyond what `report.py` validates.

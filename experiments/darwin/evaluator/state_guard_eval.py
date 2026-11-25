@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Trusted state-guard evaluator CLI.
 
-Scores a candidate workspace against a fresh same-box baseline using interleaved pairs of
-the trusted `state-guard-perf` suite. Prints `@FEEDBACK <text>` and `@RESULT <name>=<float>`
-lines on stdout; progress goes to stderr. Exit 0 for any candidate outcome (invalid => score
-0.0), 2 for evaluator infrastructure errors.
+Scores a candidate workspace against a fresh same-box baseline. It runs the crash-recovery suite
+first (a failed gate means no timed pair is run or credited), then interleaved pairs of the perf
+suite, both from the trusted `state-guard-perf` Nx target. Prints `@FEEDBACK <text>` and
+`@RESULT <name>=<float>` lines on stdout; progress goes to stderr. Exit 0 for any candidate
+outcome (invalid => score 0.0), 2 for evaluator infrastructure errors.
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -43,6 +45,11 @@ SCALARS = (
     "makespan_ms",
     "baseline_e2e_spread",
     "accepted",
+    "recovery_qualified",
+    "crash_gated_points",
+    "crash_failing_points",
+    "crash_baseline_failing_points",
+    "crash_fixed_points",
     "pairs_completed",
     "shared_files_touched",
     "changed_file_count",
@@ -101,7 +108,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--spark-target", default=None)
     parser.add_argument("--cache-dir", default=os.path.join("~", ".cache", "openivm-darwin"))
     parser.add_argument("--manifest", default=None)
-    parser.add_argument("--run-timeout", type=float, default=None, help="seconds per suite run")
+    parser.add_argument("--run-timeout", type=float, default=None, help="seconds per perf suite run")
+    parser.add_argument("--crash-timeout", type=float, default=None, help="seconds per crash suite run")
     parser.add_argument("--deadline", type=float, default=0.0, help="total seconds for all runs (0 = none)")
     parser.add_argument("--no-box-lock", action="store_true")
     parser.add_argument("--lock-sha256", default="", help="pinned sha256 of evaluator.lock.json")
@@ -123,21 +131,26 @@ class Session:
         self.args, self.manifest, self.runner, self.out = args, manifest, run, out
         self.started = time.monotonic()
         self.run_count = 0
+        self.baseline_sha = ""
+        self.baseline_verdict: report.CrashVerdict | None = None
+        self.candidate_verdict: report.CrashVerdict | None = None
 
     def remaining(self) -> float:
         if self.args.deadline <= 0:
             return float("inf")
         return self.args.deadline - (time.monotonic() - self.started)
 
-    def run_suite(self, role: str, root: Path, pair: int) -> runner.RunResult:
-        timeout = min(self.args.run_timeout, self.remaining())
+    def run_suite(self, role: str, root: Path, pair: int, suite: str = "perf") -> runner.RunResult:
+        limit = self.args.crash_timeout if suite == "crash" else self.args.run_timeout
+        timeout = min(limit, self.remaining())
         if timeout <= 0:
             return runner.RunResult(exit_code=None, timed_out=True)
         self.run_count += 1
-        label = f"{role}-{os.getpid()}-{pair}"
-        log(f"pair {pair + 1}/{self.args.pairs} {role} run starting (timeout {timeout:.0f}s)")
-        result = self.runner.run(role, root, label, self.args.spark_target, timeout)
-        log(f"pair {pair + 1}/{self.args.pairs} {role} run finished: exit={result.exit_code} timed_out={result.timed_out} {result.duration_s:.0f}s")
+        label = f"{role}-{suite}-{os.getpid()}-{pair}"
+        what = f"pair {pair + 1}/{self.args.pairs} {role} perf" if suite == "perf" else f"{role} crash"
+        log(f"{what} run starting (timeout {timeout:.0f}s)")
+        result = self.runner.run(role, root, label, self.args.spark_target, timeout, suite)
+        log(f"{what} run finished: exit={result.exit_code} timed_out={result.timed_out} {result.duration_s:.0f}s")
         return result
 
     def check_baseline(self, result: runner.RunResult, pair: int) -> dict[str, Any]:
@@ -160,14 +173,14 @@ class Session:
 
     def check_candidate(self, result: runner.RunResult, pair: int) -> dict[str, Any] | None:
         out, manifest = self.out, self.manifest
-        perf_name, crash_name = manifest["nx"]["perf_report"], manifest["nx"]["crash_report"]
+        perf_name = manifest["nx"]["perf_report"]
         if result.timed_out:
             out.mark("correctness_gate", False)
             out.say(f"candidate run {pair + 1} timed out or the evaluation deadline was reached")
             return None
         if result.exit_code != 0:
             out.mark("correctness_gate", False)
-            out.say(f"suite exited {result.exit_code} (a correctness/recovery assertion or the build failed)")
+            out.say(f"perf suite exited {result.exit_code} (a correctness assertion or the build failed)")
             for line in result.failure_excerpt():
                 out.say(f"failure: {line}")
         perf_ok = False
@@ -182,7 +195,6 @@ class Session:
                 out.say(f"invalid {perf_name}: " + "; ".join(problems[:6]))
             else:
                 perf_ok = True
-        self._check_crash(result, crash_name)
         if not perf_ok:
             return None
         failures = report.perf_gate_failures(result.perf, manifest)
@@ -196,24 +208,101 @@ class Session:
         out.mark("report_gate", True)
         return result.perf
 
-    def _check_crash(self, result: runner.RunResult, crash_name: str) -> None:
-        out = self.out
+    def crash_verdict(self, result: runner.RunResult) -> tuple[report.CrashVerdict | None, list[str]]:
+        """The validated crash verdict of one crash-suite run, or the reasons it cannot be used."""
+        name = self.manifest["nx"]["crash_report"]
+        excerpt = [f"failure: {line}" for line in result.failure_excerpt(6)]
+        if result.timed_out:
+            return None, ["the crash suite timed out or the evaluation deadline was reached"]
         if result.crash is None:
-            if result.exit_code == 0:
-                out.mark("crash_gate", False)
-                out.say(next((e for e in result.read_errors if e.startswith(crash_name)), f"{crash_name}: not written"))
-            return
+            reason = next((e for e in result.read_errors if e.startswith(name)), f"{name}: not written")
+            return None, [f"{reason} (the build failed or the suite aborted before reporting)", *excerpt]
         problems = report.validate_crash(result.crash, self.manifest)
         if problems:
+            return None, [f"invalid {name}: " + "; ".join(problems[:6])]
+        verdict = report.crash_verdict(result.crash, self.manifest)
+        if verdict.problems:
+            return None, [f"invalid {name}: " + "; ".join(verdict.problems[:6])]
+        if result.exit_code != 0 and not verdict.failing:
+            return None, [f"the crash suite exited {result.exit_code} although its report shows no failing point", *excerpt]
+        return verdict, []
+
+    def cached_baseline_crash(self) -> Path | None:
+        if self.args.offline_fixtures or not self.baseline_sha:
+            return None
+        backend = os.environ.get("OPENIVM_STATE_GUARD_CATALOG_BACKEND", "delta") or "delta"
+        name = f"{self.baseline_sha[:12]}-{self.args.spark_target}-{backend}.json"
+        return Path(self.args.cache_dir).expanduser() / "crash-baseline" / name
+
+    def baseline_crash(self, root: Path) -> report.CrashVerdict:
+        """Crash verdict of the same-box baseline; computed once per baseline/target/backend and cached."""
+        cache = self.cached_baseline_crash()
+        verdict = None
+        if cache is not None and cache.is_file():
+            try:
+                cached = report.load_json(cache)
+                if not report.validate_crash(cached, self.manifest):
+                    verdict = report.crash_verdict(cached, self.manifest)
+                    log(f"baseline crash report reused from {cache}")
+            except (OSError, ValueError):
+                verdict = None
+            if verdict is not None and verdict.problems:
+                verdict = None
+        if verdict is None:
+            result = self.run_suite("baseline", root, 0, "crash")
+            verdict, reasons = self.crash_verdict(result)
+            if verdict is None:
+                raise runner.InfraError("baseline crash suite is unusable: " + "; ".join(reasons[:4]))
+            if cache is not None:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(json.dumps(result.crash, indent=2, sort_keys=True), encoding="utf-8")
+        self.baseline_verdict = verdict
+        return verdict
+
+    def check_crash(self, candidate_root: Path, baseline_root: Path) -> bool:
+        """Run the candidate crash suite; False (gate failed) means no speed is measured or awarded."""
+        out = self.out
+        baseline = self.baseline_crash(baseline_root)
+        known_failures = baseline.failing
+        result = self.run_suite("candidate", candidate_root, 0, "crash")
+        verdict, reasons = self.crash_verdict(result)
+        if verdict is None:
             out.mark("crash_gate", False)
-            out.say(f"invalid {crash_name}: " + "; ".join(problems[:6]))
-            return
-        failures, known = report.crash_gate(result.crash)
-        out.mark("crash_gate", not failures)
-        for failure in failures[:6]:
-            out.say(f"crash gate: {failure}")
-        for name in known:
-            out.say(f"{self.manifest['known_gap']['text']} [point {name}]")
+            for reason in reasons:
+                out.say(f"crash gate: {reason}")
+            return False
+        self.candidate_verdict = verdict
+        regressions = report.crash_regressions(verdict, baseline)
+        out.mark("crash_gate", not regressions)
+        for regression in regressions[:6]:
+            out.say(f"crash gate: {regression}")
+        results = out.results
+        results["crash_gated_points"] = verdict.gated
+        results["crash_failing_points"] = len(verdict.failing)
+        results["crash_baseline_failing_points"] = len(known_failures)
+        results["crash_fixed_points"] = len([key for key in known_failures if key not in verdict.failing])
+        results["recovery_qualified"] = 1.0 if not verdict.failing and not regressions else 0.0
+        self.explain_crash(verdict, known_failures)
+        return not regressions
+
+    def explain_crash(self, verdict: report.CrashVerdict, known_failures: dict[str, list[str]]) -> None:
+        out = self.out
+        if verdict.failing:
+            listed = "; ".join(
+                f"{key} ({', '.join(flags)} false{', baseline fails too' if key in known_failures else ', NEW'})"
+                for key, flags in verdict.failing.items()
+            )
+            out.say(
+                "recovery NOT QUALIFIED: these gated crash points still fail (baseline-known failures stay visible and are "
+                f"never scored as success; speed is exploratory and cannot be accepted until they pass): {listed}"
+            )
+        else:
+            out.say(f"recovery qualified: all {verdict.gated} gated crash points pass (intercept and cdf reported separately)")
+        fixed = [key for key in known_failures if key not in verdict.failing]
+        if fixed:
+            out.say("crash points fixed versus the same-box baseline: " + ", ".join(fixed))
+        for key in verdict.known:
+            out.say(f"{self.manifest['known_gap']['text']} [point {key}] reported separately; never counted as a pass")
 
 
 def baseline_sources(args: argparse.Namespace) -> list[str]:
@@ -235,12 +324,14 @@ def prepare_roots(args: argparse.Namespace, session: Session) -> tuple[Path, lis
         raise runner.InfraError("--baseline-ref is required")
     sha = policy.resolve_baseline(args.workspace, args.baseline_ref, args.baseline_repo or None)
     log(f"baseline {args.baseline_ref} -> {sha}")
+    session.baseline_sha = sha
     changes = policy.collect_changes(args.workspace, sha) if args.mode == "candidate" else []
     if args.mode == "candidate":
         verdict = policy.check_changes(changes, manifest, args.lane)
         if not verdict["ok"]:
             return Path(args.workspace), changes
-    root = runner.prepare_baseline_worktree(Path(args.cache_dir).expanduser(), sha, baseline_sources(args))
+    protect = (Path(args.workspace), lock.ROOT)
+    root = runner.prepare_baseline_worktree(Path(args.cache_dir).expanduser(), sha, baseline_sources(args), protect)
     return root, changes
 
 
@@ -266,6 +357,8 @@ def evaluate_candidate(args: argparse.Namespace, session: Session) -> None:
     candidates: list[dict[str, Any]] = []
     guard = runner.BoxLock(Path(args.cache_dir).expanduser() / "box.lock", wait_s=min(session.remaining(), 3600.0))
     with _maybe(guard, not (args.no_box_lock or args.offline_fixtures)):
+        if not session.check_crash(candidate_root, baseline_root):
+            return
         for pair in range(args.pairs):
             order = ("baseline", "candidate") if pair % 2 == 0 else ("candidate", "baseline")
             for role in order:
@@ -316,13 +409,22 @@ def finish_candidate(args, session, lane, baselines, candidates, verdict) -> Non
     results["baseline_e2e_ms_median"] = scores.baseline_e2e
     results["candidate_e2e_ms_median"] = scores.candidate_e2e
     results["makespan_ms"] = scores.candidate_e2e
-    results["accepted"] = 1.0 if scores.accepted else 0.0
+    qualified = results["recovery_qualified"] == 1.0
+    accepted = scores.accepted and qualified
+    results["accepted"] = 1.0 if accepted else 0.0
     valid = not out.failed()
     results["combined_score"] = (
-        scoring.combined_score(scores.e2e_improvement_median, scores.wait_reduction, scores.accepted, manifest) if valid else 0.0
+        scoring.combined_score(scores.e2e_improvement_median, scores.wait_reduction, accepted, manifest) if valid else 0.0
     )
     acceptance = manifest["acceptance"]
-    verdict_text = "ACCEPTED" if scores.accepted else "valid but NOT accepted" if valid else "INVALID (score 0.0)"
+    if not valid:
+        verdict_text = "INVALID (score 0.0)"
+    elif accepted:
+        verdict_text = "ACCEPTED"
+    elif scores.accepted:
+        verdict_text = "speed thresholds met but NOT accepted: recovery is not qualified"
+    else:
+        verdict_text = "valid but NOT accepted"
     out.say(f"verdict: {verdict_text}; combined_score={results['combined_score']:.3f}")
     out.say(
         f"lane {args.lane.upper()} ({lane['name']}): targeted wait median {scores.baseline_targeted:.0f} -> "
@@ -343,6 +445,7 @@ def finish_candidate(args, session, lane, baselines, candidates, verdict) -> Non
 def evaluate_baseline(args: argparse.Namespace, session: Session) -> None:
     out, manifest = session.out, session.manifest
     root, _ = prepare_roots(args, session)
+    known_failures = session.baseline_crash(root).failing
     runs: list[dict[str, Any]] = []
     for index in range(args.pairs):
         runs.append(session.check_baseline(session.run_suite("baseline", root, index), index))
@@ -350,6 +453,10 @@ def evaluate_baseline(args: argparse.Namespace, session: Session) -> None:
     e2e = [r["makespan_ms"] for r in runs]
     middle = scoring.median(e2e)
     results = out.results
+    results["crash_gated_points"] = session.baseline_verdict.gated
+    results["crash_baseline_failing_points"] = len(known_failures)
+    results["crash_failing_points"] = len(known_failures)
+    results["recovery_qualified"] = 1.0 if not known_failures else 0.0
     results["baseline_e2e_ms_median"] = middle
     results["baseline_e2e_spread"] = (max(e2e) - min(e2e)) / middle if middle > 0 else 0.0
     results["baseline_targeted_wait_ms"] = scoring.median([scoring.targeted_value(r, spec) for r in runs])
@@ -363,6 +470,13 @@ def evaluate_baseline(args: argparse.Namespace, session: Session) -> None:
         "combined_score is always 0.0 in baseline mode"
     )
     out.say("baseline spread above ~15% means this box is too noisy for a 10% acceptance threshold")
+    if known_failures:
+        listed = "; ".join(f"{key} ({', '.join(flags)} false)" for key, flags in known_failures.items())
+        out.say(f"baseline recovery failures are real product failures, never filtered or scored as success: {listed}")
+    else:
+        out.say(f"baseline recovery: all {session.baseline_verdict.gated} gated crash points pass")
+    for key in session.baseline_verdict.known:
+        out.say(f"{manifest['known_gap']['text']} [point {key}] reported separately; never counted as a pass")
 
 
 def execute(args: argparse.Namespace, manifest: dict[str, Any], run: Any, out: Output) -> None:
@@ -392,6 +506,7 @@ def main(argv: list[str] | None = None, run: Any = None, stream: TextIO | None =
     args.pairs = args.pairs if args.pairs is not None else manifest["acceptance"]["default_pairs"]
     args.spark_target = args.spark_target or manifest["nx"]["default_spark_target"]
     args.run_timeout = args.run_timeout or float(manifest["budget"]["run_timeout_s"])
+    args.crash_timeout = args.crash_timeout or float(manifest["budget"]["crash_timeout_s"])
     out = Output(manifest, args.lane)
     code = 0
     try:

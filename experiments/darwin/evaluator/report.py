@@ -1,5 +1,6 @@
 """Validation of the trusted state-guard suite reports (perf and crash, schema v1)."""
 
+import dataclasses
 import json
 import math
 import re
@@ -286,8 +287,9 @@ def validate_crash(crash: Any, manifest: dict[str, Any]) -> list[str]:
     if not isinstance(points, list):
         return errors + ["points: must be a list"]
     minimum = int(manifest["expected"]["min_crash_points"])
-    if len(points) < minimum:
-        errors.append(f"points: need at least {minimum}, got {len(points)}")
+    gated = [p for p in points if isinstance(p, dict) and p.get("known_gap") is not True]
+    if len(gated) < minimum:
+        errors.append(f"points: need at least {minimum} gated (non-known-gap) points, got {len(gated)}")
     for position, point in enumerate(points):
         where = f"points[{position}]"
         if not isinstance(point, dict):
@@ -300,18 +302,58 @@ def validate_crash(crash: Any, manifest: dict[str, Any]) -> list[str]:
                 errors.append(f"{where}.{flag}: must be a boolean")
         if not isinstance(point.get("notes"), str):
             errors.append(f"{where}.notes: must be a string")
+        modes = manifest["expected"]["crash_modes"]
+        if point.get("mode") not in modes:
+            errors.append(f"{where}.mode: must be one of {modes}, got {point.get('mode')!r}")
     return errors
 
 
-def crash_gate(crash: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """Return (failures, documented known-gap point names) for a validated crash report."""
-    failures: list[str] = []
-    known: list[str] = []
+@dataclasses.dataclass
+class CrashVerdict:
+    """Crash/recovery outcome of one run.
+
+    `failing` maps "<mode>/<name>" to the flags that are false for every gated point. `known` lists the documented
+    known-gap points: they are reported, never counted as passes, and never excuse any other point.
+    """
+
+    failing: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    known: list[str] = dataclasses.field(default_factory=list)
+    problems: list[str] = dataclasses.field(default_factory=list)
+    gated: int = 0
+    keys: list[str] = dataclasses.field(default_factory=list)
+
+
+def crash_verdict(crash: dict[str, Any], manifest: dict[str, Any]) -> CrashVerdict:
+    verdict = CrashVerdict()
+    documented = manifest["known_gap"]["point"]
     for point in crash["points"]:
+        key = f"{point['mode']}/{point['name']}"
         if point["known_gap"]:
-            known.append(point["name"])
+            if point["name"] == documented:
+                verdict.known.append(key)
+            else:
+                verdict.problems.append(f"{key}: known_gap=true is only allowed for the documented {documented!r} point")
             continue
+        if point["name"] == documented:
+            verdict.problems.append(f"{key}: the documented known-gap point must carry known_gap=true")
+            continue
+        verdict.gated += 1
+        verdict.keys.append(key)
         missing = [flag for flag in CRASH_FLAGS if not point[flag]]
         if missing:
-            failures.append(f"crash point {point['name']!r}: {', '.join(missing)} false")
-    return failures, known
+            verdict.failing[key] = missing
+    every = [f"{p['mode']}/{p['name']}" for p in crash["points"]]
+    verdict.problems.extend(f"{key}: reported more than once" for key in sorted({k for k in every if every.count(k) > 1}))
+    return verdict
+
+
+def crash_regressions(candidate: CrashVerdict, baseline: CrashVerdict) -> list[str]:
+    """Candidate failures the same-box baseline lacks (flag-wise) and gated points it no longer reports; each invalidates it."""
+    found = [f"crash point {key!r} is no longer reported (the baseline reports it)" for key in baseline.keys if key not in candidate.keys]
+    for key, flags in sorted(candidate.failing.items()):
+        known = baseline.failing.get(key, [])
+        new = [flag for flag in flags if flag not in known]
+        if new:
+            before = f"baseline also fails {', '.join(known)}" if known else "baseline passes"
+            found.append(f"crash point {key!r}: {', '.join(new)} false ({before})")
+    return found

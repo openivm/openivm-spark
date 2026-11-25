@@ -35,7 +35,7 @@ class FakeNx(runner.NxRunner):
         super().__init__(MANIFEST, exec_prefix="")
         self.mode = mode
 
-    def command(self, spark_target, report_dir, label):
+    def command(self, spark_target, report_dir, label, suite="all"):
         return [sys.executable, "-c", FAKE_SUITE, self.mode]
 
 
@@ -77,17 +77,57 @@ class NxCommandTests(unittest.TestCase):
 
     def test_devcontainer_command_exports_the_report_contract(self):
         command = runner.NxRunner(MANIFEST, exec_prefix="npx --no-install nx run devcontainer:exec --").command(
-            "spark-3.5", "/workspaces/openivm-spark/.logs/state-guard/x", "x"
+            "spark-3.5", "/workspaces/openivm-spark/.logs/state-guard/x", "x", "crash"
         )
         self.assertEqual(command[:7], ["npx", "--no-install", "nx", "run", "devcontainer:exec", "--", "env"])
         self.assertIn(f"{REPORT_ENV}=/workspaces/openivm-spark/.logs/state-guard/x", command)
         self.assertIn("OPENIVM_STATE_GUARD_RUN_LABEL=x", command)
+        self.assertIn(f"{MANIFEST['nx']['suite_env']}=crash", command)
         self.assertEqual(command[-1], "--configuration=spark-3.5")
+
+    def test_unknown_suite_is_an_infrastructure_error(self):
+        with scratch_dir() as root, self.assertRaises(runner.InfraError):
+            FakeNx("pass").run("candidate", root, "x", "spark-3.5", 5, "everything")
+
+
+class FreshWorktreeDependencyTests(unittest.TestCase):
+    def test_installed_or_prefixed_roots_are_left_alone(self):
+        with scratch_dir() as root, mock.patch.object(runner.subprocess, "run") as npm:
+            runner.ensure_dependencies(root, ["npx"])
+            (root / "node_modules" / ".bin").mkdir(parents=True)
+            (root / "node_modules" / ".bin" / "nx").write_text("")
+            runner.ensure_dependencies(root)
+        npm.assert_not_called()
+
+    def test_missing_node_modules_install_from_the_frozen_lockfile(self):
+        with scratch_dir() as root:
+            (root / "package-lock.json").write_text("{}")
+
+            def fake_npm(command, **kwargs):
+                (root / "node_modules" / ".bin").mkdir(parents=True)
+                (root / "node_modules" / ".bin" / "nx").write_text("")
+                return subprocess.CompletedProcess(command, 0, stdout="")
+
+            with mock.patch.object(runner.subprocess, "run", side_effect=fake_npm) as npm:
+                runner.ensure_dependencies(root)
+            self.assertEqual(npm.call_args.args[0][:2], ["npm", "ci"])
+            self.assertEqual(npm.call_args.kwargs["cwd"], str(root))
+
+    def test_no_lockfile_or_a_failed_install_is_an_infrastructure_error(self):
+        with scratch_dir() as root:
+            with self.assertRaises(runner.InfraError):
+                runner.ensure_dependencies(root)
+            (root / "package-lock.json").write_text("{}")
+            failed = subprocess.CompletedProcess([], 1, stdout="ERESOLVE could not resolve")
+            with mock.patch.object(runner.subprocess, "run", return_value=failed), self.assertRaises(runner.InfraError):
+                runner.ensure_dependencies(root)
 
 
 class NxRunnerProcessTests(unittest.TestCase):
     def run_fake(self, mode, timeout=60):
         with scratch_dir() as root:
+            (root / "node_modules" / ".bin").mkdir(parents=True)
+            (root / "node_modules" / ".bin" / "nx").touch()
             result = FakeNx(mode).run("candidate", root, "case", "spark-3.5", timeout)
             log = (root / ".logs" / "state-guard" / "case.run.log")
             return result, log.read_text(encoding="utf-8") if log.is_file() else ""
@@ -121,11 +161,12 @@ class NxRunnerProcessTests(unittest.TestCase):
 class FixtureRunnerTests(unittest.TestCase):
     def test_exit_code_and_failure_lines_come_from_run_json(self):
         fixtures = runner.FixtureRunner(FIXTURES / "reports", MANIFEST, "baseline", "bad-parity")
-        result = fixtures.run("candidate", FIXTURES, "x", "spark-3.5", 1.0)
+        result = fixtures.run("candidate", FIXTURES, "x", "spark-3.5", 1.0, "perf")
         self.assertEqual(result.exit_code, 1)
         self.assertTrue(any("*** FAILED ***" in line for line in result.failure_lines))
         self.assertIsNotNone(result.perf)
-        self.assertEqual(fixtures.run("baseline", FIXTURES, "x", "spark-3.5", 1.0).exit_code, 0)
+        self.assertEqual(fixtures.run("baseline", FIXTURES, "x", "spark-3.5", 1.0, "perf").exit_code, 0)
+        self.assertEqual(fixtures.run("baseline", FIXTURES, "x", "spark-3.5", 1.0, "crash").exit_code, 1)
 
     def test_missing_set_is_an_infrastructure_error(self):
         with self.assertRaises(runner.InfraError):
@@ -188,6 +229,45 @@ class BaselineWorktreeTests(unittest.TestCase):
     def test_unfetchable_baseline_is_an_infrastructure_error(self):
         with self.assertRaises(runner.InfraError):
             runner.prepare_baseline_worktree(self.tmp / "cache", "0" * 40, [str(self.source)])
+
+    def test_destructive_git_operations_only_ever_touch_the_evaluator_cache_worktree(self):
+        cache = self.tmp / "cache"
+        with self.assertRaisesRegex(runner.InfraError, "not the evaluator baseline worktree"):
+            runner.assert_owned_worktree(cache, self.source, self.first)
+        with self.assertRaisesRegex(runner.InfraError, "non-SHA"):
+            runner.assert_owned_worktree(cache, cache / "baseline" / self.first[:12], "HEAD")
+        with self.assertRaisesRegex(runner.InfraError, "not the evaluator baseline worktree"):
+            runner.assert_owned_worktree(cache, cache / "baseline" / "other", self.first)
+        owned = runner.prepare_baseline_worktree(cache, self.first, [str(self.source)])
+        self.assertEqual(runner.assert_owned_worktree(cache, owned, self.first), owned.resolve())
+
+    def test_a_lane_checkout_in_the_cache_path_is_never_reset(self):
+        cache = self.tmp / "cache"
+        lane = cache / "baseline" / self.first[:12]
+        lane.mkdir(parents=True)
+        self.git(lane, "init", "--quiet")
+        (lane / "work.txt").write_text("uncommitted lane work\n")
+        with self.assertRaisesRegex(runner.InfraError, "ownership marker"):
+            runner.prepare_baseline_worktree(cache, self.first, [str(self.source)])
+        self.assertEqual((lane / "work.txt").read_text(), "uncommitted lane work\n")
+
+    def test_a_non_empty_directory_without_git_and_a_protected_checkout_are_refused(self):
+        cache = self.tmp / "cache"
+        stray = cache / "baseline" / self.first[:12]
+        stray.mkdir(parents=True)
+        (stray / "keep.txt").write_text("x")
+        with self.assertRaisesRegex(runner.InfraError, "not empty"):
+            runner.prepare_baseline_worktree(cache, self.first, [str(self.source)])
+        self.assertTrue((stray / "keep.txt").exists())
+        inside = self.tmp / "lane"
+        with self.assertRaisesRegex(runner.InfraError, "overlaps the protected checkout"):
+            runner.prepare_baseline_worktree(inside / "cache", self.first, [str(self.source)], protect=(inside,))
+
+    def test_an_abbreviated_baseline_is_refused_before_touching_the_disk(self):
+        cache = self.tmp / "cache"
+        with self.assertRaises(runner.InfraError):
+            runner.prepare_baseline_worktree(cache, self.first[:12], [str(self.source)])
+        self.assertFalse(cache.exists())
 
     def test_resolve_baseline_prefers_the_local_object_then_fetches(self):
         self.assertEqual(policy.resolve_baseline(self.source, "HEAD~1"), self.first)

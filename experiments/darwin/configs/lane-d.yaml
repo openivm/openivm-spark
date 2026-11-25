@@ -1,109 +1,157 @@
 # Darwin lane D: whole-path efficiency + catalog backend.
-# Replace every "<...>" placeholder before `darwin run` (see experiments/darwin/README.md):
-#   source.ref, source.options.repository, container.options.path,
-#   evaluator.options.baseline_ref, evaluator.options.lock_sha256, agents[0].models[0].name
-name: openivm-state-guard-lane-d
+# Run through `darwin evolve` with the environment documented in experiments/darwin/README.md:
+#   OPENIVM_DARWIN_TRUSTED      checkout of the frozen harness commit that holds the trusted evaluator
+#   OPENIVM_DARWIN_BASELINE_SHA the full harness commit SHA every candidate is compared against
+#   OPENIVM_DARWIN_LOCK_SHA256  pinned sha256 of experiments/darwin/evaluator.lock.json
+# No credentials or hosts are configured here; Darwin reads COPILOT_* from its --env-file.
 
-executor:
-  parallelism: 1
-  termination:
-    max_iterations: 18
-    early_stopping:
-      max_iterations_without_improvement: 8
-      metric: combined_score
-      min_improvement: 0.5
-      improvement_type: absolute
+experiments:
+  - name: openivm-state-guard-lane-d
+    executor:
+      parallelism: 1
+      termination:
+        max_iterations: 18
+        early_stopping:
+          max_iterations_without_improvement: 8
+          metric: combined_score
+          min_improvement: 0.5
+          improvement_type: absolute
+    agents:
+      - timeout: 3600
+        models:
+          - name: claude-haiku-4.5
+    evaluator:
+      timeout: 7200
+      commands:
+        - python3 "${OPENIVM_DARWIN_TRUSTED:?set OPENIVM_DARWIN_TRUSTED}/experiments/darwin/evaluator/state_guard_eval.py" --mode candidate --lane d --workspace . --baseline-repo "${OPENIVM_DARWIN_TRUSTED}" --baseline-ref "${OPENIVM_DARWIN_BASELINE_SHA:?set OPENIVM_DARWIN_BASELINE_SHA}" --lock-sha256 "${OPENIVM_DARWIN_LOCK_SHA256:?set OPENIVM_DARWIN_LOCK_SHA256}" --pairs 3
+      metrics:
+        combined_score: !eval float([l for l in stdout if l.startswith('@RESULT combined_score=')][0].split('=', 1)[1])
+        allowlist_gate: !eval float([l for l in stdout if l.startswith('@RESULT allowlist_gate=')][0].split('=', 1)[1])
+        correctness_gate: !eval float([l for l in stdout if l.startswith('@RESULT correctness_gate=')][0].split('=', 1)[1])
+        crash_gate: !eval float([l for l in stdout if l.startswith('@RESULT crash_gate=')][0].split('=', 1)[1])
+        incremental_gate: !eval float([l for l in stdout if l.startswith('@RESULT incremental_gate=')][0].split('=', 1)[1])
+        concurrency_gate: !eval float([l for l in stdout if l.startswith('@RESULT concurrency_gate=')][0].split('=', 1)[1])
+        report_gate: !eval float([l for l in stdout if l.startswith('@RESULT report_gate=')][0].split('=', 1)[1])
+        trust_gate: !eval float([l for l in stdout if l.startswith('@RESULT trust_gate=')][0].split('=', 1)[1])
+        wait_reduction: !eval float([l for l in stdout if l.startswith('@RESULT wait_reduction=')][0].split('=', 1)[1])
+        e2e_improvement_median: !eval float([l for l in stdout if l.startswith('@RESULT e2e_improvement_median=')][0].split('=', 1)[1])
+        e2e_improvement_min: !eval float([l for l in stdout if l.startswith('@RESULT e2e_improvement_min=')][0].split('=', 1)[1])
+        e2e_improvement_max: !eval float([l for l in stdout if l.startswith('@RESULT e2e_improvement_max=')][0].split('=', 1)[1])
+        baseline_targeted_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT baseline_targeted_wait_ms=')][0].split('=', 1)[1])
+        candidate_targeted_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT candidate_targeted_wait_ms=')][0].split('=', 1)[1])
+        baseline_e2e_ms_median: !eval float([l for l in stdout if l.startswith('@RESULT baseline_e2e_ms_median=')][0].split('=', 1)[1])
+        candidate_e2e_ms_median: !eval float([l for l in stdout if l.startswith('@RESULT candidate_e2e_ms_median=')][0].split('=', 1)[1])
+        makespan_ms: !eval float([l for l in stdout if l.startswith('@RESULT makespan_ms=')][0].split('=', 1)[1])
+        baseline_e2e_spread: !eval float([l for l in stdout if l.startswith('@RESULT baseline_e2e_spread=')][0].split('=', 1)[1])
+        accepted: !eval float([l for l in stdout if l.startswith('@RESULT accepted=')][0].split('=', 1)[1])
+        recovery_qualified: !eval float([l for l in stdout if l.startswith('@RESULT recovery_qualified=')][0].split('=', 1)[1])
+        crash_gated_points: !eval float([l for l in stdout if l.startswith('@RESULT crash_gated_points=')][0].split('=', 1)[1])
+        crash_failing_points: !eval float([l for l in stdout if l.startswith('@RESULT crash_failing_points=')][0].split('=', 1)[1])
+        crash_baseline_failing_points: !eval float([l for l in stdout if l.startswith('@RESULT crash_baseline_failing_points=')][0].split('=', 1)[1])
+        crash_fixed_points: !eval float([l for l in stdout if l.startswith('@RESULT crash_fixed_points=')][0].split('=', 1)[1])
+        pairs_completed: !eval float([l for l in stdout if l.startswith('@RESULT pairs_completed=')][0].split('=', 1)[1])
+        shared_files_touched: !eval float([l for l in stdout if l.startswith('@RESULT shared_files_touched=')][0].split('=', 1)[1])
+        changed_file_count: !eval float([l for l in stdout if l.startswith('@RESULT changed_file_count=')][0].split('=', 1)[1])
+        engine_overlap_ms_baseline_median: !eval float([l for l in stdout if l.startswith('@RESULT engine_overlap_ms_baseline_median=')][0].split('=', 1)[1])
+        engine_overlap_ms_candidate_median: !eval float([l for l in stdout if l.startswith('@RESULT engine_overlap_ms_candidate_median=')][0].split('=', 1)[1])
+        max_concurrent_engine_baseline_median: !eval float([l for l in stdout if l.startswith('@RESULT max_concurrent_engine_baseline_median=')][0].split('=', 1)[1])
+        max_concurrent_engine_candidate_median: !eval float([l for l in stdout if l.startswith('@RESULT max_concurrent_engine_candidate_median=')][0].split('=', 1)[1])
+        serial_sum_ms_baseline_median: !eval float([l for l in stdout if l.startswith('@RESULT serial_sum_ms_baseline_median=')][0].split('=', 1)[1])
+        serial_sum_ms_candidate_median: !eval float([l for l in stdout if l.startswith('@RESULT serial_sum_ms_candidate_median=')][0].split('=', 1)[1])
+        drain_ms_candidate_median: !eval float([l for l in stdout if l.startswith('@RESULT drain_ms_candidate_median=')][0].split('=', 1)[1])
+        barrier_hold_overlap_ms_baseline_median: !eval float([l for l in stdout if l.startswith('@RESULT barrier_hold_overlap_ms_baseline_median=')][0].split('=', 1)[1])
+        barrier_hold_overlap_ms_candidate_median: !eval float([l for l in stdout if l.startswith('@RESULT barrier_hold_overlap_ms_candidate_median=')][0].split('=', 1)[1])
+        info_catalog_fs_ops_total_baseline: !eval float([l for l in stdout if l.startswith('@RESULT info_catalog_fs_ops_total_baseline=')][0].split('=', 1)[1])
+        info_catalog_fs_ops_total_candidate: !eval float([l for l in stdout if l.startswith('@RESULT info_catalog_fs_ops_total_candidate=')][0].split('=', 1)[1])
+        mv1_submit_to_ack_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv1_submit_to_ack_ms=')][0].split('=', 1)[1])
+        mv1_state_barrier_hold_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv1_state_barrier_hold_ms=')][0].split('=', 1)[1])
+        mv1_state_barrier_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv1_state_barrier_wait_ms=')][0].split('=', 1)[1])
+        mv1_capture_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv1_capture_wait_ms=')][0].split('=', 1)[1])
+        mv1_publication_queue_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv1_publication_queue_wait_ms=')][0].split('=', 1)[1])
+        mv2_submit_to_ack_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv2_submit_to_ack_ms=')][0].split('=', 1)[1])
+        mv2_state_barrier_hold_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv2_state_barrier_hold_ms=')][0].split('=', 1)[1])
+        mv2_state_barrier_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv2_state_barrier_wait_ms=')][0].split('=', 1)[1])
+        mv2_capture_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv2_capture_wait_ms=')][0].split('=', 1)[1])
+        mv2_publication_queue_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv2_publication_queue_wait_ms=')][0].split('=', 1)[1])
+        mv3_submit_to_ack_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv3_submit_to_ack_ms=')][0].split('=', 1)[1])
+        mv3_state_barrier_hold_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv3_state_barrier_hold_ms=')][0].split('=', 1)[1])
+        mv3_state_barrier_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv3_state_barrier_wait_ms=')][0].split('=', 1)[1])
+        mv3_capture_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv3_capture_wait_ms=')][0].split('=', 1)[1])
+        mv3_publication_queue_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv3_publication_queue_wait_ms=')][0].split('=', 1)[1])
+        mv4_submit_to_ack_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv4_submit_to_ack_ms=')][0].split('=', 1)[1])
+        mv4_state_barrier_hold_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv4_state_barrier_hold_ms=')][0].split('=', 1)[1])
+        mv4_state_barrier_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv4_state_barrier_wait_ms=')][0].split('=', 1)[1])
+        mv4_capture_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv4_capture_wait_ms=')][0].split('=', 1)[1])
+        mv4_publication_queue_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv4_publication_queue_wait_ms=')][0].split('=', 1)[1])
+        mv5_submit_to_ack_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv5_submit_to_ack_ms=')][0].split('=', 1)[1])
+        mv5_state_barrier_hold_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv5_state_barrier_hold_ms=')][0].split('=', 1)[1])
+        mv5_state_barrier_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv5_state_barrier_wait_ms=')][0].split('=', 1)[1])
+        mv5_capture_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv5_capture_wait_ms=')][0].split('=', 1)[1])
+        mv5_publication_queue_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv5_publication_queue_wait_ms=')][0].split('=', 1)[1])
+        mv6_submit_to_ack_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv6_submit_to_ack_ms=')][0].split('=', 1)[1])
+        mv6_state_barrier_hold_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv6_state_barrier_hold_ms=')][0].split('=', 1)[1])
+        mv6_state_barrier_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv6_state_barrier_wait_ms=')][0].split('=', 1)[1])
+        mv6_capture_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv6_capture_wait_ms=')][0].split('=', 1)[1])
+        mv6_publication_queue_wait_ms: !eval float([l for l in stdout if l.startswith('@RESULT mv6_publication_queue_wait_ms=')][0].split('=', 1)[1])
+      artifacts:
+        feedback: !eval '"\n".join(l[10:] for l in stdout if l.startswith("@FEEDBACK "))'
+    prompt:
+      system: |
+        You are optimizing OpenIVM-Spark (Scala, spark-ext/) to reduce state-guard contention during
+        concurrent materialized-view (MV) refresh. You work in lane D of five independent lanes:
+        WHOLE-PATH EFFICIENCY AND CATALOG BACKEND.
 
-source:
-  provider: git
-  ref: "<BASELINE_REF>"
-  options:
-    repository: "<REPOSITORY_URL_OR_LOCAL_PATH>"
+        Lane goal: shorten the end-to-end refresh path of each MV, measured as wall_ms summed over the
+        six MVs, by making the catalog backend and the refresh entry path cheaper (fewer catalog round
+        trips per refresh, cheaper backend operations, no redundant work on the hot path). The catalog
+        filesystem operation total is reported for information only.
 
-container:
-  provider: passthrough
-  options:
-    path: "<DARWIN_RUNTIME_DIR>/containers"
+        Acceptance, all required (the evaluator measures a fresh same-box baseline, median of 3
+        interleaved paired runs):
+          1. every correctness and crash-recovery gate passes;
+          2. the lane-D wall time (summed over the six MVs) drops by at least 80%;
+          3. the median paired end-to-end makespan improves by at least 10%.
+        Any failed gate, allowlist violation, build or test failure, or timeout scores 0.0.
+        Crash points are compared one by one with the same-box baseline: a point the baseline already
+        fails stays visible in the feedback and is never counted as a pass, and a candidate is only
+        ACCEPTED when every non-known-gap crash point passes (recovery_qualified). Until then speed
+        is exploratory.
 
-prompt:
-  system: |
-    You are optimizing OpenIVM-Spark (Scala, spark-ext/) to reduce state-guard contention during
-    concurrent materialized-view (MV) refresh. You work in lane D of five independent lanes:
-    WHOLE-PATH EFFICIENCY AND CATALOG BACKEND.
+        Editable files for lane D (repository-relative):
+          owned:
+            - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalogBackend.scala
+            - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/FeatureGate.scala
+          shared with other lanes (keep the diff minimal; an integrator merges):
+            - spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala
+            - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaMvCatalogBackend.scala
+            - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala
+            - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaPathTable.scala
+        Everything else is frozen: tests, build and CI files, experiments/, and the telemetry and
+        measurement files (OpenIvmExecutionSpan, RefreshProfile, PhaseTimeline, anything under
+        telemetry/). Do not add, delete, rename or chmod files, and do not add symlinks or binaries.
+        Darwin's required output/ protocol files are allowed.
 
-    Lane goal: shorten the end-to-end refresh path of each MV, measured as wall_ms summed over the
-    six MVs, by making the catalog backend and the refresh entry path cheaper (fewer catalog round
-    trips per refresh, cheaper backend operations, no redundant work on the hot path). The catalog
-    filesystem operation total is reported for information only.
-
-    Acceptance, all required (the evaluator measures a fresh same-box baseline, median of 3
-    interleaved paired runs):
-      1. every correctness and crash-recovery gate passes;
-      2. the lane-D wall time (summed over the six MVs) drops by at least 80%;
-      3. the median paired end-to-end makespan improves by at least 10%.
-    Any failed gate, allowlist violation, build or test failure, or timeout scores 0.0.
-
-    Editable files for lane D (repository-relative):
-      owned:
-        - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalogBackend.scala
-        - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/FeatureGate.scala
-      shared with other lanes (keep the diff minimal; an integrator merges):
-        - spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala
-        - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaMvCatalogBackend.scala
-    Everything else is frozen: tests, build and CI files, experiments/, and the telemetry and
-    measurement files (OpenIvmExecutionSpan, RefreshProfile, PhaseTimeline, anything under
-    telemetry/). Do not add, delete, rename or chmod files, and do not add symlinks or binaries.
-    Darwin's required output/ protocol files are allowed.
-
-    Facts and rules:
-      - The measured spans are nested and NOT additive (for example catalog finalization runs inside
-        the barrier hold, and waits overlap). Do not read a sum of spans as a critical path.
-      - The evidence is local modeled latency: relative evidence only, not OneLake proof. Delta I/O
-        is NOT proven to be the cause of the contention; do not assume it.
-      - Never let an incrementalizable MV fall back to FULL_REFRESH. Gate: full_refresh_count == 0
-        and incremental_count == 6. Do not use FeatureGate to switch an incremental path off.
-      - Preserve crash-safety and the ordering of state transitions. Recovery after a crash at any
-        point must still converge to exact results.
-      - Do not move or defer work outside the measured interval (the makespan includes a final
-        drain), do not serialize engine executions (concurrent engine executions must be kept), and
-        do not reduce the work an MV does.
-      - Do not weaken, skip or edit tests or assertions, and do not touch the evaluator.
-      - A known gap is documented and out of scope: a crash between the MV-version write and the
-        CDF-watermark write (MV-version/CDF-watermark). This lane may touch that path; do not make
-        the gap worse, and the crash suite will exercise it when you change that ordering.
-      - Do not run builds, tests or benchmarks; the evaluator owns them. Read only the source you
-        need, make one focused change, commit it and return.
-  agent: |
-    Reduce the lane-D wall time (wall_ms per MV). Start from MvCatalogBackend.scala and trace which
-    backend operations a refresh issues and which are redundant. Read the feedback artifact from
-    the previous evaluation first: it lists the per-MV wall times, the failed gates and the first
-    failure lines. State the mechanism you are changing and why it preserves the recorded state and
-    its write ordering.
-
-samplers:
-  - provider: islands
-    options:
-      population_size: 12
-      num_islands: 2
-      archive_size: 12
-      feature_dimensions:
-        - combined_score
-        - wait_reduction
-        - e2e_improvement_median
-
-evaluator:
-  path: ../evaluator/darwin_evaluator.py
-  timeout: 5400
-  retries: 0
-  builtin_metrics: []
-  options:
-    lane: d
-    baseline_ref: "<BASELINE_SHA>"
-    spark_target: spark-3.5
-    pairs: 3
-    lock_sha256: "<SHA256_OF_evaluator.lock.json>"
-
-agents:
-  - models:
-      - name: "<MODEL_NAME>"
-        timeout: 3600
+        Facts and rules:
+          - The measured spans are nested and NOT additive (for example catalog finalization runs inside
+            the barrier hold, and waits overlap). Do not read a sum of spans as a critical path.
+          - The evidence is local modeled latency: relative evidence only, not OneLake proof. Delta I/O
+            is NOT proven to be the cause of the contention; do not assume it.
+          - Never let an incrementalizable MV fall back to FULL_REFRESH. Gate: full_refresh_count == 0
+            and incremental_count == 6. Do not use FeatureGate to switch an incremental path off.
+          - Preserve crash-safety and the ordering of state transitions. Recovery after a crash at any
+            point must still converge to exact results.
+          - Do not move or defer work outside the measured interval (the makespan includes a final
+            drain), do not serialize engine executions (concurrent engine executions must be kept), and
+            do not reduce the work an MV does.
+          - Do not weaken, skip or edit tests or assertions, and do not touch the evaluator.
+          - A known gap is documented and out of scope: a crash between the MV-version write and the
+            CDF-watermark write (MV-version/CDF-watermark). This lane may touch that path; do not make
+            the gap worse, and the crash suite will exercise it when you change that ordering.
+          - Do not run builds, tests or benchmarks; the evaluator owns them. Read only the source you
+            need, make one focused change, commit it and return.
+      agent: |
+        Reduce the lane-D wall time (wall_ms per MV). Start from MvCatalogBackend.scala and trace which
+        backend operations a refresh issues and which are redundant. Read the feedback artifact from
+        the previous evaluation first: it lists the per-MV wall times, the failed gates and the first
+        failure lines. State the mechanism you are changing and why it preserves the recorded state and
+        its write ordering.

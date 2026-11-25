@@ -2,44 +2,103 @@
  "schema": "openivm.state-guard-crash/v1",
  "points": [
   {
-   "name": "crash-after-barrier-acquire",
+   "name": "state_sync_before_snapshot_commit",
+   "mode": "intercept",
+   "crashed": true,
+   "recovered": true,
+   "parity": false,
+   "metadata_converged": false,
+   "incremental_after_recovery": false,
+   "known_gap": false,
+   "notes": "intercept mode: state_sync_before_snapshot_commit"
+  },
+  {
+   "name": "state_sync_after_snapshot_commit",
+   "mode": "intercept",
    "crashed": true,
    "recovered": true,
    "parity": true,
    "metadata_converged": true,
    "incremental_after_recovery": true,
    "known_gap": false,
-   "notes": "state barrier held, process killed before capture"
+   "notes": "intercept mode: state_sync_after_snapshot_commit"
   },
   {
-   "name": "crash-mid-state-publication",
+   "name": "refresh_before_finalize",
+   "mode": "intercept",
    "crashed": true,
    "recovered": true,
    "parity": true,
    "metadata_converged": true,
    "incremental_after_recovery": true,
    "known_gap": false,
-   "notes": "killed between state upload and commit marker"
+   "notes": "intercept mode: refresh_before_finalize"
   },
   {
-   "name": "crash-after-catalog-finalize",
+   "name": "acked_refresh_durable",
+   "mode": "intercept",
    "crashed": true,
    "recovered": true,
    "parity": true,
    "metadata_converged": true,
    "incremental_after_recovery": true,
    "known_gap": false,
-   "notes": "killed after catalog finalize, before the durable ack"
+   "notes": "intercept mode: acked_refresh_durable"
   },
   {
-   "name": "crash-between-mv-version-and-cdf-watermark",
+   "name": "state_sync_before_snapshot_commit",
+   "mode": "cdf",
    "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "cdf mode: state_sync_before_snapshot_commit"
+  },
+  {
+   "name": "state_sync_after_snapshot_commit",
+   "mode": "cdf",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "cdf mode: state_sync_after_snapshot_commit"
+  },
+  {
+   "name": "refresh_before_finalize",
+   "mode": "cdf",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "cdf mode: refresh_before_finalize"
+  },
+  {
+   "name": "acked_refresh_durable",
+   "mode": "cdf",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "cdf mode: acked_refresh_durable"
+  },
+  {
+   "name": "mv_version_and_cdf_watermark_gap",
+   "mode": "cdf",
+   "crashed": false,
    "recovered": false,
    "parity": false,
    "metadata_converged": false,
    "incremental_after_recovery": false,
    "known_gap": true,
-   "notes": "documented known gap: MV-version/CDF-watermark"
+   "notes": "documented known gap; not exercised"
   }
  ]
 }

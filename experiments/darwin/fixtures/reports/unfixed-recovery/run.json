@@ -1,0 +1,6 @@
+{
+ "exit_codes": {
+  "perf": 0,
+  "crash": 1
+ }
+}

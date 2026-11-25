@@ -1,0 +1,93 @@
+{
+ "schema": "openivm.state-guard-crash/v1",
+ "points": [
+  {
+   "name": "state_sync_before_snapshot_commit",
+   "mode": "intercept",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "intercept mode: state_sync_before_snapshot_commit"
+  },
+  {
+   "name": "state_sync_after_snapshot_commit",
+   "mode": "intercept",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "intercept mode: state_sync_after_snapshot_commit"
+  },
+  {
+   "name": "refresh_before_finalize",
+   "mode": "intercept",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "intercept mode: refresh_before_finalize"
+  },
+  {
+   "name": "acked_refresh_durable",
+   "mode": "intercept",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "intercept mode: acked_refresh_durable"
+  },
+  {
+   "name": "state_sync_before_snapshot_commit",
+   "mode": "cdf",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "cdf mode: state_sync_before_snapshot_commit"
+  },
+  {
+   "name": "state_sync_after_snapshot_commit",
+   "mode": "cdf",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "cdf mode: state_sync_after_snapshot_commit"
+  },
+  {
+   "name": "refresh_before_finalize",
+   "mode": "cdf",
+   "crashed": true,
+   "recovered": true,
+   "parity": true,
+   "metadata_converged": true,
+   "incremental_after_recovery": true,
+   "known_gap": false,
+   "notes": "cdf mode: refresh_before_finalize"
+  },
+  {
+   "name": "mv_version_and_cdf_watermark_gap",
+   "mode": "cdf",
+   "crashed": false,
+   "recovered": false,
+   "parity": false,
+   "metadata_converged": false,
+   "incremental_after_recovery": false,
+   "known_gap": true,
+   "notes": "documented known gap; not exercised"
+  }
+ ]
+}

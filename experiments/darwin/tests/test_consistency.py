@@ -1,8 +1,9 @@
 import importlib.util
+import io
 import re
 import unittest
 
-import darwin_evaluator
+import state_guard_eval
 from . import DARWIN, FIXTURES, MANIFEST
 
 CONFIGS = DARWIN / "configs"
@@ -26,55 +27,110 @@ def editable_paths(lane):
     return spec["owned"] + spec["shared"] + spec["new_files"]
 
 
-def evaluator_option_keys(text):
-    block = text.split("\nevaluator:\n", 1)[1].split("\nagents:\n", 1)[0]
-    options = block.split("  options:\n", 1)[1]
-    return re.findall(r"^    (\w+):", options, re.MULTILINE)
+def metrics_block(text):
+    block = text.split("\n      metrics:\n", 1)[1].split("\n      artifacts:\n", 1)[0]
+    return re.findall(r"^        (\w+): !eval (.+)$", block, re.MULTILINE)
+
+
+def evaluator_command(text):
+    return re.search(r"(?m)^      commands:\n        - (.+)$", text).group(1)
 
 
 class LaneConfigTests(unittest.TestCase):
-    def test_every_lane_has_a_config_that_names_its_own_lane(self):
+    def test_every_lane_has_an_evolve_experiment_that_names_its_own_lane(self):
         self.assertEqual(sorted(p.name for p in CONFIGS.glob("lane-*.yaml")), [f"lane-{x}.yaml" for x in LANES])
         for lane in LANES:
             text = config_text(lane)
             with self.subTest(lane=lane):
-                self.assertRegex(text, rf"(?m)^name: openivm-state-guard-lane-{lane}$")
-                self.assertRegex(text, rf"(?m)^    lane: {lane}$")
+                self.assertRegex(text, rf"(?m)^experiments:\n  - name: openivm-state-guard-lane-{lane}$")
                 self.assertIn(f"lane {lane.upper()} of five", text)
+                self.assertNotRegex(text, r"(?m)^(source|container|samplers|name):", "obsolete `darwin run` schema")
 
     def test_budget_and_evaluator_settings_match_the_manifest(self):
         budget = MANIFEST["budget"]
         for lane in LANES:
             text = config_text(lane)
             with self.subTest(lane=lane):
-                self.assertRegex(text, rf"(?m)^    max_iterations: {budget['max_iterations']}$")
-                self.assertRegex(text, rf"(?m)^      max_iterations_without_improvement: {budget['max_iterations_without_improvement']}$")
-                self.assertRegex(text, rf"(?m)^      metric: {budget['metric']}$")
-                self.assertRegex(text, rf"(?m)^      min_improvement: {budget['min_improvement']}$")
-                self.assertRegex(text, rf"(?m)^      improvement_type: {budget['improvement_type']}$")
-                self.assertRegex(text, rf"(?m)^  timeout: {budget['iteration_timeout_s']}$")
-                self.assertRegex(text, r"(?m)^  retries: 0$")
-                self.assertRegex(text, r"(?m)^  path: \.\./evaluator/darwin_evaluator\.py$")
-                self.assertRegex(text, rf"(?m)^    pairs: {MANIFEST['acceptance']['default_pairs']}$")
+                self.assertRegex(text, rf"(?m)^        max_iterations: {budget['max_iterations']}$")
+                self.assertRegex(text, rf"(?m)^          max_iterations_without_improvement: {budget['max_iterations_without_improvement']}$")
+                self.assertRegex(text, rf"(?m)^          metric: {budget['metric']}$")
+                self.assertRegex(text, rf"(?m)^          min_improvement: {budget['min_improvement']}$")
+                self.assertRegex(text, rf"(?m)^          improvement_type: {budget['improvement_type']}$")
+                self.assertRegex(text, rf"(?m)^      - timeout: {budget['agent_timeout_s']}$")
+                self.assertRegex(text, rf"(?m)^          - name: {re.escape(budget['model'])}$")
+                self.assertRegex(text, rf"(?m)^      timeout: {budget['iteration_timeout_s']}$")
+        self.assertGreater(budget["iteration_timeout_s"], budget["deadline_s"])
+        self.assertGreaterEqual(budget["deadline_s"], budget["crash_timeout_s"])
 
-    def test_evaluator_options_are_all_declared_by_the_wrapper(self):
-        declared = set(darwin_evaluator.StateGuardOptions.__annotations__)
+    def test_command_runs_the_trusted_evaluator_for_this_lane_with_pinned_inputs(self):
         for lane in LANES:
+            command = evaluator_command(config_text(lane))
             with self.subTest(lane=lane):
-                keys = evaluator_option_keys(config_text(lane))
-                self.assertTrue({"lane", "baseline_ref", "lock_sha256"} <= set(keys), keys)
-                self.assertLessEqual(set(keys), declared)
+                self.assertIn('"${OPENIVM_DARWIN_TRUSTED:?', command)
+                self.assertIn("/experiments/darwin/evaluator/state_guard_eval.py", command)
+                self.assertIn("--mode candidate", command)
+                self.assertIn(f"--lane {lane} ", command)
+                self.assertIn("--workspace .", command)
+                self.assertIn('--baseline-repo "${OPENIVM_DARWIN_TRUSTED}"', command)
+                self.assertIn('--baseline-ref "${OPENIVM_DARWIN_BASELINE_SHA:?', command)
+                self.assertIn('--lock-sha256 "${OPENIVM_DARWIN_LOCK_SHA256:?', command)
+                self.assertIn(f"--pairs {MANIFEST['acceptance']['default_pairs']}", command)
+                for forbidden in ("--skip-lock-check", "--no-box-lock", "--offline", "--manifest"):
+                    self.assertNotIn(forbidden, command)
 
-    def test_configs_pin_the_trusted_evaluator_and_are_not_candidate_editable(self):
-        self.assertTrue((CONFIGS / "../evaluator/darwin_evaluator.py").resolve().is_file())
+    def test_every_metric_the_evaluator_emits_is_declared_and_parses_its_own_output(self):
+        for lane in LANES:
+            out = state_guard_eval.Output(MANIFEST, lane)
+            for index, name in enumerate(out.names):
+                out.results[name] = index + 0.25
+            stream = io.StringIO()
+            out.emit(stream)
+            stdout = [line.strip() for line in stream.getvalue().splitlines() if line.strip()]
+            declared = metrics_block(config_text(lane))
+            with self.subTest(lane=lane):
+                self.assertEqual([name for name, _ in declared], out.names)
+                for name, expression in declared:
+                    if name.endswith("_gate"):
+                        continue
+                    self.assertEqual(eval(expression, {}, {"stdout": stdout}), float(out.results[name]), name)
+
+    def test_missing_evaluator_output_fails_the_evaluation_instead_of_scoring_zero(self):
+        name, expression = metrics_block(config_text("a"))[0]
+        self.assertEqual(name, "combined_score")
+        with self.assertRaises(IndexError):
+            eval(expression, {}, {"stdout": ["@FEEDBACK infra error"]})
+
+    def test_feedback_artifact_joins_the_feedback_lines(self):
+        match = re.search(r"(?m)^        feedback: !eval '(.+)'$", config_text("a"))
+        stdout = ["@FEEDBACK one", "@RESULT combined_score=1.0", "@FEEDBACK two"]
+        self.assertEqual(eval(match.group(1), {}, {"stdout": stdout}), "one\ntwo")
+
+    def test_configs_carry_no_credentials_hosts_placeholders_or_odd_whitespace(self):
         for lane in LANES:
             text = config_text(lane)
             with self.subTest(lane=lane):
-                self.assertIn("<SHA256_OF_evaluator.lock.json>", text)
-                self.assertIn("experiments/", text)
-                self.assertNotRegex(text, r"gh[pousr]_[A-Za-z0-9]{20}|Bearer ")
+                self.assertNotRegex(text, r"gh[pousr]_[A-Za-z0-9]{20}|Bearer |msft\.ghe\.com|COPILOT_GITHUB_TOKEN=")
+                self.assertNotRegex(text, r'"<[A-Za-z0-9_]+>"')
                 self.assertNotIn("\r", text)
                 self.assertNotIn("\t", text)
+
+    def test_configs_load_as_darwin_evolve_manifests_when_pyyaml_is_available(self):
+        yaml = importlib.util.find_spec("yaml")
+        if yaml is None:
+            self.skipTest("PyYAML is not installed")
+        import yaml as pyyaml
+
+        class Loader(pyyaml.SafeLoader):
+            pass
+
+        Loader.add_constructor("!eval", lambda loader, node: loader.construct_scalar(node))
+        for lane in LANES:
+            doc = pyyaml.load(config_text(lane), Loader=Loader)
+            with self.subTest(lane=lane):
+                experiment = doc["experiments"][0]
+                self.assertEqual(set(experiment), {"name", "executor", "agents", "evaluator", "prompt"})
+                self.assertEqual(set(experiment["prompt"]), {"system", "agent"})
+                self.assertEqual(len(experiment["evaluator"]["metrics"]), len(metrics_block(config_text(lane))))
 
 
 class LanePromptTests(unittest.TestCase):
@@ -142,6 +198,13 @@ class ManifestMirrorTests(unittest.TestCase):
             for path in editable_paths(lane):
                 with self.subTest(lane=lane, path=path):
                     self.assertFalse(policy.is_frozen(path, MANIFEST))
+
+    def test_lanes_own_the_files_their_candidates_change(self):
+        catalog = "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/"
+        self.assertIn(catalog + "DeltaPathTable.scala", MANIFEST["lanes"]["b"]["owned"])
+        for lane in "abd":
+            self.assertIn(catalog + "MvCatalog.scala", editable_paths(lane))
+        self.assertIn(catalog + "DeltaPathTable.scala", editable_paths("d"))
 
 
 class FixtureReproducibilityTests(unittest.TestCase):

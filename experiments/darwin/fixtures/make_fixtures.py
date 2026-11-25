@@ -165,41 +165,39 @@ def good_perf() -> dict:
     return perf_doc(build_views(scaled(GOOD_FACTORS)), 120.0, BASELINE_BYTES // 10, 18, CANDIDATE_SHA)
 
 
-def crash_doc(break_point: bool = False) -> dict:
-    points = [
-        ("crash-after-barrier-acquire", "state barrier held, process killed before capture"),
-        ("crash-mid-state-publication", "killed between state upload and commit marker"),
-        ("crash-after-catalog-finalize", "killed after catalog finalize, before the durable ack"),
-    ]
-    docs = [
-        {
-            "name": name,
-            "crashed": True,
-            "recovered": True,
-            "parity": True,
-            "metadata_converged": True,
-            "incremental_after_recovery": True,
-            "known_gap": False,
-            "notes": note,
-        }
-        for name, note in points
-    ]
-    if break_point:
-        docs[1]["recovered"] = False
-        docs[1]["metadata_converged"] = False
+CRASH_POINTS = (
+    "state_sync_before_snapshot_commit",
+    "state_sync_after_snapshot_commit",
+    "refresh_before_finalize",
+    "acked_refresh_durable",
+)
+KNOWN_STALE_SNAPSHOT = "intercept/state_sync_before_snapshot_commit"
+
+
+def crash_doc(failing: dict[str, tuple[str, ...]] | None = None, dropped: tuple[str, ...] = ()) -> dict:
+    """The eight gated crash points plus the documented known gap; `failing` maps "mode/name" to its false flags."""
+    failing = failing or {}
+    docs = []
+    for mode in MANIFEST["expected"]["crash_modes"]:
+        for name in CRASH_POINTS:
+            key = f"{mode}/{name}"
+            if key in dropped:
+                continue
+            flags = {flag: flag not in failing.get(key, ()) for flag in report.CRASH_FLAGS}
+            docs.append({"name": name, "mode": mode, **flags, "known_gap": False, "notes": f"{mode} mode: {name}"})
     docs.append(
         {
-            "name": "crash-between-mv-version-and-cdf-watermark",
-            "crashed": True,
-            "recovered": False,
-            "parity": False,
-            "metadata_converged": False,
-            "incremental_after_recovery": False,
+            "name": MANIFEST["known_gap"]["point"],
+            "mode": "cdf",
+            **{flag: False for flag in report.CRASH_FLAGS},
             "known_gap": True,
-            "notes": "documented known gap: MV-version/CDF-watermark",
+            "notes": "documented known gap; not exercised",
         }
     )
     return {"schema": report.CRASH_SCHEMA, "points": docs}
+
+
+STALE_SNAPSHOT_FLAGS = {KNOWN_STALE_SNAPSHOT: ("parity", "metadata_converged", "incremental_after_recovery")}
 
 
 def lane_a_changes() -> list[dict]:
@@ -213,7 +211,7 @@ def lane_a_changes() -> list[dict]:
 def report_sets() -> dict[str, dict[str, object]]:
     base, good = baseline_perf(), good_perf()
     sets: dict[str, dict[str, object]] = {
-        "baseline": {"perf": base, "crash": crash_doc()},
+        "baseline": {"perf": base, "crash": crash_doc(STALE_SNAPSHOT_FLAGS), "run": {"exit_codes": {"perf": 0, "crash": 1}}},
         "good-candidate": {"perf": good, "crash": crash_doc()},
     }
 
@@ -236,7 +234,7 @@ def report_sets() -> dict[str, dict[str, object]]:
         "perf": bad_parity,
         "crash": crash_doc(),
         "run": {
-            "exit_code": 1,
+            "exit_codes": {"perf": 1, "crash": 0},
             "log": [
                 "[info] Run completed in 8 minutes.",
                 "[info] - MV6 matches the EXCEPT ALL oracle *** FAILED ***",
@@ -246,7 +244,20 @@ def report_sets() -> dict[str, dict[str, object]]:
         },
     }
 
-    sets["bad-crash"] = {"perf": good, "crash": crash_doc(break_point=True)}
+    sets["bad-crash"] = {
+        "perf": good,
+        "crash": crash_doc({"cdf/refresh_before_finalize": ("recovered", "metadata_converged")}),
+        "run": {"exit_codes": {"perf": 0, "crash": 1}},
+    }
+    sets["unfixed-recovery"] = {
+        "perf": good,
+        "crash": crash_doc(STALE_SNAPSHOT_FLAGS),
+        "run": {"exit_codes": {"perf": 0, "crash": 1}},
+    }
+    sets["crash-point-dropped"] = {
+        "perf": good,
+        "crash": crash_doc(dropped=("cdf/acked_refresh_durable",)),
+    }
 
     regression = copy.deepcopy(good)
     regression["views"][3]["refresh_type"] = "FULL_REFRESH"
@@ -299,7 +310,7 @@ def change(path: str, status: str = "M", old: str = "100644", new: str = "100644
 def diff_cases() -> dict[str, dict]:
     lanes = MANIFEST["lanes"]
     a_owned, mvc = lanes["a"]["owned"][0], lanes["a"]["shared"][0]
-    b_owned, b_shared = lanes["b"]["owned"][0], lanes["b"]["shared"][1]
+    b_owned, b_shared = lanes["b"]["owned"][1], lanes["b"]["shared"][1]
     rdb = a_owned.rsplit("/", 1)[0]
     e_new = [rdb + "/OpenIvmStateDeltaWriter.scala", rdb + "/OpenIvmStateSyncCodecV2.scala"]
     return {

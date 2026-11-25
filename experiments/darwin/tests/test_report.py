@@ -111,32 +111,65 @@ class GateTests(unittest.TestCase):
 
 
 class CrashTests(unittest.TestCase):
-    def test_good_report_passes_and_echoes_the_known_gap(self):
-        doc = crash("baseline")
+    STALE = "intercept/state_sync_before_snapshot_commit"
+
+    def verdict(self, name):
+        doc = crash(name)
         self.assertEqual(report.validate_crash(doc, MANIFEST), [])
-        failures, known = report.crash_gate(doc)
-        self.assertEqual(failures, [])
-        self.assertEqual(known, ["crash-between-mv-version-and-cdf-watermark"])
+        return report.crash_verdict(doc, MANIFEST)
 
-    def test_unrecovered_point_fails_but_known_gap_never_does(self):
-        failures, _ = report.crash_gate(crash("bad-crash"))
-        self.assertEqual(len(failures), 1)
-        self.assertIn("recovered, metadata_converged false", failures[0])
-        doc = crash("baseline")
-        gap = next(p for p in doc["points"] if p["known_gap"])
-        gap.update(recovered=False, parity=False)
-        self.assertEqual(report.crash_gate(doc)[0], [])
+    def test_baseline_reports_its_real_failure_and_never_counts_the_known_gap(self):
+        verdict = self.verdict("baseline")
+        self.assertEqual(verdict.gated, 8)
+        self.assertEqual(list(verdict.failing), [self.STALE])
+        self.assertEqual(verdict.known, ["cdf/mv_version_and_cdf_watermark_gap"])
+        self.assertEqual(verdict.problems, [])
+        self.assertEqual(self.verdict("good-candidate").failing, {})
 
-    def test_schema_and_minimum_points(self):
-        doc = crash("baseline")
-        doc["points"] = doc["points"][:2]
-        self.assertTrue(any("need at least 3" in p for p in report.validate_crash(doc, MANIFEST)))
+    def test_known_gap_flag_cannot_hide_a_failing_point_or_be_dropped(self):
+        doc = crash("good-candidate")
+        doc["points"][0]["known_gap"] = True
+        self.assertTrue(any("only allowed for the documented" in p for p in report.crash_verdict(doc, MANIFEST).problems))
+        doc = crash("good-candidate")
+        next(p for p in doc["points"] if p["known_gap"])["known_gap"] = False
+        self.assertTrue(any("must carry known_gap=true" in p for p in report.crash_verdict(doc, MANIFEST).problems))
+        doc = crash("good-candidate")
+        doc["points"].append(copy.deepcopy(doc["points"][0]))
+        self.assertTrue(any("more than once" in p for p in report.crash_verdict(doc, MANIFEST).problems))
+
+    def test_regressions_are_relative_to_the_same_box_baseline(self):
+        baseline = self.verdict("baseline")
+        self.assertEqual(report.crash_regressions(self.verdict("unfixed-recovery"), baseline), [])
+        self.assertEqual(report.crash_regressions(self.verdict("good-candidate"), baseline), [])
+        found = report.crash_regressions(self.verdict("bad-crash"), baseline)
+        self.assertEqual(len(found), 1)
+        self.assertIn("cdf/refresh_before_finalize", found[0])
+        self.assertIn("baseline passes", found[0])
+
+    def test_a_partially_fixed_point_may_not_break_another_flag(self):
+        baseline = report.CrashVerdict(failing={self.STALE: ["parity", "metadata_converged"]}, keys=[self.STALE])
+        candidate = report.CrashVerdict(failing={self.STALE: ["parity", "recovered"]}, keys=[self.STALE])
+        found = report.crash_regressions(candidate, baseline)
+        self.assertEqual(len(found), 1)
+        self.assertIn("recovered false", found[0])
+
+    def test_dropping_a_reported_point_is_a_regression(self):
+        baseline = report.CrashVerdict(keys=["cdf/a", "cdf/b"])
+        found = report.crash_regressions(report.CrashVerdict(keys=["cdf/a"]), baseline)
+        self.assertEqual(len(found), 1)
+        self.assertIn("cdf/b", found[0])
+
+    def test_schema_modes_and_minimum_gated_points(self):
+        found = " ".join(report.validate_crash(crash("crash-point-dropped"), MANIFEST))
+        self.assertIn("need at least 8 gated", found)
         doc = copy.deepcopy(crash("baseline"))
         doc["schema"] = "wrong"
         doc["points"][0]["recovered"] = "yes"
+        doc["points"][1]["mode"] = "other"
         found = " ".join(report.validate_crash(doc, MANIFEST))
         self.assertIn("schema", found)
         self.assertIn("recovered: must be a boolean", found)
+        self.assertIn("mode: must be one of", found)
 
 
 if __name__ == "__main__":

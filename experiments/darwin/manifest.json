@@ -12,6 +12,7 @@
     "default_spark_target": "spark-3.5",
     "report_dir_env": "OPENIVM_STATE_GUARD_REPORT_DIR",
     "run_label_env": "OPENIVM_STATE_GUARD_RUN_LABEL",
+    "suite_env": "OPENIVM_STATE_GUARD_SUITE",
     "perf_report": "state-guard-perf.json",
     "crash_report": "state-guard-crash.json"
   },
@@ -19,7 +20,8 @@
     "views": 6,
     "incremental_count": 6,
     "full_refresh_count": 0,
-    "min_crash_points": 3,
+    "min_crash_points": 8,
+    "crash_modes": ["intercept", "cdf"],
     "max_report_value": 1000000000000.0
   },
   "acceptance": {
@@ -43,9 +45,12 @@
     "metric": "combined_score",
     "min_improvement": 0.5,
     "improvement_type": "absolute",
-    "iteration_timeout_s": 5400,
+    "model": "claude-haiku-4.5",
+    "agent_timeout_s": 3600,
+    "iteration_timeout_s": 7200,
     "run_timeout_s": 1200,
-    "deadline_s": 5000
+    "crash_timeout_s": 2400,
+    "deadline_s": 6600
   },
   "frozen": {
     "globs": [
@@ -72,7 +77,8 @@
   "protocol_files": ["output/*.json", "output/*.md"],
   "known_gap": {
     "name": "MV-version/CDF-watermark",
-    "text": "documented known gap: MV-version/CDF-watermark (crash between the MV-version write and the CDF-watermark write); only exercised when a candidate changes that path (lanes B, D)",
+    "point": "mv_version_and_cdf_watermark_gap",
+    "text": "documented known gap: MV-version/CDF-watermark (crash between the MV-version write and the CDF-watermark write); documentation-only, never a pass and never an excuse for any other crash point; only exercised when a candidate changes that path (lanes B, D)",
     "lanes_that_may_touch": ["b", "d"]
   },
   "reference_evidence": {
@@ -94,7 +100,8 @@
         "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmRocksDBRegistry.scala"
       ],
       "shared": [
-        "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala"
+        "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala"
       ],
       "new_files": []
     },
@@ -105,7 +112,8 @@
       "owned": [
         "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala",
         "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/CdfWatermarkBackend.scala",
-        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/StagingCatalog.scala"
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/StagingCatalog.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaPathTable.scala"
       ],
       "shared": [
         "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala",
@@ -138,7 +146,9 @@
       ],
       "shared": [
         "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala",
-        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaMvCatalogBackend.scala"
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaMvCatalogBackend.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaPathTable.scala"
       ],
       "new_files": []
     },

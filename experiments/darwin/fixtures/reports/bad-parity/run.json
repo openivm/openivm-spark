@@ -1,5 +1,8 @@
 {
- "exit_code": 1,
+ "exit_codes": {
+  "perf": 1,
+  "crash": 0
+ },
  "log": [
   "[info] Run completed in 8 minutes.",
   "[info] - MV6 matches the EXCEPT ALL oracle *** FAILED ***",

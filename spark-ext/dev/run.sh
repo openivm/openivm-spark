@@ -54,6 +54,7 @@ Environment:
   OPENIVM_TEST_FORKS         Fork cap forwarded as openivm.test.forks.
   OPENIVM_TEST_LOG_ROOT      Log root (default repo-root .logs).
   OPENIVM_SOURCE_DIR         OpenIVM source tree for openivm-test.
+  OPENIVM_STATE_GUARD_SUITE  state-guard-perf: all (default), perf or crash.
 EOF
 }
 
@@ -345,11 +346,22 @@ cmd_verify_all() {
 }
 
 cmd_state_guard_perf() {
+    local perf="ivmIt/testOnly org.openivm.spark.perf.StateGuardConcurrentRefreshPerfSpec -- -n org.openivm.spark.tags.StateGuardPerf"
+    local crash="ivmIt/testOnly org.openivm.spark.common.rocksdb.StateGuardCrashRecoverySpec -- -n org.openivm.spark.tags.StateGuardPerf"
+    local suites=()
+
+    case "${OPENIVM_STATE_GUARD_SUITE:-all}" in
+        all)   suites=("$perf" "$crash") ;;
+        perf)  suites=("$perf") ;;
+        crash) suites=("$crash") ;;
+        *)
+            echo "[spark-ext/run] OPENIVM_STATE_GUARD_SUITE must be all, perf or crash" >&2
+            exit 2
+            ;;
+    esac
     prepare_sbt 1
     setup_test_log_dir
-    run_sbt "$@" \
-        "ivmIt/testOnly org.openivm.spark.perf.StateGuardConcurrentRefreshPerfSpec -- -n org.openivm.spark.tags.StateGuardPerf" \
-        "ivmIt/testOnly org.openivm.spark.common.rocksdb.StateGuardCrashRecoverySpec -- -n org.openivm.spark.tags.StateGuardPerf"
+    run_sbt "$@" "${suites[@]}"
 }
 
 cmd_window_benchmark() {
