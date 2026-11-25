@@ -89,6 +89,20 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
     )
 
   describe("Delta MV catalog backend") {
+    it("recreates an initialized catalog path after it is deleted") {
+      val path   = s"$root/recreated-catalog"
+      val schema = StructType(Seq(StructField("key", IntegerType, nullable = false)))
+
+      DeltaPathTable.createIfAbsent(spark, path, schema, "key")
+      val initialId = DeltaTable.forPath(spark, path).detail().select("id").head().getString(0)
+      deleteDir(new File(path))
+      DeltaPathTable.createIfAbsent(spark, path, schema, "key")
+
+      val replacement = DeltaTable.forPath(spark, path).detail().head()
+      replacement.getAs[String]("id") should not be initialId
+      replacement.getAs[Seq[String]]("partitionColumns") shouldBe Seq("key")
+    }
+
     it("initializes both catalog paths concurrently and preserves data when reinitialized from another schema") {
       implicit val executionContext: ExecutionContext = ExecutionContext.global
       val catalogPath                                 = s"$root/concurrent-initialization"
