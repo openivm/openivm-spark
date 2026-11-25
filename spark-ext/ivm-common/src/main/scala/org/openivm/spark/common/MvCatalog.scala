@@ -992,7 +992,7 @@ object MvCatalog {
       newVersion: Long,
       token: String
   ): Unit =
-    DeltaMvCatalogBackend.advanceWithInterceptWitness(spark, lookup(spark, name).map(_.name).getOrElse(name), newVersion, token)
+    DeltaMvCatalogBackend.advanceWithInterceptWitness(spark, name, newVersion, token)
 
   def advanceWithCdfWatermarks(
       spark: SparkSession,
