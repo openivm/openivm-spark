@@ -16,6 +16,8 @@
   <a href="https://github.com/openivm/ivm-bench">IVM Bench</a>
 </p>
 
+![OpenIVM Delta and RocksDB state architecture](openivm-delta-rocksdb-architecture.drawio.png)
+
 OpenIVM for Spark is a Spark SQL extension that compiles and applies
 incremental maintenance plans for materialized views. Spark executes the
 resulting SQL against Delta Lake; OpenIVM and LPTS compile the plans in a
