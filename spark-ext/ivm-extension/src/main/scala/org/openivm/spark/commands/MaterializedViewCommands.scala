@@ -6881,7 +6881,11 @@ case class RefreshMaterializedViewCommand(
             // (added by openivm when the user query has no COUNT(*)) or the
             // user's COUNT(*) alias (extracted at CREATE time).
             if (isCountMonoid(meta.refreshType) && !insertOnlyAggregate) {
-              countMonoidColumn(spark, mergeTargetId, meta).foreach { col =>
+              // OpenIVM's own emptied-group DELETE, when it is the program's last write, already
+              // removed every zero-count row.
+              val programDeleted = (col: String) =>
+                EmptyGroupDelete.programDeletesEmptyGroups(rewritten.statements, mergeTargetId.table, col)
+              countMonoidColumn(spark, mergeTargetId, meta).filterNot(programDeleted).foreach { col =>
                 val q         = col.replace("`", "``")
                 val deleteSql = s"DELETE FROM ${sqlIdent(mergeTargetId)} WHERE `$q` = 0"
                 val idx       = stmtCounter.getAndIncrement()

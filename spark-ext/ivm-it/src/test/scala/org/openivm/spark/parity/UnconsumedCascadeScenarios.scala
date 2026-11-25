@@ -82,6 +82,7 @@ abstract class UnconsumedCascadeScenarios extends IvmParitySpecBase("unconsumed-
           if (view == "uc_grp" || view == "uc_sum") {
             withClue(s"$view statements: ${kinds.mkString(", ")}") {
               kinds should contain("merge")
+              kinds should not contain "count_monoid_cleanup"
               kinds should not contain "insert_into"
             }
           }
