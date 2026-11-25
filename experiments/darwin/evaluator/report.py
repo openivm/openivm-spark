@@ -347,6 +347,30 @@ def crash_verdict(crash: dict[str, Any], manifest: dict[str, Any]) -> CrashVerdi
     return verdict
 
 
+def with_witness_points(crash: Any, outcomes: dict[str, str], manifest: dict[str, Any]) -> Any:
+    """The crash report plus one gated intercept point per named ScalaTest case of the manifest.
+
+    A case that did not run (or was skipped, ignored or cancelled) fails; each case's five flags mirror its outcome.
+    The witness cases run in the same crash suite invocation, so a baseline and a candidate are compared point-wise.
+    """
+    if not isinstance(crash, dict) or not isinstance(crash.get("points"), list):
+        return crash
+    points = list(crash["points"])
+    for case in manifest.get("witness_cases", []):
+        status = outcomes.get(f"{case['spec']}: {case['test']}", "not executed")
+        passed = status == "passed"
+        points.append(
+            {
+                "name": f"witness_{case['name']}",
+                "mode": "intercept",
+                **{flag: passed for flag in CRASH_FLAGS},
+                "known_gap": False,
+                "notes": f"named case {case['spec']}: {case['test']} ({status})",
+            }
+        )
+    return {**crash, "points": points}
+
+
 def crash_regressions(candidate: CrashVerdict, baseline: CrashVerdict) -> list[str]:
     """Candidate failures the same-box baseline lacks (flag-wise) and gated points it no longer reports; each invalidates it."""
     found = [f"crash point {key!r} is no longer reported (the baseline reports it)" for key in baseline.keys if key not in candidate.keys]

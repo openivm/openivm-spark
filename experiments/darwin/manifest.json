@@ -24,6 +24,19 @@
     "crash_modes": ["intercept", "cdf"],
     "max_report_value": 1000000000000.0
   },
+  "witness_cases": [
+    {"name": "fresh_jvm_delta_pre_input_snapshot", "spec": "InterceptStaleSnapshotCrashSpec", "test": "recovers delta after a pre-input snapshot"},
+    {"name": "fresh_jvm_delta_post_input_snapshot", "spec": "InterceptStaleSnapshotCrashSpec", "test": "recovers delta after a post-input snapshot"},
+    {"name": "fresh_jvm_rocksdb_pre_input_snapshot", "spec": "InterceptStaleSnapshotCrashSpec", "test": "recovers rocksdb after a pre-input snapshot"},
+    {"name": "fresh_jvm_rocksdb_post_input_snapshot", "spec": "InterceptStaleSnapshotCrashSpec", "test": "recovers rocksdb after a post-input snapshot"},
+    {"name": "stale_snapshot_delta_snapshot_has_input", "spec": "InterceptStaleSnapshotDeltaSpec", "test": "recovers when the last snapshot contains the staged input"},
+    {"name": "stale_snapshot_delta_snapshot_predates_input", "spec": "InterceptStaleSnapshotDeltaSpec", "test": "recovers when the last snapshot predates the staged input"},
+    {"name": "stale_snapshot_delta_downstream_cascade", "spec": "InterceptStaleSnapshotDeltaSpec", "test": "recovers the upstream delta for a downstream materialized view"},
+    {"name": "stale_snapshot_rocksdb_snapshot_has_input", "spec": "InterceptStaleSnapshotRocksSpec", "test": "recovers when the last snapshot contains the staged input"},
+    {"name": "stale_snapshot_rocksdb_snapshot_predates_input", "spec": "InterceptStaleSnapshotRocksSpec", "test": "recovers when the last snapshot predates the staged input"},
+    {"name": "legacy_intercept_bootstrap_stays_incremental", "spec": "LegacyInterceptWitnessSpec", "test": "bootstraps an existing view without changing its incremental refresh path"},
+    {"name": "legacy_intercept_unreadable_identity_fails", "spec": "LegacyInterceptWitnessSpec", "test": "fails explicitly if a legacy view's target identity cannot be read"}
+  ],
   "acceptance": {
     "min_wait_reduction": 0.8,
     "min_e2e_improvement": 0.1,

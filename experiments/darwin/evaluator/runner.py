@@ -14,6 +14,7 @@ import signal
 import subprocess
 import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -26,6 +27,7 @@ SECRET_PATTERNS = (
 )
 SECRET_ENV = re.compile(r"(?i)(TOKEN|SECRET|PASSWORD|CREDENTIAL|API_?KEY)")
 FAILURE_LINE = re.compile(r"\*\*\* FAILED|\[error\]|Exception|AssertionError|error:", re.IGNORECASE)
+JUNIT_DIR = "junit"
 TAIL_LINES = 400
 MAX_FAILURE_LINES = 60
 
@@ -55,6 +57,25 @@ def redact(text: str) -> str:
     return text
 
 
+def read_junit_outcomes(directory: Path) -> dict[str, str]:
+    """ScalaTest JUnit XML -> {"<SimpleSuiteName>: <test name>": "passed" | "failed" | "skipped"}.
+
+    The console is not used: parallel forked suites interleave their lines, JUnit files are one per suite.
+    """
+    outcomes: dict[str, str] = {}
+    for path in sorted(Path(directory).glob("TEST-*.xml")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "<!DOCTYPE" in text or "<!ENTITY" in text:
+            raise ValueError(f"{path.name}: DTDs are not accepted")
+        root = ET.fromstring(text)
+        for case in root.iter("testcase"):
+            suite = (case.get("classname") or root.get("name") or "").rsplit(".", 1)[-1]
+            tags = {child.tag for child in case}
+            status = "failed" if tags & {"failure", "error"} else "skipped" if "skipped" in tags else "passed"
+            outcomes[f"{suite}: {case.get('name')}"] = status
+    return outcomes
+
+
 def run_git(cwd: Any, *args: str, timeout: float = 600.0) -> tuple[int, bytes]:
     env = {k: v for k, v in os.environ.items() if k not in GIT_ENV_STRIP}
     try:
@@ -82,6 +103,7 @@ class RunResult:
     read_errors: list[str] = dataclasses.field(default_factory=list)
     log_tail: list[str] = dataclasses.field(default_factory=list)
     failure_lines: list[str] = dataclasses.field(default_factory=list)
+    outcomes: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def failure_excerpt(self, limit: int = 12) -> list[str]:
         lines = self.failure_lines[:limit] or self.log_tail[-15:]
@@ -111,6 +133,12 @@ def _read_reports(report_dir: Path, manifest: dict[str, Any], result: RunResult,
             setattr(result, attr, report.load_json(path))
         except (OSError, ValueError) as exc:
             result.read_errors.append(f"{name}: unreadable ({exc})")
+    junit = report_dir / JUNIT_DIR
+    if suite in ("all", "crash") and junit.is_dir():
+        try:
+            result.outcomes = read_junit_outcomes(junit)
+        except (OSError, ValueError, ET.ParseError) as exc:
+            result.read_errors.append(f"{JUNIT_DIR}: unreadable ({exc})")
 
 
 def scrubbed_env() -> dict[str, str]:
@@ -168,9 +196,10 @@ class NxRunner:
         nx = self.manifest["nx"]
         if suite not in SUITES:
             raise InfraError(f"unknown suite {suite!r}")
+        root = Path(root).resolve()
         ensure_dependencies(root, self.prefix)
         relative = Path(".logs") / "state-guard" / label
-        report_dir = Path(root) / relative
+        report_dir = root / relative
         shutil.rmtree(report_dir, ignore_errors=True)
         report_dir.mkdir(parents=True, exist_ok=True)
         in_container = f"{self.container_root.rstrip('/')}/{relative.as_posix()}" if self.prefix else str(report_dir)
@@ -261,6 +290,7 @@ class FixtureRunner:
             exits = info.get("exit_codes", {})
             result.exit_code = int(exits.get(suite, info.get("exit_code", 0)))
             result.log_tail = [str(line) for line in info.get("log", [])]
+            result.outcomes = {str(name): str(status) for name, status in info.get("outcomes", {}).items()}
             result.failure_lines = [line for line in result.log_tail if FAILURE_LINE.search(line)]
             result.timed_out = bool(info.get("timed_out", False))
         _read_reports(folder, self.manifest, result, suite)

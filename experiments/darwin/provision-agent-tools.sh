@@ -50,7 +50,9 @@ if [[ -n "${DARWIN_WHEEL:-}" ]]; then
     python3 -m venv --without-pip "$venv"
     python3 -m pip --python "$venv/bin/python" install pip
   fi
-  "$venv/bin/python" -m pip install --force-reinstall "$DARWIN_WHEEL"
+  if ! "$venv/bin/darwin" --version 2>/dev/null | grep -q " 0.3.0$"; then
+    "$venv/bin/python" -m pip install --quiet "$DARWIN_WHEEL"
+  fi
   darwin_bin="$venv/bin/darwin"
 fi
 

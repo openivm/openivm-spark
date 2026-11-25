@@ -198,6 +198,19 @@ def crash_doc(failing: dict[str, tuple[str, ...]] | None = None, dropped: tuple[
 
 
 STALE_SNAPSHOT_FLAGS = {KNOWN_STALE_SNAPSHOT: ("parity", "metadata_converged", "incremental_after_recovery")}
+WITNESS_OUTCOMES = {f"{case['spec']}: {case['test']}": "passed" for case in MANIFEST["witness_cases"]}
+
+
+def witness_outcomes(**overrides: str | None) -> dict[str, str]:
+    """All witness cases passed, except `overrides` keyed by case name: a status, or None for "did not run"."""
+    by_name = {case["name"]: f"{case['spec']}: {case['test']}" for case in MANIFEST["witness_cases"]}
+    outcomes = dict(WITNESS_OUTCOMES)
+    for name, status in overrides.items():
+        if status is None:
+            del outcomes[by_name[name]]
+        else:
+            outcomes[by_name[name]] = status
+    return outcomes
 
 
 def lane_a_changes() -> list[dict]:
@@ -257,6 +270,18 @@ def report_sets() -> dict[str, dict[str, object]]:
     sets["crash-point-dropped"] = {
         "perf": good,
         "crash": crash_doc(dropped=("cdf/acked_refresh_durable",)),
+    }
+    sets["witness-failed"] = {
+        "perf": good,
+        "crash": crash_doc(),
+        "run": {"exit_codes": {"perf": 0, "crash": 1}},
+        "outcomes": witness_outcomes(fresh_jvm_delta_post_input_snapshot="failed"),
+    }
+    sets["witness-not-run"] = {
+        "perf": good,
+        "crash": crash_doc(),
+        "run": {"exit_codes": {"perf": 0, "crash": 1}},
+        "outcomes": witness_outcomes(legacy_intercept_bootstrap_stays_incremental=None, legacy_intercept_unreadable_identity_fails="skipped"),
     }
 
     regression = copy.deepcopy(good)
@@ -361,8 +386,7 @@ def generate() -> dict[str, str]:
         folder = f"reports/{name}"
         files[f"{folder}/state-guard-perf.json"] = dump(parts["perf"])
         files[f"{folder}/state-guard-crash.json"] = dump(parts["crash"])
-        if "run" in parts:
-            files[f"{folder}/run.json"] = dump(parts["run"])
+        files[f"{folder}/run.json"] = dump({**parts.get("run", {}), "outcomes": parts.get("outcomes", WITNESS_OUTCOMES)})
         if "changes" in parts:
             files[f"{folder}/changes.json"] = dump(parts["changes"])
     for name, case in diff_cases().items():

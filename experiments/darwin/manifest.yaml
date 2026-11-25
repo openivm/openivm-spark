@@ -43,6 +43,11 @@ crash:                                           # state-guard-crash.json; one p
   min_gated_points: 8
   candidate_gate: no regression versus the same-box baseline (per point and flag); never filtered
   recovery_qualified: every gated point passes; baseline failures keep it 0 and the candidate is never accepted
+  witness_cases:                                 # named ScalaTest cases run with the crash suite; each becomes a gated intercept point
+    - InterceptStaleSnapshotCrashSpec: fresh-JVM kill before the snapshot commit record, pre/post-DML snapshot, delta and rocksdb
+    - InterceptStaleSnapshotDeltaSpec / InterceptStaleSnapshotRocksSpec: stale-snapshot recovery, including the downstream cascade (delta)
+    - LegacyInterceptWitnessSpec: legacy intercept bootstrap stays incremental; unreadable target identity fails explicitly
+    - a case that did not run, was ignored or cancelled fails; the exact test names live in manifest.json "witness_cases"
 
 frozen:                                          # any diff vs the baseline => combined_score 0.0
   - experiments/**

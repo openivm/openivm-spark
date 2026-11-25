@@ -3,6 +3,7 @@ import subprocess
 import sys
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import policy
@@ -19,6 +20,10 @@ out = os.environ["{env}"]
 print("TOKENS_LEAKED" if any("TOKEN" in key for key in os.environ) else "env clean")
 print("clone https://user:hunter2@example.invalid/repo.git with ghp_" + "B" * 30)
 if mode == "pass":
+    for name in ("state-guard-perf.json", "state-guard-crash.json"):
+        shutil.copy(r"{good}" + os.sep + name, os.path.join(out, name))
+elif mode == "chdir":
+    os.chdir(os.path.dirname(out))
     for name in ("state-guard-perf.json", "state-guard-crash.json"):
         shutil.copy(r"{good}" + os.sep + name, os.path.join(out, name))
 elif mode == "fail":
@@ -142,6 +147,19 @@ class NxRunnerProcessTests(unittest.TestCase):
         self.assertNotIn("hunter2", log)
         self.assertNotIn("ghp_B", log)
 
+    def test_a_relative_workspace_still_gives_the_suite_an_absolute_report_dir(self):
+        with scratch_dir() as root:
+            (root / "node_modules" / ".bin").mkdir(parents=True)
+            (root / "node_modules" / ".bin" / "nx").touch()
+            previous = os.getcwd()
+            os.chdir(root)
+            try:
+                result = FakeNx("chdir").run("candidate", Path("."), "case", "spark-3.5", 60)
+            finally:
+                os.chdir(previous)
+        self.assertEqual(result.read_errors, [])
+        self.assertEqual(result.crash["schema"], "openivm.state-guard-crash/v1")
+
     def test_failing_suite_keeps_the_failure_lines_and_reports_missing_files(self):
         result, _ = self.run_fake("fail")
         self.assertEqual(result.exit_code, 1)
@@ -156,6 +174,55 @@ class NxRunnerProcessTests(unittest.TestCase):
         self.assertTrue(result.timed_out)
         self.assertIsNone(result.exit_code)
         self.assertLess(time.monotonic() - started, 60)
+
+
+class JunitOutcomeTests(unittest.TestCase):
+    SUITE = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<testsuite name="{cls}" tests="3">\n'
+        '<testcase classname="{cls}" name="same name" time="0.1"/>\n'
+        '<testcase classname="{cls}" name="broken" time="0.1"><failure message="x" type="t">trace</failure></testcase>\n'
+        '<testcase classname="{cls}" name="ignored" time="0.0"><skipped/></testcase>\n'
+        "</testsuite>\n"
+    )
+
+    def write(self, directory, name, text):
+        (directory / name).write_text(text, encoding="utf-8")
+
+    def test_outcomes_are_keyed_by_simple_suite_name(self):
+        with scratch_dir() as root:
+            self.write(root, "TEST-a.One.xml", self.SUITE.format(cls="a.One"))
+            self.write(root, "TEST-b.Two.xml", self.SUITE.replace('<failure message="x" type="t">trace</failure>', "").format(cls="b.Two"))
+            outcomes = runner.read_junit_outcomes(root)
+        self.assertEqual(
+            outcomes,
+            {
+                "One: same name": "passed",
+                "One: broken": "failed",
+                "One: ignored": "skipped",
+                "Two: same name": "passed",
+                "Two: broken": "passed",
+                "Two: ignored": "skipped",
+            },
+        )
+
+    def test_a_dtd_is_refused_and_leaves_the_cases_unexecuted(self):
+        with scratch_dir() as root:
+            junit = root / runner.JUNIT_DIR
+            junit.mkdir()
+            self.write(junit, "TEST-x.xml", '<!DOCTYPE x [<!ENTITY y "z">]><testsuite/>')
+            result = runner.RunResult(exit_code=0)
+            runner._read_reports(root, MANIFEST, result, "crash")
+        self.assertEqual(result.outcomes, {})
+        self.assertTrue(any(e.startswith("junit: unreadable") for e in result.read_errors))
+
+    def test_the_perf_suite_does_not_read_junit(self):
+        with scratch_dir() as root:
+            (root / runner.JUNIT_DIR).mkdir()
+            self.write(root / runner.JUNIT_DIR, "TEST-x.xml", self.SUITE.format(cls="a.One"))
+            result = runner.RunResult(exit_code=0)
+            runner._read_reports(root, MANIFEST, result, "perf")
+        self.assertEqual(result.outcomes, {})
 
 
 class FixtureRunnerTests(unittest.TestCase):

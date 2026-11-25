@@ -220,6 +220,7 @@ class Session:
         problems = report.validate_crash(result.crash, self.manifest)
         if problems:
             return None, [f"invalid {name}: " + "; ".join(problems[:6])]
+        result.crash = report.with_witness_points(result.crash, result.outcomes, self.manifest)
         verdict = report.crash_verdict(result.crash, self.manifest)
         if verdict.problems:
             return None, [f"invalid {name}: " + "; ".join(verdict.problems[:6])]
