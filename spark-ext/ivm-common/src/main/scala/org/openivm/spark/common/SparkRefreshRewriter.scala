@@ -545,6 +545,8 @@ object SparkRefreshRewriter {
     * @param sourceSnapshotAdvanceOldVersions Pre-advance snapshot versions for
     *                         pinned sources whose live reads are intentionally
     *                         moved to a caller-supplied target pin.
+    * @param reusePublishedSnapshotForCascade Allow the signed cascade to read the target
+    *                         after the target has been fully replaced.
     * @param mvVersionBeforeRefresh Delta version visible before this refresh starts.
     *                         Required when pragma-gated recompute cascade emits an
     *                         `openivm_old_<view>` snapshot that must stay pinned to
@@ -572,7 +574,8 @@ object SparkRefreshRewriter {
       uniqueJoinSimplifyEnabled: Boolean = false,
       windowPartitionSingleDeleteMergeEnabled: Boolean = false,
       mvVersionBeforeRefresh: Option[Long] = None,
-      sourceSnapshotRelations: Map[String, String] = Map.empty
+      sourceSnapshotRelations: Map[String, String] = Map.empty,
+      reusePublishedSnapshotForCascade: Boolean = true
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
 
@@ -726,7 +729,10 @@ object SparkRefreshRewriter {
       val withDedupedSource  = withAliasFixup.map(s => deduplicateNullSafeMergeSource(s, mvName))
       val withSemiJoinRewrite =
         withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
-      val withPublishedSnapshotReuse = reuseFullyReplacedTargetInCascade(withSemiJoinRewrite, mvName, viewLogicalName)
+      val withPublishedSnapshotReuse =
+        if (reusePublishedSnapshotForCascade)
+          reuseFullyReplacedTargetInCascade(withSemiJoinRewrite, mvName, viewLogicalName)
+        else withSemiJoinRewrite
       RewrittenRefresh(withPublishedSnapshotReuse.map(postProcess), hasRunningWindowProgram, cascade.map(_.inputPath))
     } finally {
       activeQualifiedNames.set(prior)

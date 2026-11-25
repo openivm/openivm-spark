@@ -6228,7 +6228,12 @@ case class RefreshMaterializedViewCommand(
                 },
                 sourceSnapshotAdvanceOldVersions = sourceSnapshotAdvanceOldVersions,
                 mvVersionBeforeRefresh = Some(meta.lastVersion),
-                sourceSnapshotRelations = snapshotRelations
+                sourceSnapshotRelations = snapshotRelations,
+                // Keep the signed old/new cascade recognizable so the CDF path can
+                // replace it with the target's single Delta commit.
+                reusePublishedSnapshotForCascade = propagation.requiresDmlInterception ||
+                  meta.refreshType != RefreshTypeCode.WindowPartition ||
+                  !FeatureGate.windowSinglePassReplaceEnabled(spark)
               )
             }
           }
