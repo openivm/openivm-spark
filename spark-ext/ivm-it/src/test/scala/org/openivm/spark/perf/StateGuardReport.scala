@@ -30,7 +30,8 @@ private[spark] object StateGuardReport {
   def catalogBackend: String =
     sys.env.get(CatalogBackendEnv).map(_.trim.toLowerCase).filter(Set("delta", "rocksdb")).getOrElse("delta")
 
-  def sparkTarget: String = if (scala.util.Properties.versionNumberString.startsWith("2.12")) "spark-3.5" else "spark-4.1"
+  def sparkTarget: String =
+    if (scala.util.Properties.versionNumberString.startsWith("2.12")) "spark-3.5" else "spark-4.1"
 
   def headSha: String =
     sys.env.get(HeadShaEnv).filter(_.nonEmpty).getOrElse {
@@ -74,9 +75,9 @@ private[spark] object StateGuardReport {
   }
 
   private def toJava(value: Any): AnyRef = value match {
-    case null            => null
-    case None            => null
-    case Some(inner)     => toJava(inner)
+    case null        => null
+    case None        => null
+    case Some(inner) => toJava(inner)
     case m: scala.collection.Map[_, _] =>
       val out = new java.util.LinkedHashMap[String, AnyRef]()
       m.toSeq.sortBy(_._1.toString).foreach { case (k, v) => out.put(k.toString, toJava(v)) }

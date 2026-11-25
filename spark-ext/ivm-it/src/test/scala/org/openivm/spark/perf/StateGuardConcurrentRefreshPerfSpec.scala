@@ -66,18 +66,18 @@ class StateGuardConcurrentRefreshPerfSpec extends IvmParitySpecBase("state-guard
   override protected def sparkMaster: String = "local[8]"
 
   override protected def extraSparkConf: Map[String, String] = Map(
-    "spark.plugins"                          -> "org.openivm.spark.plugin.metrics.OpenIvmMetricsPlugin",
-    BoundedTelemetryQueue.EnabledKey         -> "true",
-    BoundedTelemetryQueue.LocalUriKey        -> queueDir.toURI.toString,
-    BoundedTelemetryQueue.CapacityKey        -> "65536",
-    FeatureGate.CatalogBackendKey            -> StateGuardReport.catalogBackend,
-    FeatureGate.StateSyncUriKey              -> remoteDir.toURI.toString,
-    FeatureGate.StateSyncAsyncEnabledKey     -> "false",
-    FeatureGate.ProfileRefreshKey            -> "true",
-    FeatureGate.QueryLogEnabledKey           -> "true",
-    "fs.file.impl"                           -> classOf[StateGuardLocalFileSystem].getName,
-    "fs.file.impl.disable.cache"             -> "true",
-    "fs.AbstractFileSystem.file.impl"        -> classOf[StateGuardLocalAbstractFs].getName
+    "spark.plugins"                      -> "org.openivm.spark.plugin.metrics.OpenIvmMetricsPlugin",
+    BoundedTelemetryQueue.EnabledKey     -> "true",
+    BoundedTelemetryQueue.LocalUriKey    -> queueDir.toURI.toString,
+    BoundedTelemetryQueue.CapacityKey    -> "65536",
+    FeatureGate.CatalogBackendKey        -> StateGuardReport.catalogBackend,
+    FeatureGate.StateSyncUriKey          -> remoteDir.toURI.toString,
+    FeatureGate.StateSyncAsyncEnabledKey -> "false",
+    FeatureGate.ProfileRefreshKey        -> "true",
+    FeatureGate.QueryLogEnabledKey       -> "true",
+    "fs.file.impl"                       -> classOf[StateGuardLocalFileSystem].getName,
+    "fs.file.impl.disable.cache"         -> "true",
+    "fs.AbstractFileSystem.file.impl"    -> classOf[StateGuardLocalAbstractFs].getName
   )
 
   override def afterAll(): Unit =
@@ -154,7 +154,10 @@ class StateGuardConcurrentRefreshPerfSpec extends IvmParitySpecBase("state-guard
     } finally OpenIvmExecutionSpan.setStateSyncEvidenceHookForTesting(null)
   }
 
-  it("measures six concurrent incremental refreshes against modeled state-sync and catalog latency", StateGuardPerfTag) {
+  it(
+    "measures six concurrent incremental refreshes against modeled state-sync and catalog latency",
+    StateGuardPerfTag
+  ) {
     sql("CREATE TABLE sgperf_events(symbol STRING, amount INT) USING DELTA")
     sql("INSERT INTO sgperf_events SELECT concat('sym_', cast(id % 20 as string)), cast(id as int) FROM range(200)")
     (1 to MvCount).foreach { i =>
@@ -195,9 +198,9 @@ class StateGuardConcurrentRefreshPerfSpec extends IvmParitySpecBase("state-guard
     val offset = (ns: Long) => ms(ns - run.startNs)
 
     val views = (0 until MvCount).map { idx =>
-      val id      = run.requestIds(idx)
-      val mine    = events.filter(n => text(n, "request_id") == id)
-      val phases  = mine.filter(n => text(n, "event_type") == "phase")
+      val id     = run.requestIds(idx)
+      val mine   = events.filter(n => text(n, "request_id") == id)
+      val phases = mine.filter(n => text(n, "event_type") == "phase")
       def named(p: String => Boolean): Seq[StateGuardInterval] =
         phases.filter(n => p(text(n, "phase"))).map(phaseInterval)
       val waits    = named(_ == "state_barrier_wait")
@@ -206,7 +209,9 @@ class StateGuardConcurrentRefreshPerfSpec extends IvmParitySpecBase("state-guard
       val finalize = union(named(_.startsWith("finalize_")))
       val advance  = named(_ == "finalize_catalog_advance")
       val span = mine
-        .find(n => text(n, "event_type") != "phase" && text(n, "operation") == "refresh" && n.has("effective_refresh_type"))
+        .find(n =>
+          text(n, "event_type") != "phase" && text(n, "operation") == "refresh" && n.has("effective_refresh_type")
+        )
         .getOrElse(fail(s"missing refresh span for $id"))
       val reqs: Seq[StateSyncRequestEvidence] = requests.filter(_.parentRequestId.contains(id))
       val pubs                                = reqs.map(_.publicationId).distinct.flatMap(publicationById.get)
@@ -219,32 +224,32 @@ class StateGuardConcurrentRefreshPerfSpec extends IvmParitySpecBase("state-guard
 
       val holdSpan = union(holds)
       val row = Map[String, Any](
-        "mv_index"                   -> (idx + 1),
-        "name"                       -> s"sgperf_mv${idx + 1}",
-        "wall_ms"                    -> ms(run.ackNs(idx) - run.submitNs(idx)),
-        "refresh_type"               -> text(span, "effective_refresh_type"),
-        "outcome"                    -> text(span, "outcome"),
-        "submit_to_ack_ms"           -> ms(run.ackNs(idx) - run.submitNs(idx)),
-        "state_barrier_wait_ms"      -> ms(waits.map(_.lengthNs).sum),
-        "state_barrier_hold_ms"      -> ms(holds.map(_.lengthNs).sum),
-        "capture_wait_ms"            -> ms(capture),
-        "catalog_finalize_ms"        -> ms(finalize.map(_.lengthNs).getOrElse(0L)),
-        "catalog_advance_ms"         -> ms(advance.map(_.lengthNs).sum),
-        "publication_queue_wait_ms"  -> ms(reqs.map(_.queueWaitNs).sum),
-        "publication_ms"             -> ms(pubs.map(_.durationNs).sum),
-        "engine_exec_ms"             -> ms(engine.map(_.lengthNs).getOrElse(0L)),
-        "submit_at_ms"               -> offset(run.submitNs(idx)),
-        "ack_at_ms"                  -> offset(run.ackNs(idx)),
-        "barrier_acquired_at_ms"     -> at(holdSpan, _.startNs),
-        "barrier_released_at_ms"     -> at(holdSpan, _.endNs),
-        "engine_start_at_ms"         -> at(engine, _.startNs),
-        "engine_end_at_ms"           -> at(engine, _.endNs),
+        "mv_index"                     -> (idx + 1),
+        "name"                         -> s"sgperf_mv${idx + 1}",
+        "wall_ms"                      -> ms(run.ackNs(idx) - run.submitNs(idx)),
+        "refresh_type"                 -> text(span, "effective_refresh_type"),
+        "outcome"                      -> text(span, "outcome"),
+        "submit_to_ack_ms"             -> ms(run.ackNs(idx) - run.submitNs(idx)),
+        "state_barrier_wait_ms"        -> ms(waits.map(_.lengthNs).sum),
+        "state_barrier_hold_ms"        -> ms(holds.map(_.lengthNs).sum),
+        "capture_wait_ms"              -> ms(capture),
+        "catalog_finalize_ms"          -> ms(finalize.map(_.lengthNs).getOrElse(0L)),
+        "catalog_advance_ms"           -> ms(advance.map(_.lengthNs).sum),
+        "publication_queue_wait_ms"    -> ms(reqs.map(_.queueWaitNs).sum),
+        "publication_ms"               -> ms(pubs.map(_.durationNs).sum),
+        "engine_exec_ms"               -> ms(engine.map(_.lengthNs).getOrElse(0L)),
+        "submit_at_ms"                 -> offset(run.submitNs(idx)),
+        "ack_at_ms"                    -> offset(run.ackNs(idx)),
+        "barrier_acquired_at_ms"       -> at(holdSpan, _.startNs),
+        "barrier_released_at_ms"       -> at(holdSpan, _.endNs),
+        "engine_start_at_ms"           -> at(engine, _.startNs),
+        "engine_end_at_ms"             -> at(engine, _.endNs),
         "catalog_finalize_start_at_ms" -> at(finalize, _.startNs),
-        "catalog_finalize_end_at_ms" -> at(finalize, _.endNs),
-        "publication_start_at_ms"    -> at(publishing, _.startNs),
-        "publication_end_at_ms"      -> at(publishing, _.endNs),
-        "state_sync_requests"        -> reqs.size,
-        "state_sync_acknowledged"    -> (reqs.nonEmpty && reqs.forall(r => r.status == "success") &&
+        "catalog_finalize_end_at_ms"   -> at(finalize, _.endNs),
+        "publication_start_at_ms"      -> at(publishing, _.startNs),
+        "publication_end_at_ms"        -> at(publishing, _.endNs),
+        "state_sync_requests"          -> reqs.size,
+        "state_sync_acknowledged" -> (reqs.nonEmpty && reqs.forall(r => r.status == "success") &&
           reqs.exists(_.acknowledgedSnapshotGenerationId.nonEmpty))
       )
       ViewRow(row, engine, holds)
@@ -286,12 +291,12 @@ class StateGuardConcurrentRefreshPerfSpec extends IvmParitySpecBase("state-guard
     }.toMap
 
     val report = Map[String, Any](
-      "schema"        -> "openivm.state-guard-perf/v1",
-      "evidence_class" -> StateGuardReport.EvidenceClass,
-      "spark_target"  -> StateGuardReport.sparkTarget,
-      "head_sha"      -> StateGuardReport.headSha,
+      "schema"          -> "openivm.state-guard-perf/v1",
+      "evidence_class"  -> StateGuardReport.EvidenceClass,
+      "spark_target"    -> StateGuardReport.sparkTarget,
+      "head_sha"        -> StateGuardReport.headSha,
       "catalog_backend" -> StateGuardReport.catalogBackend,
-      "label"         -> sys.env.getOrElse(StateGuardReport.RunLabelEnv, ""),
+      "label"           -> sys.env.getOrElse(StateGuardReport.RunLabelEnv, ""),
       "latency_profile" -> Map(
         "name"             -> profile.name,
         "catalog_read_ms"  -> profile.catalogReadMs,
@@ -310,9 +315,9 @@ class StateGuardConcurrentRefreshPerfSpec extends IvmParitySpecBase("state-guard
       "barrier_hold_overlap_ms" -> ms(StateGuardReport.overlapNs(holdIntervals, 2)),
       "views"                   -> publicVisible,
       "counts" -> Map(
-        "incremental_count" -> outcomes.count(o => o.nonEmpty && !o.contains("full_refresh")),
+        "incremental_count"  -> outcomes.count(o => o.nonEmpty && !o.contains("full_refresh")),
         "full_refresh_count" -> outcomes.count(_.contains("full_refresh")),
-        "fs_ops"            -> byArea,
+        "fs_ops"             -> byArea,
         "state_sync" -> Map(
           "publications"   -> publications.count(_.published),
           "commits"        -> commits,

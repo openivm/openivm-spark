@@ -39,9 +39,9 @@ private[rocksdb] object StateGuardCrashProbe {
     private val mapper = new ObjectMapper()
     val cdf            = mode == "cdf"
 
-    def sql(text: String): Unit       = { spark.sql(text).collect(); () }
-    def metadata                      = MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)).get
-    def mvVersion(): Long             = DeltaTableVersion.requireLatest(spark, metadata.location)
+    def sql(text: String): Unit = { spark.sql(text).collect(); () }
+    def metadata                = MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)).get
+    def mvVersion(): Long       = DeltaTableVersion.requireLatest(spark, metadata.location)
 
     def parity(): Boolean = {
       val actual   = spark.sql(s"SELECT symbol, events, total FROM $mv")
@@ -261,7 +261,8 @@ class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
   private def deleteTree(path: Path): Unit =
     if (Files.exists(path)) {
       val walk = Files.walk(path)
-      try walk.sorted(java.util.Comparator.reverseOrder[Path]()).iterator().asScala.toVector.foreach(Files.deleteIfExists)
+      try
+        walk.sorted(java.util.Comparator.reverseOrder[Path]()).iterator().asScala.toVector.foreach(Files.deleteIfExists)
       finally walk.close()
     }
 
@@ -269,7 +270,8 @@ class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
     val root = Paths.get("target").toAbsolutePath.resolve(s"state-guard-crash-${UUID.randomUUID().toString.take(8)}")
     Files.createDirectories(root)
     val crashExit = launch(root, "crash", point, backend)
-    val crashed   = crashExit.contains(StateGuardCrashProbe.CrashExit) && Files.isRegularFile(root.resolve("crash-marker"))
+    val crashed =
+      crashExit.contains(StateGuardCrashProbe.CrashExit) && Files.isRegularFile(root.resolve("crash-marker"))
     var recoverExit: Option[Int] = None
     val result: Option[JsonNode] =
       if (!crashed) None
@@ -277,13 +279,15 @@ class StateGuardCrashRecoverySpec extends AnyFunSpec with Matchers {
         if (point.wipeLocalState) deleteTree(root.resolve("state"))
         recoverExit = launch(root, "recover", point, backend)
         val file = root.resolve("recover-result.json")
-        if (recoverExit.contains(0) && Files.isRegularFile(file)) Some(new ObjectMapper().readTree(file.toFile)) else None
+        if (recoverExit.contains(0) && Files.isRegularFile(file)) Some(new ObjectMapper().readTree(file.toFile))
+        else None
       }
     def flag(name: String): Boolean = result.exists(_.path(name).asBoolean(false))
     val restored                    = !point.wipeLocalState || flag("state_restored")
     val diagnostics =
       if (!crashed) s"; crash phase exit=${crashExit.map(_.toString).getOrElse("timeout")}, logs in $root"
-      else if (result.isEmpty) s"; recover phase exit=${recoverExit.map(_.toString).getOrElse("timeout")}, logs in $root"
+      else if (result.isEmpty)
+        s"; recover phase exit=${recoverExit.map(_.toString).getOrElse("timeout")}, logs in $root"
       else if (!restored) "; local state was not restored from the remote"
       else ""
     val report = Map[String, Any](
