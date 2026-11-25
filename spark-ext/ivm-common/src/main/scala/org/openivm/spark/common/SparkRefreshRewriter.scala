@@ -5,6 +5,13 @@ import java.nio.charset.{CodingErrorAction, StandardCharsets}
 import java.security.MessageDigest
 
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedRelation}
+import org.apache.spark.sql.catalyst.expressions.{And, Cast, EqualTo, Expression}
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.plans.logical.{Filter, Join, LogicalPlan, Project, SubqueryAlias}
+
+import scala.util.Try
 
 /** Output of [[SparkRefreshRewriter.rewrite]]: the ordered list of Spark-SQL
   * statements that, when executed, perform one incremental refresh.
@@ -67,14 +74,16 @@ object RewriteLineage {
       outputs: Seq[OutputStatement]
   )
 
-  /** Fixed pre/post rewrite passes and the opaque caller hook applied to each output. */
+  private[common] val publishedSnapshotReuseRule = RewriteRule("reuse-published-snapshot-in-cascade", "1", Unknown)
+
+  /** Default pre/post rewrite passes and the opaque caller hook applied to each output. */
   val outputPipelineRules: Vector[RewriteRule] = Vector(
     RewriteRule("expand-source-select-star-except", "1", Unknown),
     RewriteRule("expand-output-select-star-except", "1", Unknown),
     RewriteRule("fix-merge-alias-refs", "1", Unknown),
     RewriteRule("deduplicate-null-safe-merge-source", "1", Unknown),
     RewriteRule("rewrite-recompute-exists-as-affected-keys-join", "1", Unknown),
-    RewriteRule("reuse-published-snapshot-in-cascade", "1", Unknown),
+    publishedSnapshotReuseRule,
     RewriteRule("caller-post-process", "unidentified", Unknown)
   )
 
@@ -550,7 +559,7 @@ object SparkRefreshRewriter {
 
   /** Inline a view-delta CTAS body into its single aggregate MERGE consumer.
     *
-    * Eligible insert-only terminal aggregates do not need a durable cascade
+    * Eligible insert-only aggregates do not need a durable cascade
     * delta. Replacing the one scratch-path scan with the CTAS query turns the
     * two-statement write/read program into one Spark pipeline. Return `None`
     * unless the shape is exact so callers can execute the original program.
@@ -579,6 +588,11 @@ object SparkRefreshRewriter {
         refPattern.matcher(strippedMerge).replaceFirst(replacement)
       }
   }
+
+  private[spark] def restrictAggregateMergeTarget(merge: String, predicate: String): String =
+    findTopLevelSqlKeyword(merge, 0, merge.length, "WHEN").fold(merge) { when =>
+      merge.substring(0, when) + s" AND ($predicate) " + merge.substring(when)
+    }
 
   /** Replace every occurrence of `` delta.`<viewDeltaPath>` `` in `sql` with
     * `` `<tempViewName>` ``. Anchored on the exact escaped path (the path is
@@ -660,6 +674,8 @@ object SparkRefreshRewriter {
     * @param sourceSnapshotAdvanceOldVersions Pre-advance snapshot versions for
     *                         pinned sources whose live reads are intentionally
     *                         moved to a caller-supplied target pin.
+    * @param reusePublishedSnapshotForCascade Allow the signed cascade to read the target
+    *                         after the target has been fully replaced.
     * @param mvVersionBeforeRefresh Delta version visible before this refresh starts.
     *                         Required when pragma-gated recompute cascade emits an
     *                         `openivm_old_<view>` snapshot that must stay pinned to
@@ -689,7 +705,8 @@ object SparkRefreshRewriter {
       mvVersionBeforeRefresh: Option[Long] = None,
       sourceSnapshotRelations: Map[String, String] = Map.empty,
       lineageCapture: Option[RewriteLineage.Capture] = None,
-      lineagePostProcessRules: Option[Seq[RewriteLineage.RewriteRule]] = None
+      lineagePostProcessRules: Option[Seq[RewriteLineage.RewriteRule]] = None,
+      reusePublishedSnapshotForCascade: Boolean = true
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
 
@@ -881,8 +898,11 @@ object SparkRefreshRewriter {
       val withSemiJoinRewrite =
         withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
       // These final passes preserve output order and cardinality.
-      val withPublishedSnapshotReuse = reuseFullyReplacedTargetInCascade(withSemiJoinRewrite, mvName, viewLogicalName)
-      val finalStatements            = withPublishedSnapshotReuse.map(postProcess)
+      val withPublishedSnapshotReuse =
+        if (reusePublishedSnapshotForCascade)
+          reuseFullyReplacedTargetInCascade(withSemiJoinRewrite, mvName, viewLogicalName)
+        else withSemiJoinRewrite
+      val finalStatements = withPublishedSnapshotReuse.map(postProcess)
       lineageCapture match {
         case None =>
           RewrittenRefresh(
@@ -891,6 +911,9 @@ object SparkRefreshRewriter {
             aggregateInputPath = aggregateInputPath
           )
         case Some(_) =>
+          val pipelineRules = RewriteLineage.outputPipelineRules.dropRight(1).filter { rule =>
+            reusePublishedSnapshotForCascade || rule != RewriteLineage.publishedSnapshotReuseRule
+          } ++ lineagePostProcessRules.getOrElse(RewriteLineage.outputPipelineRules.takeRight(1))
           val outputs = pendingLineage.get.zipWithIndex.map { case (pending, outputIndex) =>
             RewriteLineage.OutputStatement(
               outputIndex,
@@ -899,8 +922,7 @@ object SparkRefreshRewriter {
               pending.rule.name,
               pending.rule.version,
               pending.rule.classification,
-              RewriteLineage.outputPipelineRules.dropRight(1) ++
-                lineagePostProcessRules.getOrElse(RewriteLineage.outputPipelineRules.takeRight(1))
+              pipelineRules
             )
           }.toVector
           val outputIndicesBySource = outputs.groupBy(_.sourceOrdinal).map { case (ordinal, sourceOutputs) =>
@@ -1264,7 +1286,7 @@ object SparkRefreshRewriter {
       // SELECT reads either the cached run_result or the legacy fast/state views. The
       // fallback cascade (openivm_old/openivm_new signed-multiset) is emitted
       // FIRST and CTAS-creates the view-delta path (ViewDeltaInsert); this
-      // statement appends to it (the fallback reads openivm_old/openivm_new).
+      // statement appends to it.
       StatementKind.RunningWindowCascadeInsert
     } else if (upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
       // Distinguish the AGGREGATE_GROUP retract companion (refresh_sql.cpp:620,
@@ -1640,17 +1662,45 @@ object SparkRefreshRewriter {
         )
     }
 
-    val operand =
-      "((?:(?i:CAST)\\s*\\(\\s*)?(?:(`?[A-Za-z][A-Za-z0-9_]*`?)\\s*\\.\\s*)?(`?[A-Za-z][A-Za-z0-9_]*`?)(?:\\s+(?i:AS)\\s+([A-Za-z][A-Za-z0-9_]*(?:\\s*\\([^)]*\\))?)\\s*\\))?)"
-    val equality = ("(?s)" + operand + "\\s*=\\s*" + operand).r
+    // Only inner joins of direct relations can safely constrain the entire CTE.
+    def innerJoinConditions(plan: LogicalPlan): Option[Seq[Expression]] = plan match {
+      case project: Project      => innerJoinConditions(project.child)
+      case filter: Filter        => innerJoinConditions(filter.child)
+      case alias: SubqueryAlias  => innerJoinConditions(alias.child)
+      case _: UnresolvedRelation => Some(Seq.empty)
+      case join: Join if join.joinType == Inner =>
+        for {
+          left      <- innerJoinConditions(join.left)
+          right     <- innerJoinConditions(join.right)
+          condition <- join.condition
+        } yield left ++ right :+ condition
+      case _ => None
+    }
+
+    def equalityConjuncts(expression: Expression): Seq[EqualTo] = expression match {
+      case And(left, right)  => equalityConjuncts(left) ++ equalityConjuncts(right)
+      case equality: EqualTo => Seq(equality)
+      case _                 => Seq.empty
+    }
+
+    def columnRef(expression: Expression): Option[(Option[String], String, Option[String])] = expression match {
+      case attr: UnresolvedAttribute =>
+        attr.nameParts match {
+          case Seq(name)        => Some((None, name, None))
+          case Seq(alias, name) => Some((Some(alias), name, None))
+          case _                => None
+        }
+      case cast: Cast if cast.child.isInstanceOf[UnresolvedAttribute] =>
+        columnRef(cast.child).map { case (alias, name, _) => (alias, name, Some(cast.dataType.sql)) }
+      case _ => None
+    }
 
     ctes.flatMap { cte =>
       val refs = collectScd2RelationRefs(cte.body).filter(ref => byName.contains(ref.shortName.toLowerCase))
       if (refs.size < 2 || !"(?is)\\bINNER\\s+JOIN\\b".r.findFirstIn(cte.body).isDefined) Seq.empty
       else {
-        def relationFor(alias: String, column: String): Option[Scd2RelationRef] = {
-          val normalizedAlias = stripBackticks(Option(alias).getOrElse(""))
-          val normalizedCol   = stripBackticks(column)
+        def relationFor(alias: Option[String], column: String): Option[Scd2RelationRef] = {
+          val normalizedAlias = alias.getOrElse("")
           val candidates =
             if (normalizedAlias.nonEmpty)
               refs.filter(ref =>
@@ -1661,7 +1711,7 @@ object SparkRefreshRewriter {
               refs.filter { ref =>
                 byName
                   .get(ref.shortName.toLowerCase)
-                  .exists(parsedCteColumns(_).exists(_.equalsIgnoreCase(normalizedCol)))
+                  .exists(parsedCteColumns(_).exists(_.equalsIgnoreCase(column)))
               }
           candidates.distinct match {
             case Seq(single) => Some(single)
@@ -1669,31 +1719,35 @@ object SparkRefreshRewriter {
           }
         }
 
-        equality
-          .findAllMatchIn(cte.body)
-          .flatMap { m =>
-            val leftRef  = relationFor(m.group(2), m.group(3))
-            val rightRef = relationFor(m.group(6), m.group(7))
+        Try(CatalystSqlParser.parsePlan(cte.body)).toOption
+          .flatMap(innerJoinConditions)
+          .filter(_.size + 1 == refs.size)
+          .iterator
+          .flatten
+          .flatMap(equalityConjuncts)
+          .flatMap { equality =>
             for {
-              left        <- leftRef
-              right       <- rightRef
-              leftOrigin  <- origin(left.shortName)
-              rightOrigin <- origin(right.shortName)
+              (leftAlias, leftCol, leftCast)    <- columnRef(equality.left)
+              (rightAlias, rightCol, rightCast) <- columnRef(equality.right)
+              left                              <- relationFor(leftAlias, leftCol)
+              right                             <- relationFor(rightAlias, rightCol)
+              leftOrigin                        <- origin(left.shortName)
+              rightOrigin                       <- origin(right.shortName)
               site <- (leftOrigin, rightOrigin) match {
                 case (base, delta) if !base.isDelta && delta.isDelta =>
                   Some(
                     RegularNtermPruneSite(
                       cte.name,
-                      m.group(1).trim,
-                      RegularNtermKeyRequest(delta.shortName, stripBackticks(m.group(7)), Option(m.group(8)))
+                      equality.left.sql,
+                      RegularNtermKeyRequest(delta.shortName, rightCol, rightCast)
                     )
                   )
                 case (delta, base) if delta.isDelta && !base.isDelta =>
                   Some(
                     RegularNtermPruneSite(
                       cte.name,
-                      m.group(5).trim,
-                      RegularNtermKeyRequest(delta.shortName, stripBackticks(m.group(3)), Option(m.group(4)))
+                      equality.right.sql,
+                      RegularNtermKeyRequest(delta.shortName, leftCol, leftCast)
                     )
                   )
                 case _ => None
@@ -3621,7 +3675,7 @@ object SparkRefreshRewriter {
               }
               .getOrElse(stmt)
           case None =>
-            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)(?:\s+(?:AS\s+)?(\w+))?\s+WHERE\s+(.+?)\s*$""".r
+            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)\s+(?:(?:AS\s+)?(\w+)\s+)?WHERE\s+(.+?)\s*$""".r
             tempRe
               .findFirstMatchIn(existsBody)
               .map { t =>

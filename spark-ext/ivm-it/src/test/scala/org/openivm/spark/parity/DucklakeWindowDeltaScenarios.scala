@@ -100,8 +100,7 @@ abstract class DucklakeWindowDeltaScenarios extends IvmParitySpecBase("ducklake-
       refreshMv("dlwd_mv_market_join")
       assertMvCorrect("dlwd_mv_market_join", mvJoinSql)
 
-      // A backdated batch must use partition replacement and preserve the
-      // hidden ROWS state and the downstream signed delta as well.
+      // A backdated batch must preserve the hidden ROWS state and the downstream signed delta.
       sql("INSERT INTO dlwd_market VALUES ('A', 0, 50)")
       refreshMv("dlwd_mv_market")
       assertMvCorrect("dlwd_mv_market", mvMarketSql)

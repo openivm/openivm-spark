@@ -283,7 +283,7 @@ class OpenIvmCompiler private (
       val initLoad = parseInitialLoadSql(resultDir, req, nativeViewName, restore)
       if (initLoad.nonEmpty && partial.refreshTypeName != "FULL_REFRESH") markers.foreach(_.requireAllSeen())
       markers.foreach(_.clearSeen())
-      val resultSql = restore(normalizeCompiledViewNames(partial.sql, nativeViewName, req.viewName))
+      val resultSql = restore(OpenIvmCompiler.normalizeNativeViewObjects(partial.sql, nativeViewName, req.viewName))
       if (partial.refreshTypeName != "FULL_REFRESH") markers.foreach(_.requireAllSeen())
       partial.copy(
         sql = resultSql,
@@ -905,7 +905,11 @@ class OpenIvmCompiler private (
     val nativeName = if (nativeViewName.isEmpty) req.viewName else nativeViewName
     val file       = tmpDir.resolve(s"openivm_compiled_queries_$nativeName.sql")
     if (!Files.exists(file)) return ""
-    val content = normalizeCompiledViewNames(new String(Files.readAllBytes(file), "UTF-8"), nativeName, req.viewName)
+    val content = OpenIvmCompiler.normalizeNativeViewObjects(
+      new String(Files.readAllBytes(file), "UTF-8"),
+      nativeName,
+      req.viewName
+    )
 
     val pat = Pattern.compile(
       s"(?is)create\\s+table\\s+openivm_data_${Pattern.quote(req.viewName)}\\s+as\\s+(?=WITH\\b|SELECT\\b)",
@@ -932,13 +936,6 @@ class OpenIvmCompiler private (
 
     LptsSparkDialect.translate(OpenIvmCompiler.reattachInitialLoadSourceReads(extracted, req))
   }
-
-  /** Spark's rewrite program addresses one logical MV; native catalog keys are
-    * private to the row-less compiler database. Preserve source references and
-    * string literals while removing native qualification from internal tables.
-    */
-  private[compiler] def normalizeCompiledViewNames(sql: String, nativeName: String, viewName: String): String =
-    OpenIvmCompiler.normalizeNativeViewObjects(sql, nativeName, viewName)
 
   /** Fully-qualified name of every source the request tracks, the key space a
     * snapshot pin has to resolve against.

@@ -42,9 +42,8 @@ import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler}
   *     for downstream `compile` calls.
   *   - openivm Test 4 (`target_dialect="spark"` in the CompileFacts JSON) →
   *     `OpenIvmCompiler` always emits SPARK-dialect SQL; verified for a
-  *     SIMPLE_PROJECTION view by asserting the generated SQL contains the
-  *     fully-qualified `memory.main.` prefix that the lpts SPARK pipeline
-  *     emits.
+  *     SIMPLE_PROJECTION view by checking that the initial load reads the
+  *     qualified Spark source and the refresh SQL names canonical delta helpers.
   *   - openivm Test 5 (AGGREGATE_GROUP compile returns non-empty SQL) →
   *     duplicate of Test 1 with a deliberately different shape, retained for
   *     1:1 parity.
@@ -171,8 +170,9 @@ abstract class CompileRefreshScenarios extends IvmParitySpecBase("compile-refres
     // OpenIvmCompiler always sets the SPARK dialect on its embedded DuckDB
     // session, so we verify by compiling a SIMPLE_PROJECTION view (which
     // exercises the lpts SPARK pipeline) and asserting the generated SQL
-    // maps the native compiler's private internal references to logical names.
-    it("emits logical internal references for SIMPLE_PROJECTION") {
+    // retains qualified source reads while binding private delta helpers by
+    // the canonical names the Spark refresh path registers.
+    it("emits SPARK-dialect SQL with qualified sources and canonical delta helpers for SIMPLE_PROJECTION") {
       val result = sharedCompiler.compile(
         CompileRequest(
           viewName = "mv_sales_proj",
@@ -183,13 +183,12 @@ abstract class CompileRefreshScenarios extends IvmParitySpecBase("compile-refres
       )
       result.refreshType shouldBe 2
       result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
-      result.sql should include("openivm_delta_sales")
-      result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
-      result.sql should include("FROM openivm_data_mv_sales_proj")
-      result.sql should not include "openivm_data___openivm_mv_"
       result.sql should include regex """(?is)\bFROM\s+openivm_delta_sales\b"""
       result.sql should not include "`memory`.`main`.`openivm_delta_sales`"
       result.initialLoadSql should include("`analytics`.`sales`")
+      result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
+      result.sql should include("FROM openivm_data_mv_sales_proj")
+      result.sql should not include "openivm_data___openivm_mv_"
     }
 
     // openivm Test 5 — AGGREGATE_GROUP shape, compile returns non-empty SQL.

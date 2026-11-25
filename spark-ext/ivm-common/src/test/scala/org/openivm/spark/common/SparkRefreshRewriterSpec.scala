@@ -1667,6 +1667,24 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       cascade should not include "FROM openivm_new_mv_r"
       full should contain("INSERT INTO `mydb`.`mv_r` SELECT * FROM openivm_new_mv_r")
 
+      val guarded = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(7L),
+        lineageCapture = Some(RewriteLineage.captureCompilerOutput(input, None)),
+        reusePublishedSnapshotForCascade = false
+      )
+      val guardedCascade = guarded.statements(full.indexOf(cascade))
+      guardedCascade should include("FROM openivm_old_mv_r")
+      guardedCascade should include("FROM openivm_new_mv_r")
+      guardedCascade should not include "FROM `mydb`.`mv_r`"
+      val ruleNames = guarded.lineage.get.outputs.flatMap(_.additionalRewriteRules).map(_.name)
+      ruleNames should not contain "reuse-published-snapshot-in-cascade"
+
       val partial = rewrite(
         input.replace(
           "DELETE FROM openivm_data_mv_r;",
@@ -1960,7 +1978,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           |SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_result_wradm_mv;
           |DROP TABLE openivm_run_result_wradm_mv;
           |""".stripMargin
-      val rewritten = SparkRefreshRewriter
+      val tagged = SparkRefreshRewriter
         .rewrite(
           compiledSql = sql,
           mvName = p52MvName,
@@ -1971,22 +1989,23 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           mvVersionBeforeRefresh = Some(3)
         )
         .statements
-      val markedDataInsert = rewritten
-        .find(_.contains("INSERT INTO `default`.`wradm_mv`"))
+      tagged.count(_.contains(SparkRefreshRewriter.RunningWindowSuffixMarker)) shouldBe 4
+      def findInsert(prefix: String): Option[String] =
+        tagged.find(s => SparkRefreshRewriter.stripExecutionMarker(s).startsWith(prefix))
+      val markedDataInsert = findInsert("INSERT INTO `default`.`wradm_mv`")
         .getOrElse(fail("materialized suffix data insert missing"))
       markedDataInsert should include(SparkRefreshRewriter.RunningWindowSuffixMarker)
       val dataInsert = SparkRefreshRewriter.stripExecutionMarker(markedDataInsert)
       dataInsert should include("(dm_s_symb, dm_date, dm_close, run_sum)")
       dataInsert should include("SELECT * FROM openivm_run_result_wradm_mv")
-      val markedAppend = rewritten
-        .find(_.contains("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`"))
+      val markedAppend = findInsert("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")
         .getOrElse(fail("materialized suffix cascade append missing"))
       markedAppend should include(SparkRefreshRewriter.RunningWindowSuffixMarker)
       val append = SparkRefreshRewriter.stripExecutionMarker(markedAppend)
       append should include("FROM openivm_run_result_wradm_mv")
       append should not include "openivm_timestamp"
       append should include("CURRENT_TIMESTAMP")
-      val executable = rewritten.map(SparkRefreshRewriter.stripExecutionMarker)
+      val executable = tagged.map(SparkRefreshRewriter.stripExecutionMarker)
       executable.count(_.startsWith("CACHE TABLE `openivm_run_result_wradm_mv`")) shouldBe 1
       executable.count(_.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
     }
@@ -2501,11 +2520,20 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           |INSERT INTO openivm_delta_v SELECT * FROM t3_join""".stripMargin
       val request = SparkRefreshRewriter.RegularNtermKeyRequest("orders", "t1_account_id", Some("BIGINT"))
 
-      SparkRefreshRewriter.regularNtermKeyRequests(sql) shouldBe Seq(request)
-      val rewritten = SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(sql, Map(request -> Seq("10", "20")))
-      rewritten should include("WHERE t2_account_id IN (10, 20)")
-      rewritten should include("FROM t1_projection")
-      rewritten should include("FROM `accounts` VERSION AS OF 17")
+      val wrapped = sql.replace(
+        "CAST(t1_account_id AS BIGINT) = t2_account_id",
+        "((t2_account_id) > (0)) AND ((CAST(t1_account_id AS BIGINT)) = (t2_account_id))"
+      )
+      for (program <- Seq(sql, wrapped)) {
+        SparkRefreshRewriter.regularNtermKeyRequests(program) shouldBe Seq(request)
+        val rewritten = SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(program, Map(request -> Seq("10", "20")))
+        rewritten should include("WHERE t2_account_id IN (10, 20)")
+        rewritten should include("FROM t1_projection")
+        rewritten should include("FROM `accounts` VERSION AS OF 17")
+      }
+      val disjunction = wrapped.replace("AND", "OR")
+      SparkRefreshRewriter.regularNtermKeyRequests(disjunction) shouldBe empty
+      SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(disjunction, Map(request -> Seq("10"))) shouldBe disjunction
     }
 
     it("leaves the N-term SQL unchanged when no bounded key set is available") {

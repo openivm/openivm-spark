@@ -333,7 +333,7 @@ object MvMetadata {
       columnStats = Map.empty,
       deltaStats = Map.empty
     )
-    // Native e773 ignores quantitative statistics. Keep all structural wire
+    // The native Spark compiler ignores quantitative statistics. Keep all structural wire
     // fields, plus the bridge-only RELY declaration switch, in the identity.
     val raw    = s"${structural.toJson}|declareRelyFk=${facts.declareRelyFk}"
     val digest = MessageDigest.getInstance("SHA-256").digest(raw.getBytes("UTF-8"))

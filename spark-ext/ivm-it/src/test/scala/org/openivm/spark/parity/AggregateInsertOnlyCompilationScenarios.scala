@@ -1,6 +1,6 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{RefreshSqlLogCatalog, RewriteLineage}
+import org.openivm.spark.common.{DeltaTableVersion, MvCatalog, RefreshSqlLogCatalog, RewriteLineage}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 /** Generic coverage for runtime selection of OpenIVM's insert-only aggregate
@@ -143,7 +143,7 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
   }
 
   describe("downstream identity") {
-    itCdf("keeps cascade SQL for a real downstream consumer") {
+    itCdf("publishes the complete change feed for a downstream consumer with one MERGE") {
       sql("CREATE TABLE aio_real_cascade_source (grp INT, value INT) USING DELTA")
       sql("INSERT INTO aio_real_cascade_source VALUES (1, 10)")
       val upstreamBody   = "SELECT grp, SUM(value) AS total FROM aio_real_cascade_source GROUP BY grp"
@@ -158,10 +158,29 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
       assertMvCorrect("aio_real_cascade_rollup", upstreamBody)
       assertMvCorrect("aio_rollup_consumer", downstreamBody)
 
-      val cascadingSql = rewrittenSql("aio_real_cascade_rollup").mkString("\n").toUpperCase
-      cascadingSql should include("CREATE OR REPLACE TABLE")
-      cascadingSql should include("MERGE INTO")
-      cascadingSql should not include "WHEN MATCHED THEN DELETE"
+      val statements = rewrittenSql("aio_real_cascade_rollup")
+      statements should have size 1
+      val merge = statements.head.toUpperCase
+      merge should include("MERGE INTO")
+      merge should include("__OPENIVM_DIRECT_DELTA")
+      merge should not include "WHEN MATCHED THEN DELETE"
+
+      val id       = spark.sessionState.sqlParser.parseTableIdentifier("aio_real_cascade_rollup")
+      val location = MvCatalog.lookup(spark, id).getOrElse(fail("missing upstream metadata")).location
+      val version  = DeltaTableVersion.requireLatest(spark, location)
+      val changes = spark.read
+        .format("delta")
+        .option("readChangeFeed", "true")
+        .option("startingVersion", version)
+        .option("endingVersion", version)
+        .load(location)
+        .select("grp", "total", "_change_type")
+      val expected = sql(
+        """SELECT * FROM VALUES (1, 10L, 'update_preimage'), (1, 12L, 'update_postimage'), (3, 30L, 'insert')
+          |AS changes(grp, total, _change_type)""".stripMargin
+      )
+      changes.exceptAll(expected).count() shouldBe 0L
+      expected.exceptAll(changes).count() shouldBe 0L
     }
   }
 }

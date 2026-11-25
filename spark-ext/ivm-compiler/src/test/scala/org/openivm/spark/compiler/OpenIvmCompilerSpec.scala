@@ -186,7 +186,7 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val input = s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
       s"FROM memory.main.openivm_data_$key JOIN `memory`.`main`.`openivm_delta_$key` d ON true " +
       s"JOIN openivm_run_result_$key r ON true JOIN memory.main.orders s ON true"
-    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+    OpenIvmCompiler.normalizeNativeViewObjects(input, key, "mv") shouldBe
       s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
       "FROM openivm_data_mv JOIN openivm_delta_mv d ON true " +
       "JOIN openivm_run_result_mv r ON true JOIN memory.main.orders s ON true"
@@ -196,7 +196,7 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val key     = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
     val literal = "escaped''" * 10000 + s"openivm_data_$key"
     val input   = s"SELECT '$literal' FROM memory.main.openivm_data_$key"
-    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+    OpenIvmCompiler.normalizeNativeViewObjects(input, key, "mv") shouldBe
       s"SELECT '$literal' FROM openivm_data_mv"
   }
 
@@ -206,14 +206,14 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val file = dir.resolve(s"openivm_compiled_queries_$key.sql")
     val req  = CompileRequest("mv", "SELECT id FROM src", Map("src" -> StructType.fromDDL("id INT")))
     try {
-      Files.write(
-        file,
-        s"create table memory.main.openivm_data_$key as SELECT id, 1 AS openivm_running_input_0 FROM memory.main.src;"
-          .getBytes("UTF-8")
-      )
+      val queries = s"create table memory.main.openivm_data_$key as SELECT ';openivm_delta_$key' AS label, " +
+        "id, 1 AS openivm_running_input_0 FROM memory.main.src; SELECT 99 AS trailing_statement;"
+      Files.write(file, queries.getBytes("UTF-8"))
       val initial = sharedCompiler.parseInitialLoadSql(dir, req, key)
       initial should include("openivm_running_input_0")
+      initial should include(s"';openivm_delta_$key'")
       initial should not include "memory.main."
+      initial should not include "trailing_statement"
     } finally {
       Files.deleteIfExists(file)
       Files.deleteIfExists(dir)
@@ -687,10 +687,10 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
   // With `target_dialect="spark"` set in the CompileFacts JSON payload,
   // OpenIVM compiles SIMPLE_PROJECTION via the lpts pipeline, which uses
   // fully-qualified `catalog.schema.table` identifiers in the generated SQL.
-  // The bridge removes the compiler's private catalog qualification from
-  // internal tables and maps encoded MV keys to the logical Spark view name.
+  // Real source reads retain their qualified names; compiler-private delta
+  // objects use the canonical helper names that Spark binds at refresh time.
 
-  it should "normalize SIMPLE_PROJECTION internal references to the Spark bridge's logical names" in {
+  it should "preserve qualified source reads and canonical delta helpers in SPARK dialect for SIMPLE_PROJECTION" in {
     val req = CompileRequest(
       viewName = "mv_sales_proj",
       viewSql = "SELECT region FROM sales WHERE amount > 0",
@@ -700,13 +700,12 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val result = sharedCompiler.compile(req)
     result.refreshType shouldBe 2
     result.refreshTypeName shouldBe "SIMPLE_PROJECTION"
-    result.sql should include("FROM    openivm_delta_sales")
-    result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
-    result.sql should include("FROM openivm_data_mv_sales_proj")
-    result.sql should not include "openivm_data___openivm_mv_"
     result.sql should include regex """(?is)\bFROM\s+openivm_delta_sales\b"""
     result.sql should not include "`memory`.`main`.`openivm_delta_sales`"
     result.initialLoadSql should include("`analytics`.`sales`")
+    result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
+    result.sql should include("FROM openivm_data_mv_sales_proj")
+    result.sql should not include "openivm_data___openivm_mv_"
   }
 
   // ── Test 6: Type mapping ──────────────────────────────────────────────────
@@ -1427,7 +1426,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
         |  : > "$fixture_dir/retried"
         |  printf 'unix_timestamp is unsupported\n' >&2
         |else
-        |  printf '%s\n' '{"refresh_type":1,"refresh_type_name":"FULL_REFRESH","sql":"SELECT 1;"}'
+        |  printf '%s\n' '{"openivm_bridge_view_key":"__openivm_mv_retry"}'
+        |  printf '%s\n' '{"refresh_type":1,"refresh_type_name":"FULL_REFRESH","sql":"SELECT 1 FROM memory.main.openivm_data___openivm_mv_retry;"}'
         |fi
         |""".stripMargin
     ) { (compiler, _, context) =>
@@ -1440,6 +1440,8 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       val request = cliTestRequest.copy(viewSql = "SELECT unix_timestamp(id) FROM cli_source")
       val result  = awaitCli(15.seconds) { compiler.compileWithTrace(request, tracer) }
       result.refreshTypeName shouldBe "FULL_REFRESH"
+      result.nativeSql shouldBe Some("SELECT 1 FROM memory.main.openivm_data___openivm_mv_retry;")
+      result.sql shouldBe s"SELECT 1 FROM openivm_data_${request.viewName};"
       val mapper = new com.fasterxml.jackson.databind.ObjectMapper()
       val rows   = events.iterator().asScala.map(line => mapper.readTree(line)).toVector
       rows.filter(_.path("phase").asText() == "worker_total").map(_.path("attempt").asInt()).toSet shouldBe Set(1, 2)

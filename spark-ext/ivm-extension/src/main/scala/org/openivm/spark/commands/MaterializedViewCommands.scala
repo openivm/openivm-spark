@@ -11,6 +11,7 @@ import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchTa
 import org.apache.spark.sql.catalyst.expressions.{
   Attribute,
   Alias,
+  And,
   AttributeReference,
   EqualNullSafe,
   Expression,
@@ -36,9 +37,27 @@ import org.apache.spark.sql.catalyst.plans.logical.{
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
-import org.apache.spark.sql.functions.{col, lit, sum}
+import org.apache.spark.sql.functions.{col, count, lit, sum, when}
 import org.apache.spark.sql.delta.DeltaLog
-import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StringType, StructField, StructType}
+import org.apache.spark.sql.types.{
+  ArrayType,
+  BooleanType,
+  ByteType,
+  DataType,
+  DateType,
+  DecimalType,
+  DoubleType,
+  FloatType,
+  IntegerType,
+  LongType,
+  MapType,
+  ShortType,
+  StringType,
+  StructField,
+  StructType,
+  TimestampNTZType,
+  TimestampType
+}
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.{OpenIvmStateBarrier, OpenIvmStateSync}
@@ -5508,14 +5527,11 @@ case class RefreshMaterializedViewCommand(
           SourceChangeLedger.reconcile(spark, changeFeedSources)
         }
 
-      // Phase D: memoize MvCatalog.list within this refresh.  The catalog is
-      // read in three places (schema_resolve, hasNoDownstreamConsumer probe,
-      // and record_cascade trigger-key resolution).  A RocksDB prefix scan
-      // each time costs 5-30 ms × 3 across heavy refresh programs.  Read once
-      // and reuse.  Defensive try/catch matches the original call sites.
-      lazy val allMvsCached: Seq[MvMetadata] =
-        try MvCatalog.list(spark)
-        catch { case _: Throwable => Seq.empty[MvMetadata] }
+      // Reuse one catalog listing for schema resolution and cascade decisions.
+      lazy val allMvsListing: Option[Seq[MvMetadata]] =
+        try Some(MvCatalog.list(spark))
+        catch { case NonFatal(_) => None }
+      lazy val allMvsCached: Seq[MvMetadata] = allMvsListing.getOrElse(Seq.empty)
 
       val collectedChangeBatches = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
         RefreshPerf.timePhase(refreshId, viewLabel, "collect_staging") {
@@ -5789,14 +5805,14 @@ case class RefreshMaterializedViewCommand(
       // are already at their current version.
       lazy val sourceSnapshotWatermarks: Map[String, ChangeWatermark] =
         if (cdfChangeBatches.nonEmpty) {
-          val current = propagation.currentWatermarks(spark, changeFeedSources) ++
-            sourceWatermarks.filter { case (source, _) => frozenSources.contains(source.toLowerCase) }
           val changed = cdfChangeBatches
             .groupBy(_.baseTable)
             .map { case (source, batches) =>
               source -> ChangeWatermark.DeltaVersion(batches.map(_.startVersionExclusive).min)
             }
-          current ++ changed
+          val unchanged = changeFeedSources.filterNot(changed.contains)
+          propagation.currentWatermarks(spark, unchanged) ++
+            sourceWatermarks.filter { case (source, _) => frozenSources.contains(source.toLowerCase) } ++ changed
         } else {
           sourceWatermarks
         }
@@ -5934,9 +5950,10 @@ case class RefreshMaterializedViewCommand(
       // Resolve current source schemas and check for schema drift. Include
       // upstream MV identity hashes so a DROP + recreate-with-same-schema
       // upstream is also caught.
-      val (freshSchemas, freshMvIdentityBySource, freshFingerprint) =
+      val (freshSchemas, freshFingerprint, currentSourceRelations) =
         profile.timeStep("metadata_pre_sql", "phase=schema_resolve") {
           RefreshPerf.timePhase(refreshId, viewLabel, "schema_resolve") {
+            val relations = Map.newBuilder[String, DataFrame]
             val schemas = meta.sourceTables.map { source =>
               val schema = preparedSourceAdvance
                 .flatMap(_.batchFor(source))
@@ -5944,7 +5961,11 @@ case class RefreshMaterializedViewCommand(
                   val expected = SourceVersionDelta.schemaAt(spark, source, batch.startVersionInclusive)
                   SourceVersionDelta.validate(spark, batch, expected)
                 }
-                .getOrElse(spark.table(source).schema)
+                .getOrElse {
+                  val relation = spark.table(source)
+                  relations += source -> relation
+                  relation.schema
+                }
               source -> schema
             }.toMap
             val identityMap: Map[String, String] = {
@@ -5956,7 +5977,7 @@ case class RefreshMaterializedViewCommand(
               }.toMap
             }
             val fp = MvCatalog.schemaFingerprint(schemas, identityMap)
-            (schemas, identityMap, fp)
+            (schemas, fp, relations.result())
           }
         }
       if (freshFingerprint != meta.sourceSchemaFingerprint) {
@@ -5972,11 +5993,6 @@ case class RefreshMaterializedViewCommand(
           )
         )
       }
-      // Reference the identity map so the unused-binding inference doesn't trip
-      // the -Ywarn-unused:imports compile flag (the value is intentionally kept
-      // local — debugging will want it).
-      val _ = freshMvIdentityBySource
-
       def verdictForSource(source: String): Option[BatchVerdict] =
         cdfBatchVerdicts
           .get(source)
@@ -6034,12 +6050,8 @@ case class RefreshMaterializedViewCommand(
           .toSet
       }
 
-      // Base-table inserts are not sufficient to prove a view delta monotone:
-      // an outer join can retract a NULL-padded row, and multi-source joins can
-      // generate cross terms. Restrict insert-only aggregate compilation to the
-      // single-source, join-free shape whose output is monotone under inserts.
-      // Downstream consumers do not affect this proof; they only determine
-      // whether the cascade delta must remain materialized.
+      // Restrict insert-only aggregation to a single source without joins.
+      // Appends to one side of an outer join can retract NULL-padded input rows.
       lazy val insertOnlyAggregateShapeCandidate: Boolean =
         !propagation.requiresDmlInterception &&
           meta.refreshType == RefreshTypeCode.AggregateGroup &&
@@ -6068,19 +6080,11 @@ case class RefreshMaterializedViewCommand(
           (batchInsertOnly || cdfRowsInsertOnly) &&
           changeBatches.nonEmpty
 
-      // CDF consumers discover an upstream MV through its Delta change feed.
-      // Only a grouped aggregate with no consumer may inline and discard its
-      // durable cascade delta. Non-terminal aggregates still use the same
-      // insert-only MIN/MAX merge, but retain OpenIVM's signed cascade output.
-      lazy val terminalInsertOnlyAggregate: Boolean =
-        insertOnlyAggregate && downstreamSourceKeysForThisMv.isEmpty
-
       profile.appendStep(
         "generate_refresh_sql.eligibility",
         s"batch_insert_only=$batchInsertOnly;cdf_rows_insert_only=$cdfRowsInsertOnly;" +
           s"insert_only_aggregate_shape_candidate=$insertOnlyAggregateShapeCandidate;" +
           s"insert_only_aggregate=$insertOnlyAggregate;" +
-          s"terminal_insert_only_aggregate=$terminalInsertOnlyAggregate;" +
           s"requires_dml_interception=${propagation.requiresDmlInterception};" +
           s"source_delta_shape=${sourceDeltaShape.toSeq.sortBy(_._1).mkString("|")};" +
           s"downstream_sources=${downstreamSourceKeysForThisMv.toSeq.sorted.mkString("|")}",
@@ -6101,8 +6105,12 @@ case class RefreshMaterializedViewCommand(
       lazy val constraintFacts = WorkloadFactsRegistry
         .forRefresh()
         .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
+      lazy val unconsumedCascade =
+        allMvsListing.isDefined && downstreamSourceKeysForThisMv.isEmpty &&
+          (meta.refreshType == RefreshTypeCode.AggregateGroup || meta.refreshType == RefreshTypeCode.AggregateHaving)
       lazy val cacheTierFacts = WorkloadFacts(
-        forceViewDeltaCascade = !terminalInsertOnlyAggregate,
+        // Delta CDF supplies pre/post images to downstream consumers of these grouped aggregates.
+        forceViewDeltaCascade = !insertOnlyAggregate && !unconsumedCascade,
         runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark),
         assumeInsertOnly = insertOnlyAggregate ||
           (FeatureGate.windowRunningIncrementalEnabled(spark) &&
@@ -6307,12 +6315,14 @@ case class RefreshMaterializedViewCommand(
                             s"stmt_kind=$kind;work_class=full_refresh_writer;segment=statement;" +
                             s"action_id=$qOrder:${attempt - 1}:statement;origin_class=executor_helper;credit_ns=0"
                         ) {
-                          val df = spark.sql(fullRefreshSql)
-                          df.write
-                            .format("delta")
-                            .mode("overwrite")
-                            .option("replaceWhere", "true")
-                            .save(meta.location)
+                          withPlanTimeBroadcastDisabled {
+                            val df = spark.sql(fullRefreshSql)
+                            df.write
+                              .format("delta")
+                              .mode("overwrite")
+                              .option("replaceWhere", "true")
+                              .save(meta.location)
+                          }
                         }
                         OpenIvmMetrics.recordWriterMetricsUnavailable(kind)
                         val ms = (System.nanoTime() - t0) / 1000000L
@@ -6964,17 +6974,21 @@ case class RefreshMaterializedViewCommand(
                 case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
               } ++ sourceSnapshotAdvanceOldVersions
               val snapshotRelations = snapshotVersions.flatMap { case (source, version) =>
-                if (
-                  !executionSnapshotPinsByQualified.keys.exists(_.equalsIgnoreCase(source)) &&
-                  MvProjectionSource.isProjection(spark, source)
-                ) {
-                  val tempName = s"openivm_source_snapshot_${source.split("\\.").last}"
-                  MvProjectionSource
-                    .read(spark, source, Map("versionAsOf" -> version.toString))
-                    .createOrReplaceTempView(tempName)
-                  sourceSnapshotTempViews += tempName
-                  Some(source -> s"`${tempName.replace("`", "``")}`")
-                } else None
+                if (executionSnapshotPinsByQualified.keys.exists(_.equalsIgnoreCase(source))) None
+                else {
+                  val relation = currentSourceRelations.get(source).orElse {
+                    try Some(spark.table(source))
+                    catch { case _: AnalysisException => None }
+                  }
+                  relation
+                    .flatMap(MvProjectionSource.readProjection(spark, _, Map("versionAsOf" -> version.toString)))
+                    .map { snapshot =>
+                      val tempName = s"openivm_source_snapshot_${source.split("\\.").last}"
+                      snapshot.createOrReplaceTempView(tempName)
+                      sourceSnapshotTempViews += tempName
+                      source -> s"`${tempName.replace("`", "``")}`"
+                    }
+                }
               }
               SparkRefreshRewriter.rewrite(
                 compiledSql = compiled.sql,
@@ -7022,6 +7036,11 @@ case class RefreshMaterializedViewCommand(
                 sourceSnapshotAdvanceOldVersions = sourceSnapshotAdvanceOldVersions,
                 mvVersionBeforeRefresh = Some(meta.lastVersion),
                 sourceSnapshotRelations = snapshotRelations,
+                // Keep the signed old/new cascade recognizable so the CDF path can
+                // replace it with the target's single Delta commit.
+                reusePublishedSnapshotForCascade = propagation.requiresDmlInterception ||
+                  meta.refreshType != RefreshTypeCode.WindowPartition ||
+                  !FeatureGate.windowSinglePassReplaceEnabled(spark),
                 lineageCapture =
                   if (profile.isActive || FeatureGate.generatedActionOwnershipEnabled(spark))
                     Some(RewriteLineage.captureCompilerOutput(compiled.sql, compiled.nativeSql))
@@ -7083,7 +7102,7 @@ case class RefreshMaterializedViewCommand(
             lazy val hasNonAppendRows = hasNonAppendSimpleProjectionRows(spark, viewDeltaPath)
 
             val directAggregateMerge: Option[String] =
-              if (terminalInsertOnlyAggregate && rewritten.statements.size == 2)
+              if (insertOnlyAggregate && rewritten.statements.size == 2)
                 SparkRefreshRewriter.inlineViewDeltaCtasIntoMerge(
                   rewritten.statements.head,
                   rewritten.statements(1),
@@ -7281,6 +7300,17 @@ case class RefreshMaterializedViewCommand(
               val idx = stmtCounter.getAndIncrement()
               executeSqlAt(sql, idx)
             }
+            def executeCdfWindowWrite(sql: String, idx: Int, fullDomainCdfMerge: Boolean): Unit = {
+              val key      = DeltaCommitClassifier.CommitUserMetadataKey
+              val previous = spark.conf.getOption(key)
+              spark.conf.set(key, DeltaCommitClassifier.WindowCdfCommit)
+              try executeSqlAt(sql, idx, fullDomainCdfMerge = fullDomainCdfMerge)
+              finally
+                previous match {
+                  case Some(value) => spark.conf.set(key, value)
+                  case None        => spark.conf.unset(key)
+                }
+            }
             def logSkippedStmt(stmtIdx: Int, kind: String): Unit = {
               advanceStmtCounterPast(stmtIdx)
               RefreshPerf.logStmt(refreshId, viewLabel, stmtIdx, kind, 0L)
@@ -7319,7 +7349,7 @@ case class RefreshMaterializedViewCommand(
                   globalWindowCdfMerge(spark, meta, mergeTargetId, select)
                 else
                   s"INSERT INTO TABLE delta.`${meta.location.replace("`", "``")}` REPLACE WHERE true $select"
-              executeSqlAt(
+              executeCdfWindowWrite(
                 targetSql,
                 0,
                 fullDomainCdfMerge = globalWindowCdfMergeEligible
@@ -7337,7 +7367,7 @@ case class RefreshMaterializedViewCommand(
               RefreshPerf.logStmt(refreshId, viewLabel, 0, "view_delta_inlined", 0L)
               profile.appendStep(
                 "execute_refresh_sql_stmt",
-                "statement=1;stmt_kind=view_delta_inlined;terminal=true;insert_only=true",
+                "statement=1;stmt_kind=view_delta_inlined;insert_only=true",
                 0L
               )
               profile.appendObservedSkip(
@@ -7348,10 +7378,21 @@ case class RefreshMaterializedViewCommand(
               RefreshPerf.emit(refreshId, viewLabel, "fast_path", "outcome='direct_insert_only_aggregate'")
               logInfo(
                 s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
-                  "outcome='direct_insert_only_aggregate' reason='terminal_insert_only_batch'"
+                  "outcome='direct_insert_only_aggregate' reason='insert_only_batch'"
               )
+              val merge = directAggregateMerge.get
+              val prunedMerge = profile.timeStep("prune_insert_only_aggregate_target") {
+                pruneInsertOnlyAggregateTarget(
+                  spark,
+                  meta.location,
+                  merge,
+                  rewritten.statements.head,
+                  viewDeltaPath,
+                  cdfChangeBatches
+                )
+              }
               withPlanTimeBroadcastDisabled {
-                executeSqlAt(directAggregateMerge.get, 1, fusedAggregateSources = Seq(0, 1))
+                executeSqlAt(prunedMerge, 1, fusedAggregateSources = Seq(0, 1))
               }
             } else if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
               // ── Scratch-CTAS fuse fast path ────────────────────────────────────
@@ -7366,7 +7407,7 @@ case class RefreshMaterializedViewCommand(
               // reads in-memory. If downstream MVs exist, the global-temp view name
               // is recorded as an MV_VIEW_DELTA staging ref so the cascade input is
               // still readable without writing the scratch to disk.
-              val fusedView: Option[String] =
+              val fusedScratch =
                 if (fuseEligible)
                   SparkRefreshRewriter
                     .extractViewDeltaCtasBody(
@@ -7378,7 +7419,7 @@ case class RefreshMaterializedViewCommand(
                       val qOrder      = qlogOrder.getAndIncrement()
                       val t0          = System.nanoTime()
                       try {
-                        val rowCount = withPlanTimeBroadcastDisabled {
+                        val (rowCount, scratch) = withPlanTimeBroadcastDisabled {
                           val d = profile.timeObservedStep(
                             "execute_refresh_sql_attempt",
                             s"statement=1;query_log_order=$qOrder;attempt=0;stmt_kind=view_delta_ctas;" +
@@ -7397,26 +7438,37 @@ case class RefreshMaterializedViewCommand(
                             d.createOrReplaceGlobalTempView(scratchView)
                             spark.catalog.cacheTable(s"global_temp.$scratchView")
                           }
-                          // Force materialisation so the cache holds the rows before
-                          // any negative-row probe / INSERT read. count() is the
-                          // cheapest force-eval action that respects the cache.
+                          val weight = col("openivm_multiplicity")
                           val actionLineage = lineageDetail(
                             Some(0),
-                            s"spark.table(global_temp.$scratchView).count()",
-                            "fused-cache-materialization@1",
+                            s"spark.table(global_temp.$scratchView).agg(rows,negativeOrNull,zero,nonUnit).head()",
+                            "fused-cache-weight-statistics@1",
                             "action_descriptor_utf8"
                           )
                           val owner = actionOwnership(qOrder, "fused_action", actionLineage)
-                          profile.timeObservedStep(
+                          val stats = profile.timeObservedStep(
                             "execute_refresh_sql_attempt",
                             s"statement=1;query_log_order=$qOrder;attempt=0;stmt_kind=view_delta_ctas;" +
                               s"work_class=incremental_sql;segment=fused_action;action_id=$qOrder:0:fused_action;" +
                               "origin_class=unknown;credit_ns=0;credit_reason=mixed_cache_materialization" +
                               actionLineage
                           ) {
-                            val scratch = spark.table(s"global_temp.$scratchView")
-                            GeneratedActionOwnership.withBoundary(spark, owner, "count")(scratch.count())
+                            GeneratedActionOwnership.withBoundary(spark, owner, "head") {
+                              spark.table(s"global_temp.$scratchView").agg(
+                                count(lit(1)),
+                                count(when(weight.isNull || weight < lit(0), lit(1))),
+                                count(when(weight === lit(0), lit(1))),
+                                count(when(weight =!= lit(1), lit(1)))
+                              ).head()
+                            }
                           }
+                          val rows        = stats.getLong(0)
+                          val hasRetracts = stats.getLong(1) != 0L
+                          val allPositive = !hasRetracts && stats.getLong(2) == 0L
+                          val partitions =
+                            if (allPositive && stats.getLong(3) == 0L) compactAppendPartitions(d.schema, rows)
+                            else None
+                          (rows, FusedProjectionScratch(scratchView, hasRetracts, allPositive, partitions))
                         }
                         val elapsedMs = (System.nanoTime() - t0) / 1000000L
                         advanceStmtCounterPast(0)
@@ -7442,7 +7494,7 @@ case class RefreshMaterializedViewCommand(
                           durationMs = elapsedMs
                         )
                         fusedScratchView = Some(scratchView)
-                        Some(scratchView)
+                        Some(scratch)
                       } catch {
                         case t: Throwable =>
                           sqlLog.record(
@@ -7467,19 +7519,9 @@ case class RefreshMaterializedViewCommand(
                     }
                 else None
 
-              // The non-append-row probe operates against either the cached temp
-              // view (fuse) or the on-disk scratch (existing path).
-              lazy val hasNonAppendRowsHere: Boolean = fusedView match {
-                case Some(view) =>
-                  spark
-                    .sql(
-                      s"SELECT 1 FROM ${StagingDeltaView.CachedViewDeltaRef.sqlRef(view)} " +
-                        "WHERE `openivm_multiplicity` < 0 OR `openivm_multiplicity` IS NULL LIMIT 1"
-                    )
-                    .head(1)
-                    .nonEmpty
-                case None => hasNonAppendRows
-              }
+              val fusedView = fusedScratch.map(_.viewName)
+              lazy val hasNonAppendRowsHere =
+                fusedScratch.fold(hasNonAppendRows)(_.hasNonAppendRows)
 
               if (fusedView.isEmpty) {
                 withPlanTimeBroadcastDisabled {
@@ -7525,12 +7567,15 @@ case class RefreshMaterializedViewCommand(
                         .contains("openivm_multiplicity") && mvCols.nonEmpty && mvCols.forall(deltaCols.contains) &&
                       // Partial-recompute deltas may carry keys with unknown weights.
                       // They cannot be expanded as an exact bag of appended rows.
-                      deltaRows.filter("openivm_multiplicity IS NULL OR openivm_multiplicity <= 0").head(1).isEmpty
+                      fusedScratch.fold(
+                        deltaRows.filter("openivm_multiplicity IS NULL OR openivm_multiplicity <= 0").head(1).isEmpty
+                      )(_.allPositive)
                     ) {
                       val colList = mvCols.map(c => s"`$c`").mkString(", ")
+                      val hint    = fusedScratch.flatMap(_.appendPartitions).fold("")(n => s"/*+ COALESCE($n) */ ")
                       Some(
                         s"""|INSERT INTO ${sqlIdent(mergeTargetId)} ($colList)
-                        |SELECT $colList FROM $src
+                        |SELECT $hint$colList FROM $src
                         |LATERAL VIEW EXPLODE(SEQUENCE(CAST(1 AS BIGINT), CAST(`openivm_multiplicity` AS BIGINT)))
                         |  _ivm_lv AS _ivm_i
                         |WHERE `openivm_multiplicity` > 0""".stripMargin
@@ -8016,7 +8061,9 @@ case class RefreshMaterializedViewCommand(
                           "outcome='window_single_pass_replace'"
                       )
                       withPlanTimeBroadcastDisabled {
-                        executeSqlAt(plan.directSql, idx, fullDomainCdfMerge = plan.fullDomainCdfMerge)
+                        if (propagation.requiresMvCdf)
+                          executeCdfWindowWrite(plan.directSql, idx, fullDomainCdfMerge = plan.fullDomainCdfMerge)
+                        else executeSqlAt(plan.directSql, idx, fullDomainCdfMerge = plan.fullDomainCdfMerge)
                       }
                   }
                 } else if (skipRedundantCdfWindowCascade) {
@@ -8164,8 +8211,11 @@ case class RefreshMaterializedViewCommand(
             // used as the bookkeeping count is either openivm_count_star
             // (added by openivm when the user query has no COUNT(*)) or the
             // user's COUNT(*) alias (extracted at CREATE time).
-            if (isCountMonoid(meta.refreshType) && !terminalInsertOnlyAggregate) {
-              countMonoidColumn(spark, mergeTargetId, meta).foreach { col =>
+            if (isCountMonoid(meta.refreshType) && !insertOnlyAggregate) {
+              // Keep the cleanup when the compiled program has no equivalent delete.
+              val programDeleted = (col: String) =>
+                EmptyGroupDelete.programDeletesEmptyGroups(rewritten.statements, mergeTargetId.table, col)
+              countMonoidColumn(spark, mergeTargetId, meta).filterNot(programDeleted).foreach { col =>
                 val q         = col.replace("`", "``")
                 val deleteSql = s"DELETE FROM ${sqlIdent(mergeTargetId)} WHERE `$q` = 0"
                 val idx       = stmtCounter.getAndIncrement()
@@ -8644,19 +8694,23 @@ case class RefreshMaterializedViewCommand(
     if (predicate.length > WindowReplaceMaxPredicateBytes) None else Some(predicate)
   }
 
+  private def cdfRows(spark: SparkSession, source: String, batches: Seq[CdfChangeBatch]): DataFrame =
+    MvProjectionSource.read(
+      spark,
+      source,
+      Map(
+        "readChangeFeed"  -> "true",
+        "startingVersion" -> (batches.map(_.startVersionExclusive).min + 1L).toString,
+        "endingVersion"   -> batches.map(_.endVersionInclusive).max.toString
+      )
+    )
+
   private def cdfBatchesContainOnlyInserts(spark: SparkSession, batches: Seq[CdfChangeBatch]): Boolean =
     try {
       batches
         .groupBy(_.baseTable)
         .forall { case (source, sourceBatches) =>
-          val startVersion = sourceBatches.map(_.startVersionExclusive).min + 1L
-          val endVersion   = sourceBatches.map(_.endVersionInclusive).max
-          spark.read
-            .format("delta")
-            .option("readChangeFeed", "true")
-            .option("startingVersion", startVersion)
-            .option("endingVersion", endVersion)
-            .table(source)
+          cdfRows(spark, source, sourceBatches)
             .filter("_change_type IS NULL OR _change_type <> 'insert'")
             .head(1)
             .isEmpty
@@ -8806,6 +8860,29 @@ case class RefreshMaterializedViewCommand(
 
   private case object WindowSinglePassNoAffectedPartitions extends WindowSinglePassPlan
 
+  private case class FusedProjectionScratch(
+      viewName: String,
+      hasNonAppendRows: Boolean,
+      allPositive: Boolean,
+      appendPartitions: Option[Int]
+  )
+
+  /** Small fixed-width, unit-weight bags need few output files. Coalesce only
+    * their direct append, after the cached delta has been computed in parallel.
+    */
+  private def compactAppendPartitions(schema: StructType, rows: Long): Option[Int] =
+    if (
+      rows <= 0 || rows > 32768 || schema.length > 64 || !schema.fields.forall { field =>
+        field.dataType match {
+          case BooleanType | ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType | DateType |
+              TimestampType | TimestampNTZType | _: DecimalType =>
+            true
+          case _ => false
+        }
+      }
+    ) None
+    else Some(((rows + 4095) / 4096).toInt)
+
   private case class WindowSinglePassWrite(
       directSql: String,
       cascadeSql: String,
@@ -8863,6 +8940,68 @@ case class RefreshMaterializedViewCommand(
             |HAVING SUM(CAST(`openivm_multiplicity` AS BIGINT)) <> 0
             |LIMIT 1""".stripMargin
       )
+    }
+  }
+
+  private def pruneInsertOnlyAggregateTarget(
+      spark: SparkSession,
+      targetLocation: String,
+      merge: String,
+      deltaCtas: String,
+      deltaPath: String,
+      batches: Seq[CdfChangeBatch]
+  ): String = {
+    // Only spend a Spark job collecting keys when CDF statistics indicate a small
+    // delta and there are enough target files to benefit from file skipping.
+    val maxKeys = 8
+    if (batches.size != 1) return merge
+    try {
+      val snapshot = DeltaLog.forTable(spark, new Path(targetLocation)).update()
+      if (snapshot.numOfFiles <= maxKeys) return merge
+      val stats = SparkDeltaStatsService.forRefresh().deltaStatsFor(spark, batches)
+      if (!stats.get(batches.head.baseTable).flatMap(_.rowCount).exists(rows => rows > 0 && rows <= 128)) return merge
+
+      def keyColumns(condition: Expression): Seq[String] = condition match {
+        case And(left, right) => keyColumns(left) ++ keyColumns(right)
+        case EqualNullSafe(v: UnresolvedAttribute, d: UnresolvedAttribute) =>
+          (v.nameParts, d.nameParts) match {
+            case (Seq("v", target), Seq("d", source)) if target == source => Seq(target)
+            case _                                                        => Nil
+          }
+        case _ => Nil
+      }
+
+      val keys = spark.sessionState.sqlParser
+        .parsePlan(merge)
+        .collect {
+          case m: MergeIntoTable if m.notMatchedBySourceActions.isEmpty => keyColumns(m.mergeCondition)
+        }
+        .flatten
+      if (keys.isEmpty) return merge
+      val source = SparkRefreshRewriter.extractViewDeltaCtasBody(deltaCtas, deltaPath).map(spark.sql)
+      val pruned = for {
+        delta <- source
+        key <- keys.find(k =>
+          delta.schema.fields.exists { field =>
+            field.name == k && Set[DataType](ByteType, ShortType, IntegerType, LongType)(field.dataType)
+          }
+        )
+        values = delta.select(col(quoteCol(key))).distinct().limit(maxKeys + 1).collect()
+        if values.nonEmpty && values.length <= maxKeys
+      } yield {
+        val target = s"v.${quoteCol(key)}"
+        // Delta reduces an IN list to a min/max range for file skipping.
+        val predicate = values
+          .map(row => if (row.isNullAt(0)) s"$target IS NULL" else s"$target = ${row.get(0)}")
+          .sorted
+          .mkString(" OR ")
+        SparkRefreshRewriter.restrictAggregateMergeTarget(merge, predicate)
+      }
+      pruned.getOrElse(merge)
+    } catch {
+      case NonFatal(e) =>
+        logWarning(s"[openivm-mv] aggregate MERGE file pruning skipped: ${e.getMessage}")
+        merge
     }
   }
 
