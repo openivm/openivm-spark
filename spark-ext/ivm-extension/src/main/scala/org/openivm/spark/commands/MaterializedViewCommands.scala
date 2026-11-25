@@ -9838,8 +9838,6 @@ case class RefreshMaterializedViewCommand(
           throw new IllegalStateException(s"Catalog did not commit the refresh witness for $viewNameStr")
       }
       propagation.markConsumed(spark, viewNameStr, changeBatches)
-      witnessToken.foreach(token =>
-        StagingCatalog.recordCompletedRefresh(spark, viewNameStr, token, newVersion, previousWitness.get.tableId))
     }
 
     // Non-cascade trigger synthesis is intercept-mode only.  Under CDF mode
@@ -9922,6 +9920,8 @@ case class RefreshMaterializedViewCommand(
         }
       }
     }
+    witnessToken.foreach(token =>
+      StagingCatalog.recordCompletedRefresh(spark, viewNameStr, token, newVersion, previousWitness.get.tableId))
   }
 
   /** Consume source changes after proving their materialized runtime delta views
