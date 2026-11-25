@@ -51,10 +51,31 @@ private[common] object GroupCommitDeltaCdfWatermarkBackend extends CdfWatermarkB
   override def ensureTables(spark: SparkSession): Unit = Delegate.ensureTables(spark)
 
   override def get(spark: SparkSession, viewName: String, source: String): Option[Long] =
-    Delegate.get(spark, viewName, source)
+    getAll(spark, viewName, Seq(source)).get(source)
 
-  override def getAll(spark: SparkSession, viewName: String, sources: Seq[String]): Map[String, Long] =
-    Delegate.getAll(spark, viewName, sources)
+  /** The greater of each source's `cdf_watermarks` row and the live watermark folded into the view's catalog row by
+    * [[DeltaMvCatalogBackend.advanceWithFoldedCdfWatermarks]], read from both tables' latest snapshots in one job.
+    */
+  override def getAll(spark: SparkSession, viewName: String, sources: Seq[String]): Map[String, Long] = {
+    val distinctSources = sources.distinct
+    if (distinctSources.isEmpty) Map.empty
+    else {
+      Delegate.ensureTables(spark)
+      val stored = spark.read
+        .format("delta")
+        .load(path(spark))
+        .filter(col(ViewName) === lit(viewName) && col(Source).isin(distinctSources: _*))
+        .select(Source, Version)
+      DeltaMvCatalogBackend
+        .liveCdfWatermarks(spark, viewName, distinctSources)
+        .fold(stored)(stored.unionByName(_))
+        .collect()
+        .foldLeft(Map.empty[String, Long]) { (acc, row) =>
+          val (source, version) = row.getString(0) -> row.getLong(1)
+          acc.updated(source, acc.get(source).fold(version)(math.max(_, version)))
+        }
+    }
+  }
 
   override def put(spark: SparkSession, viewName: String, source: String, version: Long): Unit =
     putAll(spark, viewName, Map(source -> version))
@@ -121,8 +142,13 @@ private[common] object GroupCommitDeltaCdfWatermarkBackend extends CdfWatermarkB
       .execute()
   }
 
-  override def removeForBaseTable(spark: SparkSession, baseTable: String): Unit =
+  override def removeForBaseTable(spark: SparkSession, baseTable: String): Unit = {
     Delegate.removeForBaseTable(spark, baseTable)
+    DeltaMvCatalogBackend.removeLiveCdfWatermarksForSource(spark, baseTable)
+  }
 
-  override def removeForView(spark: SparkSession, viewName: String): Unit = Delegate.removeForView(spark, viewName)
+  override def removeForView(spark: SparkSession, viewName: String): Unit = {
+    Delegate.removeForView(spark, viewName)
+    DeltaMvCatalogBackend.removeLiveCdfWatermarksForView(spark, viewName)
+  }
 }

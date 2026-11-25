@@ -9824,7 +9824,7 @@ case class RefreshMaterializedViewCommand(
     val previousWitness =
       if (interceptWitnessEnabled(spark)) StagingCatalog.completedRefreshWitness(spark, witnessName) else None
     val witnessToken = previousWitness.map(_ => UUID.randomUUID().toString)
-    profile.timeObservedStep("finalize_catalog_advance") {
+    val watermarksCommitted = profile.timeObservedStep("finalize_catalog_advance") {
       replacementMeta match {
         case Some(updated) =>
           MvCatalog.upsert(
@@ -9834,6 +9834,7 @@ case class RefreshMaterializedViewCommand(
               properties = updated.properties ++ witnessToken.map(StagingCatalog.CompletedRefreshTokenKey -> _)
             )
           )
+          false
         case None if propagation.mode == ChangeFeedMode.Cdf =>
           val cdfWatermarks = changeBatches
             .collect {
@@ -9842,10 +9843,13 @@ case class RefreshMaterializedViewCommand(
             }
             .groupBy(_._1)
             .map { case (baseTable, versions) => baseTable -> versions.map(_._2).max }
-          MvCatalog.advanceStoredWithCdfWatermarks(spark, meta.name, newVersion, cdfWatermarks)
+          MvCatalog.advanceStoredFoldingCdfWatermarks(spark, meta.name, viewNameStr, newVersion, cdfWatermarks)
         case None if witnessToken.isDefined =>
           MvCatalog.advanceWithInterceptWitness(spark, meta.name, newVersion, witnessToken.get)
-        case None => MvCatalog.advance(spark, name, newVersion)
+          false
+        case None =>
+          MvCatalog.advance(spark, name, newVersion)
+          false
       }
     }
 
@@ -9857,7 +9861,8 @@ case class RefreshMaterializedViewCommand(
         if (!actual.contains(token))
           throw new IllegalStateException(s"Catalog did not commit the refresh witness for $viewNameStr")
       }
-      propagation.markConsumed(spark, viewNameStr, changeBatches)
+      // A folded advance already committed these watermarks with the version.
+      if (!watermarksCommitted) propagation.markConsumed(spark, viewNameStr, changeBatches)
     }
 
     // Non-cascade trigger synthesis is intercept-mode only.  Under CDF mode

@@ -1015,6 +1015,25 @@ object MvCatalog {
       watermarks: Map[String, Long]
   ): Unit = backend(spark).advanceWithCdfWatermarks(spark, storedName, newVersion, watermarks)
 
+  /** [[advanceStoredWithCdfWatermarks]] that, on the Delta catalog, also commits `watermarks` as the consumed CDF
+    * watermarks recorded under `viewName` in the same commit. Returns false when they were not committed, so the caller
+    * must still mark them consumed under `viewName`.
+    */
+  private[spark] def advanceStoredFoldingCdfWatermarks(
+      spark: SparkSession,
+      storedName: TableIdentifier,
+      viewName: String,
+      newVersion: Long,
+      watermarks: Map[String, Long]
+  ): Boolean =
+    if (FeatureGate.deltaCatalogEnabled(spark) && DeltaMvCatalogBackend.foldsCdfWatermarksOf(storedName, viewName)) {
+      DeltaMvCatalogBackend.advanceWithFoldedCdfWatermarks(spark, storedName, newVersion, watermarks)
+      true
+    } else {
+      advanceStoredWithCdfWatermarks(spark, storedName, newVersion, watermarks)
+      false
+    }
+
   def updateProperties(
       spark: SparkSession,
       name: TableIdentifier,
