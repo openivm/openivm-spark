@@ -9839,7 +9839,7 @@ case class RefreshMaterializedViewCommand(
             }
             .groupBy(_._1)
             .map { case (baseTable, versions) => baseTable -> versions.map(_._2).max }
-          MvCatalog.advanceWithCdfWatermarks(spark, name, newVersion, cdfWatermarks)
+          MvCatalog.advanceStoredWithCdfWatermarks(spark, meta.name, newVersion, cdfWatermarks)
         case None if witnessToken.isDefined =>
           MvCatalog.advanceWithInterceptWitness(spark, meta.name, newVersion, witnessToken.get)
         case None => MvCatalog.advance(spark, name, newVersion)
