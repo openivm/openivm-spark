@@ -4,6 +4,7 @@ import java.io.File
 
 import org.openivm.spark.common.{FeatureGate, MvCatalog, OpenIvmStatePaths, RefreshProfileCatalog, StagingCatalog}
 import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
+import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 class LegacyInterceptWitnessSpec extends IvmParitySpecBase("legacy-intercept-witness") with InterceptMode {
   override protected def extraSparkConf: Map[String, String] = Map(
@@ -40,7 +41,9 @@ class LegacyInterceptWitnessSpec extends IvmParitySpecBase("legacy-intercept-wit
 
     sql(s"INSERT INTO $source VALUES (1, 25)")
     RefreshProfileCatalog.removeAll(spark)
+    val catalogAdvances = OpenIvmMetrics.timer("catalog.mv_catalog.advance").getCount
     refreshMv(s"default.$mv")
+    OpenIvmMetrics.timer("catalog.mv_catalog.advance").getCount should be > catalogAdvances
     val profile = RefreshProfileCatalog.scanAll(spark).map(row => s"${row.stepName}:${row.detail}").mkString("\n")
     profile should include("outcome=incremental_executed")
     assertMvCorrect(mv, query)

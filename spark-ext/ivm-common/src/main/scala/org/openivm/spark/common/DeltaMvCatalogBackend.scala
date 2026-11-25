@@ -185,17 +185,19 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
       name: TableIdentifier,
       newVersion: Long,
       token: String
-  ): Unit = withDeltaRetry {
-    ensureTables(spark)
-    val key      = StagingCatalog.CompletedRefreshTokenKey
-    val retained = map_filter(col(Properties), (existingKey, _) => existingKey =!= lit(key))
-    val proof    = map_from_arrays(array(lit(key)), array(lit(token)))
-    DeltaTable
-      .forPath(spark, path(spark))
-      .update(
-        col(Name) === lit(serializedName(name)) && col(LastVersion) <= lit(newVersion),
-        Map(LastVersion -> lit(newVersion), Properties -> map_concat(retained, proof))
-      )
+  ): Unit = OpenIvmMetrics.time("catalog.mv_catalog.advance") {
+    withDeltaRetry {
+      ensureTables(spark)
+      val key      = StagingCatalog.CompletedRefreshTokenKey
+      val retained = map_filter(col(Properties), (existingKey, _) => existingKey =!= lit(key))
+      val proof    = map_from_arrays(array(lit(key)), array(lit(token)))
+      DeltaTable
+        .forPath(spark, path(spark))
+        .update(
+          col(Name) === lit(serializedName(name)) && col(LastVersion) <= lit(newVersion),
+          Map(LastVersion -> lit(newVersion), Properties -> map_concat(retained, proof))
+        )
+    }
   }
 
   override def advanceWithCdfWatermarks(
