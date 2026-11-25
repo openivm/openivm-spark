@@ -28,7 +28,7 @@ class LegacyInterceptWitnessSpec extends IvmParitySpecBase("legacy-intercept-wit
     spark.conf.set(FeatureGate.StateSyncAsyncEnabledKey, "false")
     sql(s"INSERT INTO $source VALUES (1, 25)")
     RefreshProfileCatalog.removeAll(spark)
-    refreshMv(mv)
+    refreshMv(s"default.$mv")
     val profile = RefreshProfileCatalog.scanAll(spark).map(row => s"${row.stepName}:${row.detail}").mkString("\n")
     profile should include("outcome=incremental_executed")
     assertMvCorrect(mv, query)
@@ -36,6 +36,12 @@ class LegacyInterceptWitnessSpec extends IvmParitySpecBase("legacy-intercept-wit
     meta.properties.contains(StagingCatalog.CompletedRefreshTokenKey) shouldBe true
 
     sql(s"INSERT INTO $source VALUES (1, 5)")
+    RefreshProfileCatalog.removeAll(spark)
+    refreshMv(mv)
+    RefreshProfileCatalog.scanAll(spark).map(row => s"${row.stepName}:${row.detail}").mkString("\n") should
+      include("outcome=incremental_executed")
+    assertMvCorrect(mv, query)
+    sql(s"INSERT INTO $source VALUES (2, 5)")
     OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => throw new java.io.IOException("injected crash"))
     try {
       intercept[Exception](refreshMv(mv))

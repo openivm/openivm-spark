@@ -9814,8 +9814,9 @@ case class RefreshMaterializedViewCommand(
     val newVersion = committedDataVersion.getOrElse {
       DeltaTableVersion.requireLatest(spark, meta.location)
     }
+    val witnessName = metaName(meta.name)
     val previousWitness =
-      if (interceptWitnessEnabled(spark)) StagingCatalog.completedRefreshWitness(spark, viewNameStr) else None
+      if (interceptWitnessEnabled(spark)) StagingCatalog.completedRefreshWitness(spark, witnessName) else None
     val witnessToken = previousWitness.map(_ => UUID.randomUUID().toString)
     profile.timeObservedStep("finalize_catalog_advance") {
       replacementMeta match {
@@ -9934,7 +9935,7 @@ case class RefreshMaterializedViewCommand(
       }
     }
     witnessToken.foreach(token =>
-      StagingCatalog.recordCompletedRefresh(spark, viewNameStr, token, newVersion, previousWitness.get.tableId)
+      StagingCatalog.recordCompletedRefresh(spark, witnessName, token, newVersion, previousWitness.get.tableId)
     )
   }
 
