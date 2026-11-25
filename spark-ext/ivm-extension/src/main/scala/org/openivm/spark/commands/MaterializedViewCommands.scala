@@ -5551,9 +5551,14 @@ case class RefreshMaterializedViewCommand(
       val compileCacheEnabled      = FeatureGate.compileClassificationCacheEnabled(spark)
       val constraintFacts          = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
       val runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark)
+      // OpenIVM's aggregate cascade rows (retract companions, old/new group snapshots) exist
+      // only for downstream MVs. Without one, the refresh neither writes nor reads them.
+      val unconsumedCascade =
+        downstreamSourceKeysForThisMv.isEmpty &&
+          (meta.refreshType == RefreshTypeCode.AggregateGroup || meta.refreshType == RefreshTypeCode.AggregateHaving)
       val compileFacts = WorkloadFacts(
         // Delta CDF supplies pre/post images to downstream consumers of these grouped aggregates.
-        forceViewDeltaCascade = !insertOnlyAggregate,
+        forceViewDeltaCascade = !insertOnlyAggregate && !unconsumedCascade,
         assumeInsertOnly = insertOnlyAggregate ||
           (runningWindowIncremental && meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
         runningWindowIncremental = runningWindowIncremental,
