@@ -9887,6 +9887,7 @@ case class RefreshMaterializedViewCommand(
           .distinct
 
         if (downstreamSourceKeys.nonEmpty) {
+          OpenIvmStateBarrier.admitStateWrite(spark)
           val warehouse   = spark.conf.get("spark.sql.warehouse.dir").stripSuffix("/")
           val safeName    = viewNameStr.replaceAll("[^A-Za-z0-9_.-]", "_")
           val triggerPath = s"$warehouse/_openivm/triggers/$safeName/${UUID.randomUUID().toString}"
