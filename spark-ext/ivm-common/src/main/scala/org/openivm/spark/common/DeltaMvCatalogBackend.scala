@@ -19,7 +19,7 @@ import org.apache.spark.sql.functions.{
   when
 }
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.{Column, Row, SparkSession}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import scala.jdk.CollectionConverters._
@@ -58,7 +58,9 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
     )
   )
 
-  private def path(spark: SparkSession): String = FeatureGate.catalogPath(spark).stripSuffix("/") + "/mv_metadata"
+  private def pathAt(catalogPath: String): String = catalogPath.stripSuffix("/") + "/mv_metadata"
+
+  private def path(spark: SparkSession): String = pathAt(FeatureGate.catalogPath(spark))
 
   private def serializedName(id: TableIdentifier): String =
     id.database.fold(id.identifier)(db => s"$db.${id.identifier}")
@@ -205,35 +207,87 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
       name: TableIdentifier,
       newVersion: Long,
       watermarks: Map[String, Long]
-  ): Unit = {
+  ): Unit =
+    if (watermarks.isEmpty) advance(spark, name, newVersion)
+    else
+      withDeltaRetry {
+        ensureTables(spark)
+        DeltaTable
+          .forPath(spark, path(spark))
+          .update(
+            col(Name) === lit(serializedName(name)) && col(LastVersion) < lit(newVersion),
+            Map(LastVersion -> lit(newVersion), Properties -> mergedWatermarkProperties(col(Properties), watermarks))
+          )
+      }
+
+  /** `properties` with each `_ivm_watermark:<source>` raised to at least its version in `watermarks`. */
+  private def mergedWatermarkProperties(properties: Column, watermarks: Map[String, Long]): Column = {
     val entries = watermarks.toSeq
       .map { case (source, version) =>
         s"${MvMetadata.WatermarkKeyPrefix}$source" -> version
       }
       .sortBy(_._1)
-    if (entries.isEmpty) advance(spark, name, newVersion)
+    if (entries.isEmpty) properties
+    else {
+      val keys = array(entries.map { case (key, _) => lit(key) }: _*)
+      val values = array(entries.map { case (key, version) =>
+        val existing = properties.getItem(key)
+        val previous = when(existing.startsWith("v:"), substring(existing, 3, 20).cast("long"))
+          .otherwise(lit(Long.MinValue))
+        coalesce(
+          concat(lit("v:"), greatest(previous, lit(version)).cast("string")),
+          lit(ChangeWatermark.DeltaVersion(version).encode)
+        )
+      }: _*)
+      val retained = map_filter(properties, (key, _) => not(array_contains(keys, key)))
+      map_concat(retained, map_from_arrays(keys, values))
+    }
+  }
+
+  /** Rolls each row forward to its flushed refresh record, matching name, location and Delta table id. */
+  private[common] def advanceRecorded(
+      spark: SparkSession,
+      catalogPath: String,
+      records: Seq[MvRefreshRecords.Pending]
+  ): Unit = if (records.nonEmpty) OpenIvmMetrics.time("catalog.mv_catalog.advance") {
+    def recorded(record: MvRefreshRecords.Pending): Column =
+      col(Name) === lit(record.storedName) && col(Location) === lit(record.location) &&
+        col(Properties).getItem(MvMetadata.TargetDeltaTableIdKey) === lit(record.tableId) &&
+        col(LastVersion) < lit(record.version)
+    withDeltaRetry {
+      DeltaTable
+        .forPath(spark, pathAt(catalogPath))
+        .update(
+          records.map(recorded).reduce(_ || _),
+          Map(
+            LastVersion -> records.foldRight(col(LastVersion)) { (record, otherwise) =>
+              when(recorded(record), lit(record.version)).otherwise(otherwise)
+            },
+            Properties -> records.foldRight(col(Properties)) { (record, otherwise) =>
+              when(recorded(record), mergedWatermarkProperties(col(Properties), record.consumed)).otherwise(otherwise)
+            }
+          )
+        )
+    }
+  }
+
+  /** Stored location, Delta table id and version of each named row; empty when the catalog does not exist. */
+  private[common] def storedVersions(
+      spark: SparkSession,
+      catalogPath: String,
+      names: Seq[String]
+  ): Map[String, (String, Option[String], Long)] = {
+    val target = new org.apache.hadoop.fs.Path(pathAt(catalogPath))
+    if (names.isEmpty || !target.getFileSystem(spark.sessionState.newHadoopConf()).exists(target)) Map.empty
     else
-      withDeltaRetry {
-        ensureTables(spark)
-        val keys       = array(entries.map { case (key, _) => lit(key) }: _*)
-        val properties = col(Properties)
-        val values = array(entries.map { case (key, version) =>
-          val existing = properties.getItem(key)
-          val previous = when(existing.startsWith("v:"), substring(existing, 3, 20).cast("long"))
-            .otherwise(lit(Long.MinValue))
-          coalesce(
-            concat(lit("v:"), greatest(previous, lit(version)).cast("string")),
-            lit(ChangeWatermark.DeltaVersion(version).encode)
-          )
-        }: _*)
-        val retained = map_filter(properties, (key, _) => not(array_contains(keys, key)))
-        DeltaTable
-          .forPath(spark, path(spark))
-          .update(
-            col(Name) === lit(serializedName(name)) && col(LastVersion) < lit(newVersion),
-            Map(LastVersion -> lit(newVersion), Properties -> map_concat(retained, map_from_arrays(keys, values)))
-          )
-      }
+      spark.read
+        .format("delta")
+        .load(pathAt(catalogPath))
+        .filter(col(Name).isin(names.distinct: _*))
+        .select(col(Name), col(Location), col(Properties).getItem(MvMetadata.TargetDeltaTableIdKey), col(LastVersion))
+        .collect()
+        .map(row => row.getString(0) -> ((row.getString(1), Option(row.getString(2)), row.getLong(3))))
+        .toMap
   }
 
   override def updateProperties(
