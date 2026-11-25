@@ -152,6 +152,14 @@ private[spark] object DeltaGroupCommit {
       arrival
     }
 
+  /** The refresh on this thread reaches no further catalog group commit, so open batches stop waiting for it. */
+  def departCurrent(): Unit = Option(current.get).foreach { arrival =>
+    if (readyArrivals.remove(arrival)) {
+      val it = queues.values.iterator
+      while (it.hasNext) it.next().forget(arrival)
+    }
+  }
+
   private def currentRefresh(): Option[AnyRef] = Option(current.get).filter(readyArrivals.contains)
 
   private def readyRefreshes: Int = readyArrivals.size

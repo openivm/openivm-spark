@@ -3,7 +3,8 @@ package org.openivm.spark.common
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.delta.DeltaLog
+import org.apache.spark.sql.delta.actions.{CommitInfo, SetTransaction}
+import org.apache.spark.sql.delta.{DeltaLog, DeltaOperations}
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 import org.openivm.spark.common.rocksdb.{
@@ -21,7 +22,11 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.{FileVisitResult, Files, Path, Paths, SimpleFileVisitor}
 import java.security.MessageDigest
 import java.sql.Timestamp
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.{ConcurrentHashMap, Executors, ScheduledExecutorService, ThreadFactory, TimeUnit}
+import scala.jdk.CollectionConverters._
 import scala.util.Try
+import scala.util.control.NonFatal
 
 /**
  * Metadata record for a single materialized view tracked by openivm-spark.
@@ -1029,8 +1034,10 @@ object MvCatalog {
     if (FeatureGate.deltaCatalogEnabled(spark))
       OpenIvmStateBarrier.withMutation(spark) {
         StagingCatalog.consumptionLifecycleLock(spark, viewName).synchronized {
-          if (backend(spark).lookup(spark, name).isEmpty)
+          if (backend(spark).lookup(spark, name).isEmpty) {
+            MvRefreshRecords.discard(spark, name)
             StagingCatalog.removeConsumedForView(spark, viewName)
+          }
           backend(spark).prepareCreate(spark, name)
         }
       }
@@ -1042,9 +1049,11 @@ object MvCatalog {
 
   def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
     resolveLookup(spark, name, storedReader(spark), allowUnresolvedLegacy = true)
+      .map(MvRefreshRecords.reconcile(spark, _))
 
   private[spark] def lookupForRelation(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
     resolveLookup(spark, name, storedReader(spark), allowUnresolvedLegacy = false)
+      .map(MvRefreshRecords.reconcile(spark, _))
 
   private[spark] def lookupStored(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
     storedReader(spark)(name)
@@ -1052,16 +1061,46 @@ object MvCatalog {
   def lookupReadOnly(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
     val selected = backend(spark)
     resolveLookup(spark, name, selected.lookupReadOnly(spark, _), allowUnresolvedLegacy = false)
+      .map(MvRefreshRecords.reconcile(spark, _))
   }
 
   def list(spark: SparkSession): Seq[MvMetadata] =
-    committedCatalog(spark).fold(backend(spark).list(spark))(_.views)
+    committedCatalog(spark).fold(backend(spark).list(spark))(_.views).map(MvRefreshRecords.reconcile(spark, _))
 
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] =
-    OpenIvmStateBarrier.withMutation(spark) { backend(spark).viewsForSource(spark, table) }
+    OpenIvmStateBarrier.withMutation(spark) {
+      backend(spark).viewsForSource(spark, table).map(MvRefreshRecords.reconcile(spark, _))
+    }
 
-  def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
-    backend(spark).advance(spark, lookup(spark, name).map(_.name).getOrElse(name), newVersion)
+  /** Records a CDF refresh in the MV's own Delta log and defers the catalog bookkeeping; false means the caller must
+    * run the synchronous catalog advance and watermark write. */
+  private[spark] def commitRefreshRecord(
+      spark: SparkSession,
+      meta: MvMetadata,
+      viewName: String,
+      dataVersion: Long,
+      watermarks: Map[String, Long]
+  ): Boolean = MvRefreshRecords.commit(spark, meta, viewName, dataVersion, watermarks)
+
+  /** The stored row and the watermarks recorded only in the MV log, which a synchronous advance must carry so that
+    * moving `last_version` past the refresh records does not drop their consumed source versions. */
+  private def storedAndCarried(spark: SparkSession, name: TableIdentifier): (Option[MvMetadata], Map[String, Long]) = {
+    val stored = resolveLookup(spark, name, storedReader(spark), allowUnresolvedLegacy = true)
+    (stored, stored.fold(Map.empty[String, Long])(carriedWatermarks(spark, _)))
+  }
+
+  private def carriedWatermarks(spark: SparkSession, stored: MvMetadata): Map[String, Long] = {
+    val reconciled = MvRefreshRecords.reconcile(spark, stored)
+    if (reconciled.lastVersion == stored.lastVersion) Map.empty
+    else MvRefreshRecords.deltaVersionWatermarks(reconciled)
+  }
+
+  def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit = {
+    val (stored, carried) = storedAndCarried(spark, name)
+    val target            = stored.map(_.name).getOrElse(name)
+    if (carried.isEmpty) backend(spark).advance(spark, target, newVersion)
+    else backend(spark).advanceWithCdfWatermarks(spark, target, newVersion, carried)
+  }
 
   private[spark] def advanceWithInterceptWitness(
       spark: SparkSession,
@@ -1076,13 +1115,15 @@ object MvCatalog {
       name: TableIdentifier,
       newVersion: Long,
       watermarks: Map[String, Long]
-  ): Unit =
+  ): Unit = {
+    val (stored, carried) = storedAndCarried(spark, name)
     backend(spark).advanceWithCdfWatermarks(
       spark,
-      lookup(spark, name).map(_.name).getOrElse(name),
+      stored.map(_.name).getOrElse(name),
       newVersion,
-      watermarks
+      MvRefreshRecords.maxMerge(carried, watermarks)
     )
+  }
 
   /** Advances the catalog row stored under `storedName`, which must come from a catalog read. */
   private[spark] def advanceStoredWithCdfWatermarks(
@@ -1090,7 +1131,15 @@ object MvCatalog {
       storedName: TableIdentifier,
       newVersion: Long,
       watermarks: Map[String, Long]
-  ): Unit = backend(spark).advanceWithCdfWatermarks(spark, storedName, newVersion, watermarks)
+  ): Unit = {
+    val carried = storedReader(spark)(storedName).fold(Map.empty[String, Long])(carriedWatermarks(spark, _))
+    backend(spark).advanceWithCdfWatermarks(
+      spark,
+      storedName,
+      newVersion,
+      MvRefreshRecords.maxMerge(carried, watermarks)
+    )
+  }
 
   def updateProperties(
       spark: SparkSession,
@@ -1110,6 +1159,7 @@ object MvCatalog {
     if (FeatureGate.deltaCatalogEnabled(spark)) {
       val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
       StagingCatalog.consumptionLifecycleLock(spark, viewName).synchronized {
+        MvRefreshRecords.discard(spark, name)
         backend(spark).remove(spark, name)
         StagingCatalog.removeConsumedForView(spark, viewName)
       }
@@ -1122,4 +1172,296 @@ object MvCatalog {
   ): String = RocksDbMvCatalogBackend.schemaFingerprint(sources, mvIdentityBySource)
 
   def mvIdentity(meta: MvMetadata): String = RocksDbMvCatalogBackend.mvIdentity(meta)
+}
+
+/** Single-commit CDF refresh records for the Delta catalog.
+  *
+  * A refresh that consumed only CDF batches is recorded by one no-data commit in the MV's own Delta log, directly on
+  * top of its data commit. The commit tags name the view, its location and Delta table id, the catalog version it
+  * advanced from, and the source versions it consumed. That commit is the durable acknowledgement; the `mv_metadata`
+  * advance and the `cdf_watermarks` write are flushed in the background. Every lookup rolls the stored row forward
+  * through an unbroken chain of matching records, so a lost flush is recovered from the MV log and foreign commits,
+  * which carry no matching record, are ignored.
+  */
+private[spark] object MvRefreshRecords {
+  private val log = LoggerFactory.getLogger(getClass)
+
+  private val AppId          = "openivm.refresh.v1"
+  private val RecordTag      = "openivm.refresh"
+  private val RecordValue    = "v1"
+  private val NameTag        = "openivm.refresh.name"
+  private val LocationTag    = "openivm.refresh.location"
+  private val TableIdTag     = "openivm.refresh.table_id"
+  private val BaseVersionTag = "openivm.refresh.base_version"
+  private val DataVersionTag = "openivm.refresh.data_version"
+  private val BatchTagPrefix = "openivm.refresh.batch:"
+  private val FlushDelayMs   = 25L
+
+  /** A recorded refresh whose catalog bookkeeping has not been flushed yet. */
+  private[common] final case class Pending(
+      spark: SparkSession,
+      catalogPath: String,
+      storedName: String,
+      viewName: String,
+      location: String,
+      tableId: String,
+      version: Long,
+      consumed: Map[String, Long]
+  ) {
+    def key: (String, String) = (catalogPath, storedName)
+
+    def sameTable(other: Pending): Boolean =
+      location == other.location && tableId == other.tableId && viewName == other.viewName
+
+    def merge(newer: Pending): Pending =
+      if (!sameTable(newer)) newer
+      else newer.copy(version = math.max(version, newer.version), consumed = maxMerge(consumed, newer.consumed))
+  }
+
+  private val pending   = new ConcurrentHashMap[(String, String), Pending]()
+  private val FlushLock = new Object
+  private val scheduled = new AtomicBoolean(false)
+
+  private lazy val executor: ScheduledExecutorService =
+    Executors.newSingleThreadScheduledExecutor(new ThreadFactory {
+      override def newThread(runnable: Runnable): Thread = {
+        val thread = new Thread(null, runnable, "openivm-catalog-finalizer", 0L, false)
+        thread.setDaemon(true)
+        thread
+      }
+    })
+
+  private def enabled(spark: SparkSession): Boolean =
+    FeatureGate.deltaCatalogEnabled(spark) &&
+      spark.conf.get("spark.databricks.delta.commitInfo.enabled", "true").toBoolean
+
+  private def storedNameOf(name: TableIdentifier): String =
+    name.database.fold(name.identifier)(db => s"$db.${name.identifier}")
+
+  private def catalogPathOf(spark: SparkSession): String = FeatureGate.catalogPath(spark).stripSuffix("/")
+
+  private def tableIdOf(meta: MvMetadata): Option[String] =
+    meta.properties.get(MvMetadata.TargetDeltaTableIdKey).filter(_.nonEmpty)
+
+  private def shortName(name: String): String = name.substring(name.lastIndexOf('.') + 1)
+
+  def maxMerge(a: Map[String, Long], b: Map[String, Long]): Map[String, Long] =
+    b.foldLeft(a) { case (merged, (source, version)) =>
+      merged.updated(source, merged.get(source).fold(version)(math.max(_, version)))
+    }
+
+  def deltaVersionWatermarks(meta: MvMetadata): Map[String, Long] =
+    meta.changeWatermarks.collect { case (source, ChangeWatermark.DeltaVersion(version)) => source -> version }
+
+  private def withWatermarks(meta: MvMetadata, consumed: Map[String, Long]): MvMetadata = {
+    val merged =
+      maxMerge(deltaVersionWatermarks(meta).filter { case (source, _) => consumed.contains(source) }, consumed)
+    meta.copy(properties = meta.properties ++ merged.map { case (source, version) =>
+      s"${MvMetadata.WatermarkKeyPrefix}$source" -> ChangeWatermark.DeltaVersion(version).encode
+    })
+  }
+
+  /** Commits the refresh record on top of data version `dataVersion`; false leaves the MV log untouched or the record
+    * inert, and the caller must then run the synchronous catalog advance and watermark write. */
+  def commit(
+      spark: SparkSession,
+      meta: MvMetadata,
+      viewName: String,
+      dataVersion: Long,
+      consumed: Map[String, Long]
+  ): Boolean = tableIdOf(meta) match {
+    case Some(tableId) if enabled(spark) && meta.lastVersion >= 0 && dataVersion > meta.lastVersion =>
+      val catalogPath = catalogPathOf(spark)
+      val storedName  = storedNameOf(meta.name)
+      val queued      = Option(pending.get((catalogPath, storedName)))
+      if (queued.exists(p => p.location != meta.location || p.tableId != tableId || p.version > meta.lastVersion))
+        false
+      else
+        try {
+          val deltaLog: DeltaLog = DeltaTableVersion.deltaLogFor(spark, meta.location)
+          val snapshot           = deltaLog.update()
+          if (snapshot.version != dataVersion || snapshot.metadata.id != tableId) false
+          else if (reconcile(spark, meta).lastVersion != meta.lastVersion) false
+          else {
+            val txn = deltaLog.startTransaction(None, Some(snapshot))
+            if (txn.readVersion != dataVersion || txn.metadata.id != tableId) false
+            else {
+              val tags = Map(
+                RecordTag      -> RecordValue,
+                NameTag        -> storedName,
+                LocationTag    -> meta.location,
+                TableIdTag     -> tableId,
+                BaseVersionTag -> meta.lastVersion.toString,
+                DataVersionTag -> dataVersion.toString
+              ) ++ consumed.map { case (source, version) => s"$BatchTagPrefix$source" -> version.toString }
+              val committed = txn.commit(
+                Seq(SetTransaction(AppId, dataVersion, Some(System.currentTimeMillis()))),
+                DeltaOperations.ManualUpdate,
+                tags
+              )
+              if (committed != dataVersion + 1) false
+              else {
+                val record =
+                  Pending(spark, catalogPath, storedName, viewName, meta.location, tableId, committed, consumed)
+                pending.merge(record.key, record, (older: Pending, newer: Pending) => older.merge(newer))
+                DeltaGroupCommit.departCurrent()
+                scheduleFlush()
+                true
+              }
+            }
+          }
+        } catch {
+          case NonFatal(e) =>
+            log.warn(s"Falling back to the synchronous catalog advance for $viewName", e)
+            false
+        }
+    case _ => false
+  }
+
+  /** The stored row rolled forward through the refresh records committed on top of its version. */
+  def reconcile(spark: SparkSession, stored: MvMetadata): MvMetadata = tableIdOf(stored) match {
+    case Some(tableId) if FeatureGate.deltaCatalogEnabled(spark) && stored.lastVersion >= 0 =>
+      val deltaLog = DeltaTableVersion.deltaLogFor(spark, stored.location)
+      val snapshot = deltaLog.update()
+      if (snapshot.version <= stored.lastVersion || snapshot.metadata.id != tableId) stored
+      else {
+        val storedName = storedNameOf(stored.name)
+        var current    = stored.lastVersion
+        var consumed   = Map.empty[String, Long]
+        deltaLog
+          .getChanges(stored.lastVersion + 1L, failOnDataLoss = false)
+          .takeWhile(_._1 <= snapshot.version)
+          .foreach { case (version, actions) =>
+            actions.collectFirst { case info: CommitInfo => info }.flatMap(_.tags).foreach { tags =>
+              if (
+                tags.get(RecordTag).contains(RecordValue) &&
+                tags.get(NameTag).contains(storedName) &&
+                tags.get(LocationTag).contains(stored.location) &&
+                tags.get(TableIdTag).contains(tableId) &&
+                tags.get(BaseVersionTag).contains(current.toString) &&
+                tags.get(DataVersionTag).contains((version - 1L).toString)
+              ) {
+                current = version
+                consumed = maxMerge(
+                  consumed,
+                  tags.collect {
+                    case (key, value) if key.startsWith(BatchTagPrefix) && Try(value.toLong).isSuccess =>
+                      key.stripPrefix(BatchTagPrefix) -> value.toLong
+                  }
+                )
+              }
+            }
+          }
+        if (current == stored.lastVersion) stored
+        else withWatermarks(stored.copy(lastVersion = current), consumed)
+      }
+    case _ => stored
+  }
+
+  /** Consumed versions recorded for `viewName` whose bookkeeping is still queued, each confirmed against the latest
+    * version and table id of its MV log. */
+  private[common] def pendingConsumed(spark: SparkSession, viewName: String, sources: Seq[String]): Map[String, Long] =
+    if (pending.isEmpty) Map.empty
+    else {
+      val catalogPath = catalogPathOf(spark)
+      val wanted      = sources.toSet
+      pending
+        .values()
+        .asScala
+        .toSeq
+        .filter(p => p.catalogPath == catalogPath && p.viewName == viewName && p.consumed.keySet.exists(wanted))
+        .filter { p =>
+          val snapshot = DeltaTableVersion.deltaLogFor(spark, p.location).update()
+          snapshot.version >= p.version && snapshot.metadata.id == p.tableId
+        }
+        .map(_.consumed.filter { case (source, _) => wanted(source) })
+        .foldLeft(Map.empty[String, Long])(maxMerge)
+    }
+
+  private def matchesView(p: Pending, name: String): Boolean = {
+    val wanted = shortName(name)
+    shortName(p.storedName).equalsIgnoreCase(wanted) || shortName(p.viewName).equalsIgnoreCase(wanted)
+  }
+
+  def discard(spark: SparkSession, name: TableIdentifier): Unit = forgetView(spark, name.table)
+
+  private[common] def forgetView(spark: SparkSession, viewName: String): Unit =
+    if (!pending.isEmpty) {
+      val catalogPath = catalogPathOf(spark)
+      FlushLock.synchronized {
+        pending.asScala.foreach { case (key, p) =>
+          if (key._1 == catalogPath && matchesView(p, viewName)) pending.remove(key)
+        }
+      }
+    }
+
+  private[common] def forgetSource(spark: SparkSession, source: String): Unit =
+    if (!pending.isEmpty) {
+      val catalogPath = catalogPathOf(spark)
+      FlushLock.synchronized {
+        pending.keySet().asScala.toSeq.filter(_._1 == catalogPath).foreach { key =>
+          pending.computeIfPresent(
+            key,
+            (_: (String, String), p: Pending) =>
+              p.copy(consumed = p.consumed.filter { case (s, _) => !shortName(s).equalsIgnoreCase(shortName(source)) })
+          )
+        }
+      }
+    }
+
+  private def scheduleFlush(): Unit =
+    if (scheduled.compareAndSet(false, true))
+      try {
+        executor.schedule(
+          new Runnable { override def run(): Unit = flush() },
+          FlushDelayMs,
+          TimeUnit.MILLISECONDS
+        )
+        ()
+      } catch {
+        case NonFatal(e) =>
+          scheduled.set(false)
+          log.warn("Could not schedule the catalog finalizer", e)
+      }
+
+  private def flush(): Unit = {
+    scheduled.set(false)
+    pending.values().asScala.toSeq.groupBy(_.catalogPath).foreach { case (catalogPath, hints) =>
+      try {
+        hints.map(_.spark).find(!_.sparkContext.isStopped).foreach { spark =>
+          SparkSession.setActiveSession(spark)
+          DeltaMvCatalogBackend.advanceRecorded(spark, catalogPath, hints)
+          FlushLock.synchronized {
+            val live = hints.flatMap { h =>
+              Option(pending.get(h.key)).filter(p => p.sameTable(h) && p.version >= h.version).map { p =>
+                h.copy(consumed = h.consumed.filter { case (source, _) => p.consumed.contains(source) })
+              }
+            }
+            val stored = DeltaMvCatalogBackend.storedVersions(spark, catalogPath, live.map(_.storedName))
+            val confirmed = live.filter { h =>
+              stored.get(h.storedName).exists { case (location, tableId, version) =>
+                location == h.location && tableId.contains(h.tableId) && version >= h.version
+              }
+            }
+            CdfWatermarkBackend.putAllViews(
+              spark,
+              catalogPath,
+              confirmed.groupBy(_.viewName).map { case (view, records) =>
+                view -> records.map(_.consumed).foldLeft(Map.empty[String, Long])(maxMerge)
+              }
+            )
+          }
+        }
+      } catch {
+        case NonFatal(e) => log.warn(s"Deferred catalog finalization failed for $catalogPath", e)
+      } finally {
+        hints.foreach { h =>
+          pending.computeIfPresent(
+            h.key,
+            (_: (String, String), p: Pending) => if (p.sameTable(h) && p.version > h.version) p else null
+          )
+        }
+      }
+    }
+  }
 }

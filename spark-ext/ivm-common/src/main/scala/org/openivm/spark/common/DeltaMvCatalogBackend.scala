@@ -58,7 +58,9 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
     )
   )
 
-  private def path(spark: SparkSession): String = FeatureGate.catalogPath(spark).stripSuffix("/") + "/mv_metadata"
+  private def pathAt(catalogPath: String): String = catalogPath.stripSuffix("/") + "/mv_metadata"
+
+  private def path(spark: SparkSession): String = pathAt(FeatureGate.catalogPath(spark))
 
   private def serializedName(id: TableIdentifier): String =
     id.database.fold(id.identifier)(db => s"$db.${id.identifier}")
@@ -273,15 +275,66 @@ private[common] object DeltaMvCatalogBackend extends MvCatalogBackend with Delta
       name: TableIdentifier,
       newVersion: Long,
       watermarks: Map[String, Long]
-  ): Unit = {
-    val entries = watermarks.toSeq
+  ): Unit =
+    DeltaGroupCommit
+      .forPath[CdfAdvance](path(spark))
+      .submit(CdfAdvance(name, newVersion, watermarkEntries(watermarks)))(advanceOne(spark, _))(advanceBatch(spark, _))
+
+  private def watermarkEntries(watermarks: Map[String, Long]): Seq[(String, Long)] =
+    watermarks.toSeq
       .map { case (source, version) =>
         s"${MvMetadata.WatermarkKeyPrefix}$source" -> version
       }
       .sortBy(_._1)
-    DeltaGroupCommit
-      .forPath[CdfAdvance](path(spark))
-      .submit(CdfAdvance(name, newVersion, entries))(advanceOne(spark, _))(advanceBatch(spark, _))
+
+  /** Rolls each row forward to its flushed refresh record, matching name, location and Delta table id. */
+  private[common] def advanceRecorded(
+      spark: SparkSession,
+      catalogPath: String,
+      records: Seq[MvRefreshRecords.Pending]
+  ): Unit = if (records.nonEmpty) OpenIvmMetrics.time("catalog.mv_catalog.advance") {
+    def recorded(record: MvRefreshRecords.Pending): Column =
+      col(Name) === lit(record.storedName) && col(Location) === lit(record.location) &&
+        col(Properties).getItem(MvMetadata.TargetDeltaTableIdKey) === lit(record.tableId) &&
+        col(LastVersion) < lit(record.version)
+    def properties(record: MvRefreshRecords.Pending): Column = {
+      val entries = watermarkEntries(record.consumed)
+      if (entries.isEmpty) col(Properties) else withCdfWatermarks(entries)
+    }
+    withDeltaRetry {
+      DeltaTable
+        .forPath(spark, pathAt(catalogPath))
+        .update(
+          records.map(recorded).reduce(_ || _),
+          Map(
+            LastVersion -> records.foldRight(col(LastVersion)) { (record, otherwise) =>
+              when(recorded(record), lit(record.version)).otherwise(otherwise)
+            },
+            Properties -> records.foldRight(col(Properties)) { (record, otherwise) =>
+              when(recorded(record), properties(record)).otherwise(otherwise)
+            }
+          )
+        )
+    }
+  }
+
+  /** Stored location, Delta table id and version of each named row; empty when the catalog does not exist. */
+  private[common] def storedVersions(
+      spark: SparkSession,
+      catalogPath: String,
+      names: Seq[String]
+  ): Map[String, (String, Option[String], Long)] = {
+    val target = new org.apache.hadoop.fs.Path(pathAt(catalogPath))
+    if (names.isEmpty || !target.getFileSystem(spark.sessionState.newHadoopConf()).exists(target)) Map.empty
+    else
+      spark.read
+        .format("delta")
+        .load(pathAt(catalogPath))
+        .filter(col(Name).isin(names.distinct: _*))
+        .select(col(Name), col(Location), col(Properties).getItem(MvMetadata.TargetDeltaTableIdKey), col(LastVersion))
+        .collect()
+        .map(row => row.getString(0) -> ((row.getString(1), Option(row.getString(2)), row.getLong(3))))
+        .toMap
   }
 
   override def updateProperties(

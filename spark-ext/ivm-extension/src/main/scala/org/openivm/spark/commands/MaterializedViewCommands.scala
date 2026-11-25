@@ -5896,7 +5896,11 @@ case class RefreshMaterializedViewCommand(
           qlogOrder,
           Some(dataVersion),
           replacementMeta,
-          suppressNonCascadeTrigger = preparedSourceAdvance.nonEmpty
+          suppressNonCascadeTrigger = preparedSourceAdvance.nonEmpty,
+          recordable = preparedSourceAdvance.isEmpty && refreshPinnedIdentities.isEmpty && frozenSources.isEmpty &&
+            runningWindowStateUpdate.isEmpty && groupedWindowStateUpdate.isEmpty &&
+            !Set(RefreshTypeCode.FullRefresh, RefreshTypeCode.WindowPartition, RefreshTypeCode.GroupRecompute)
+              .contains(cleanupMeta.refreshType)
         )
         preparedSourceAdvance.foreach(_.markCommitted())
       }
@@ -9813,7 +9817,8 @@ case class RefreshMaterializedViewCommand(
       qlogOrder: java.util.concurrent.atomic.AtomicInteger = new java.util.concurrent.atomic.AtomicInteger(0),
       committedDataVersion: Option[Long] = None,
       replacementMeta: Option[MvMetadata] = None,
-      suppressNonCascadeTrigger: Boolean = false
+      suppressNonCascadeTrigger: Boolean = false,
+      recordable: Boolean = false
   ): Unit = {
     import MvCommandHelper._
     val propagation = ChangePropagationFactory.forSession(spark)
@@ -9824,6 +9829,7 @@ case class RefreshMaterializedViewCommand(
     val previousWitness =
       if (interceptWitnessEnabled(spark)) StagingCatalog.completedRefreshWitness(spark, witnessName) else None
     val witnessToken = previousWitness.map(_ => UUID.randomUUID().toString)
+    var recorded     = false
     profile.timeObservedStep("finalize_catalog_advance") {
       replacementMeta match {
         case Some(updated) =>
@@ -9842,7 +9848,10 @@ case class RefreshMaterializedViewCommand(
             }
             .groupBy(_._1)
             .map { case (baseTable, versions) => baseTable -> versions.map(_._2).max }
-          MvCatalog.advanceStoredWithCdfWatermarks(spark, meta.name, newVersion, cdfWatermarks)
+          // The refresh record in the MV log acknowledges the refresh; the catalog rows follow in the background.
+          recorded = recordable && witnessToken.isEmpty &&
+            MvCatalog.commitRefreshRecord(spark, meta, viewNameStr, newVersion, cdfWatermarks)
+          if (!recorded) MvCatalog.advanceStoredWithCdfWatermarks(spark, meta.name, newVersion, cdfWatermarks)
         case None if witnessToken.isDefined =>
           MvCatalog.advanceWithInterceptWitness(spark, meta.name, newVersion, witnessToken.get)
         case None => MvCatalog.advance(spark, name, newVersion)
@@ -9857,7 +9866,7 @@ case class RefreshMaterializedViewCommand(
         if (!actual.contains(token))
           throw new IllegalStateException(s"Catalog did not commit the refresh witness for $viewNameStr")
       }
-      propagation.markConsumed(spark, viewNameStr, changeBatches)
+      if (!recorded) propagation.markConsumed(spark, viewNameStr, changeBatches)
     }
 
     // Non-cascade trigger synthesis is intercept-mode only.  Under CDF mode
