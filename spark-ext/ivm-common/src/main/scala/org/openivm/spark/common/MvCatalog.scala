@@ -999,6 +999,17 @@ object MvCatalog {
       watermarks
     )
 
+  /** Avoids a redundant catalog read when the caller already holds authoritative metadata. */
+  private[spark] def advanceStored(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
+    backend(spark).advance(spark, name, newVersion)
+
+  private[spark] def advanceStoredWithCdfWatermarks(
+      spark: SparkSession,
+      name: TableIdentifier,
+      newVersion: Long,
+      watermarks: Map[String, Long]
+  ): Unit = backend(spark).advanceWithCdfWatermarks(spark, name, newVersion, watermarks)
+
   def updateProperties(
       spark: SparkSession,
       name: TableIdentifier,
