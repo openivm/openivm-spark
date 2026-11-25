@@ -24,7 +24,7 @@ private[common] object DeltaPathTable {
   * Before draining, a leader may wait briefly for refreshes that hold their locks but have not reached this queue yet
   * (see [[DeltaGroupCommit.RefreshArrival]]). It waits only while the expected saving outweighs the delay: with `k`
   * requests pending, `m` refreshes awaited and a typical commit taking `C`, a straggler that misses the batch waits
-  * up to `2C` instead of `C`, so the leader waits at most `C * m / (k + m)`.
+  * up to `2C` instead of `C`, so the leader waits at most `C * m / (k + m)`, fixed when collection starts.
   *
   * Every caller returns only after the commit covering its request is durable. A batch of one runs the caller's own
   * single-request path. If a multi-request batch fails, each caller re-runs its own single-request path, so batching
@@ -74,15 +74,15 @@ private[common] final class DeltaGroupCommit[R] {
 
   /** Holding leadership and this monitor, waits for awaited refreshes within the cost bound. False if interrupted. */
   private def collect(): Boolean = {
-    val start = System.nanoTime()
-    var open  = true
+    val start   = System.nanoTime()
+    val awaited = DeltaGroupCommit.readyRefreshes - arrived.size
+    val budget =
+      if (awaited <= 0) 0L
+      else math.min(commitNanos, DeltaGroupCommit.MaxWindowNanos) * awaited / (pending.size + awaited)
+    var open = true
     while (open) {
-      val awaited = DeltaGroupCommit.readyRefreshes - arrived.size
-      val budget =
-        if (awaited <= 0) 0L
-        else math.min(commitNanos, DeltaGroupCommit.MaxWindowNanos) * awaited / (pending.size + awaited)
       val remaining = start + budget - System.nanoTime()
-      if (remaining <= 0) open = false
+      if (remaining <= 0 || DeltaGroupCommit.readyRefreshes <= arrived.size) open = false
       else
         try wait(math.max(1L, remaining / 1000000L))
         catch { case _: InterruptedException => return false }
