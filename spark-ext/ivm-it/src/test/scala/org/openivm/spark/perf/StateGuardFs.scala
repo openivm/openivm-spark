@@ -165,7 +165,9 @@ class StateGuardRawLocalFileSystem extends RawLocalFileSystem {
       blockSize: Long,
       progress: Progressable
   ): FSDataOutputStream =
-    around(Seq(f), "write")(super.createNonRecursive(f, permission, flags, bufferSize, replication, blockSize, progress))
+    around(Seq(f), "write")(
+      super.createNonRecursive(f, permission, flags, bufferSize, replication, blockSize, progress)
+    )
 
   override def createNonRecursive(
       f: Path,
