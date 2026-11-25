@@ -3272,7 +3272,6 @@ object SparkRefreshRewriter {
         // those definitions in the MERGE source's query scope.
         val ctePrefix   = stmt.substring(0, m.start).trim
         val tgtAlias    = Option(m.group(1)).getOrElse("v")
-        val ctePrefix   = stmt.substring(0, m.start).trim
         val existsOpen  = m.end - 1
         val existsClose = findMatchingCloseParen(stmt, existsOpen)
         if (existsClose < 0) return stmt

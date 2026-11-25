@@ -19,7 +19,7 @@ jobs:
     runs-on: [self-hosted, openivm-spark-azure]
     timeout-minutes: 350
     container:
-      image: ghcr.io/openivm/openivm-spark-devcontainer:8aa35e2a6ebce6f17583044f098207c71e7d957d482bbb93f9ad6620faece73c
+      image: ghcr.io/openivm/openivm-spark-devcontainer:f5ad6233790eb1c23c80412373a2887d11336c202dd2ad7aa066611a83172368
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -86,7 +86,7 @@ jobs:
     needs: verify
     runs-on: [self-hosted, openivm-spark-azure]
     container:
-      image: ghcr.io/openivm/openivm-spark-devcontainer:8aa35e2a6ebce6f17583044f098207c71e7d957d482bbb93f9ad6620faece73c
+      image: ghcr.io/openivm/openivm-spark-devcontainer:f5ad6233790eb1c23c80412373a2887d11336c202dd2ad7aa066611a83172368
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

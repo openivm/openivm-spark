@@ -38,7 +38,17 @@ import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.functions.{col, lit, sum, when}
 import org.apache.spark.sql.delta.DeltaLog
-import org.apache.spark.sql.types.{ArrayType, ByteType, DataType, IntegerType, LongType, MapType, ShortType, StructField, StructType}
+import org.apache.spark.sql.types.{
+  ArrayType,
+  ByteType,
+  DataType,
+  IntegerType,
+  LongType,
+  MapType,
+  ShortType,
+  StructField,
+  StructType
+}
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
@@ -5730,7 +5740,8 @@ case class RefreshMaterializedViewCommand(
       )
       val compileCacheTier = sessionCompiler.compiler.compileCacheTier(compileRequest)
       var refreshProperties =
-        if (compileCacheEnabled) MvMetadata.withCompileCacheGeneration(meta.properties, sessionCompiler.compiler.cacheGeneration)
+        if (compileCacheEnabled)
+          MvMetadata.withCompileCacheGeneration(meta.properties, sessionCompiler.compiler.cacheGeneration)
         else meta.properties
       val reuseInSession = preparedSourceAdvance.isEmpty && refreshResolvedPins.isEmpty
 

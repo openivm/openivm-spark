@@ -1260,7 +1260,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       merge should startWith("MERGE INTO `mydb`.`mv_r` AS v")
       merge should include("WITH openivm_affected AS")
       merge should include("SELECT * FROM openivm_affected")
-      merge should include("ON _k <=> openivm_left_key OR _k <=> openivm_right_key")
+      merge should include("ON d._k <=> v.openivm_left_key OR d._k <=> v.openivm_right_key")
       merge should include("WHEN MATCHED THEN DELETE")
     }
 
@@ -1819,7 +1819,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           |SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_run_result_wradm_mv;
           |DROP TABLE openivm_run_result_wradm_mv;
           |""".stripMargin
-      val rewritten = SparkRefreshRewriter
+      val tagged = SparkRefreshRewriter
         .rewrite(
           compiledSql = sql,
           mvName = p52MvName,
@@ -1830,6 +1830,8 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           mvVersionBeforeRefresh = Some(3)
         )
         .statements
+      tagged.count(_.contains(SparkRefreshRewriter.RunningWindowSuffixMarker)) shouldBe 4
+      val rewritten = tagged.map(SparkRefreshRewriter.stripExecutionMarker)
       val dataInsert = rewritten
         .find(_.startsWith("INSERT INTO `default`.`wradm_mv`"))
         .getOrElse(fail("materialized suffix data insert missing"))

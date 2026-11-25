@@ -186,7 +186,7 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val input = s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
       s"FROM memory.main.openivm_data_$key JOIN `memory`.`main`.`openivm_delta_$key` d ON true " +
       s"JOIN openivm_run_result_$key r ON true JOIN memory.main.orders s ON true"
-    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+    OpenIvmCompiler.normalizeNativeViewObjects(input, key, "mv") shouldBe
       s"SELECT 'memory.main.openivm_data_$key', 'escaped''openivm_run_result_$key' " +
       "FROM openivm_data_mv JOIN openivm_delta_mv d ON true " +
       "JOIN openivm_run_result_mv r ON true JOIN memory.main.orders s ON true"
@@ -196,7 +196,7 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val key     = "__openivm_mv_6d656d6f7279_6d61696e_6d76_"
     val literal = "escaped''" * 10000 + s"openivm_data_$key"
     val input   = s"SELECT '$literal' FROM memory.main.openivm_data_$key"
-    sharedCompiler.normalizeCompiledViewNames(input, key, "mv") shouldBe
+    OpenIvmCompiler.normalizeNativeViewObjects(input, key, "mv") shouldBe
       s"SELECT '$literal' FROM openivm_data_mv"
   }
 
@@ -1227,23 +1227,27 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       sourceQualifiedNames = Map("orders" -> "sales.orders", "products" -> "catalog.sales.products"),
       facts = qualifiedFacts
     )
-    sharedCompiler.nativeDeltaShape(req) shouldBe Map(
+    sharedCompiler.compilerSourceFacts(req).deltaShape shouldBe Map(
       "orders"   -> DeltaShape.InsertOnly,
       "products" -> DeltaShape.Unchanged
     )
-    sharedCompiler.nativeDeltaShape(
-      req.copy(facts = WorkloadFacts(deltaShape = Map("other.products" -> DeltaShape.Unchanged)))
-    ) shouldBe Map("other.products" -> DeltaShape.Unchanged)
-    sharedCompiler.nativeDeltaShape(
-      req.copy(facts =
-        WorkloadFacts(deltaShape =
-          Map(
-            "catalog.sales.products" -> DeltaShape.Unchanged,
-            "products"               -> DeltaShape.InsertOnly
+    sharedCompiler
+      .compilerSourceFacts(
+        req.copy(facts = WorkloadFacts(deltaShape = Map("other.products" -> DeltaShape.Unchanged)))
+      )
+      .deltaShape shouldBe empty
+    sharedCompiler
+      .compilerSourceFacts(
+        req.copy(facts =
+          WorkloadFacts(deltaShape =
+            Map(
+              "catalog.sales.products" -> DeltaShape.Unchanged,
+              "products"               -> DeltaShape.InsertOnly
+            )
           )
         )
       )
-    ) shouldBe Map("products" -> DeltaShape.General)
+      .deltaShape shouldBe Map("products" -> DeltaShape.General)
 
     val compiled = sharedCompiler.compile(req)
     compiled.refreshTypeName shouldBe "SIMPLE_PROJECTION"

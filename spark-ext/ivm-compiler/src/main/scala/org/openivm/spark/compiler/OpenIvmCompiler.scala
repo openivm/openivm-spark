@@ -239,7 +239,7 @@ class OpenIvmCompiler private (
       val partial  = parseCompileResult(stdout, req.viewName, stderr)
       val initLoad = parseInitialLoadSql(tmpDir, req, nativeViewName)
       partial.copy(
-        sql = normalizeCompiledViewNames(partial.sql, nativeViewName, req.viewName),
+        sql = OpenIvmCompiler.normalizeNativeViewObjects(partial.sql, nativeViewName, req.viewName),
         initialLoadSql = initLoad
       )
     } catch {
@@ -828,7 +828,11 @@ class OpenIvmCompiler private (
     val nativeName = if (nativeViewName.isEmpty) req.viewName else nativeViewName
     val file       = tmpDir.resolve(s"openivm_compiled_queries_$nativeName.sql")
     if (!Files.exists(file)) return ""
-    val content = normalizeCompiledViewNames(new String(Files.readAllBytes(file), "UTF-8"), nativeName, req.viewName)
+    val content = OpenIvmCompiler.normalizeNativeViewObjects(
+      new String(Files.readAllBytes(file), "UTF-8"),
+      nativeName,
+      req.viewName
+    )
 
     val pat = Pattern.compile(
       s"(?is)create\\s+table\\s+openivm_data_${Pattern.quote(req.viewName)}\\s+as\\s+((?:WITH\\b|SELECT\\b).+?);",
@@ -845,26 +849,6 @@ class OpenIvmCompiler private (
     if ("""(?i)\browid\b""".r.findFirstIn(extracted).isDefined) return ""
 
     LptsSparkDialect.translate(OpenIvmCompiler.reattachInitialLoadSourceReads(extracted, req))
-  }
-
-  /** Spark's rewrite program addresses one logical MV; native catalog keys are
-    * private to the row-less compiler database. Preserve source references and
-    * string literals while removing native qualification from internal tables.
-    */
-  private[compiler] def normalizeCompiledViewNames(sql: String, nativeName: String, viewName: String): String = {
-    val internalOrLiteral =
-      "(?i)'(?:''|[^'])*+'|(?<![A-Za-z0-9_])(?:[`\"]?memory[`\"]?\\.[`\"]?main[`\"]?\\.)?[`\"]?(openivm_[A-Za-z0-9_]+)[`\"]?".r
-    internalOrLiteral.replaceAllIn(
-      sql,
-      m => {
-        val table = m.group(1)
-        val replacement =
-          if (table == null) m.matched
-          else if (nativeName != viewName && table.endsWith(nativeName)) table.stripSuffix(nativeName) + viewName
-          else table
-        java.util.regex.Matcher.quoteReplacement(replacement)
-      }
-    )
   }
 
   /** Fully-qualified name of every source the request tracks, the key space a
@@ -1009,7 +993,7 @@ object OpenIvmCompiler {
       if (objects.lookingAt()) {
         val replacement = Option(objects.group(4)).getOrElse {
           val name = Option(objects.group(1)).orElse(Option(objects.group(2))).getOrElse(objects.group(3))
-          name.replace(nativeKey, viewName)
+          if (nativeKey.nonEmpty && name.endsWith(nativeKey)) name.stripSuffix(nativeKey) + viewName else name
         }
         Some(objects.end() -> replacement)
       } else None
