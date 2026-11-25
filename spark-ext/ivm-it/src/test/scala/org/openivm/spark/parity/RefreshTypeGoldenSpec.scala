@@ -17,7 +17,7 @@ class RefreshTypeGoldenSpec extends AnyFunSpec with Matchers with BeforeAndAfter
 
   private var sharedCompiler: OpenIvmCompiler = _
 
-  // Pinned to native OPENIVM_COMMIT dbcc8788 (spark-ext/dev/pins.env); its upstream 4a7dd303 merge leaves these
+  // Pinned to native OPENIVM_COMMIT 085e418a (spark-ext/dev/pins.env); its upstream 4a7dd303 merge leaves these
   // hashes unchanged. Against 57b21876 every case now constant-folds translate(...) literals and group-recompute
   // names its derived table; both are cosmetic. aggregate-group also changes semantically: its group-retirement
   // DELETE additionally requires openivm_nonnull_sum_count_1 = 0. Every count lies in [0, COUNT(*)], so both
