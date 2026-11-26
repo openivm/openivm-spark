@@ -79,6 +79,14 @@ trait ChangePropagation {
       spark: SparkSession,
       sourceTable: String,
       sourceSchema: StructType,
+      batches: Seq[ChangeBatch],
+      sourceIsProjection: Option[Boolean]
+  ): String = registerSourceDeltaView(spark, sourceTable, sourceSchema, batches)
+
+  def registerSourceDeltaView(
+      spark: SparkSession,
+      sourceTable: String,
+      sourceSchema: StructType,
       batches: Seq[ChangeBatch]
   ): String = {
     if (batches.isEmpty) {

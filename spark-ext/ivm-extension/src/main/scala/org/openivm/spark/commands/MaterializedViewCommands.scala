@@ -5963,9 +5963,12 @@ case class RefreshMaterializedViewCommand(
       // Resolve current source schemas and check for schema drift. Include
       // upstream MV identity hashes so a DROP + recreate-with-same-schema
       // upstream is also caught.
-      val (freshSchemas, freshMvIdentityBySource, freshFingerprint) =
+      // `resolvedSourceProjections` records whether each source resolved here as a
+      // public MV projection. A `false` lets later reads skip re-analysing it.
+      val (freshSchemas, freshMvIdentityBySource, freshFingerprint, resolvedSourceProjections) =
         profile.timeStep("metadata_pre_sql", "phase=schema_resolve") {
           RefreshPerf.timePhase(refreshId, viewLabel, "schema_resolve") {
+            val projections = Map.newBuilder[String, Boolean]
             val schemas = meta.sourceTables.map { source =>
               val schema = preparedSourceAdvance
                 .flatMap(_.batchFor(source))
@@ -5973,7 +5976,11 @@ case class RefreshMaterializedViewCommand(
                   val expected = SourceVersionDelta.schemaAt(spark, source, batch.startVersionInclusive)
                   SourceVersionDelta.validate(spark, batch, expected)
                 }
-                .getOrElse(spark.table(source).schema)
+                .getOrElse {
+                  val table = spark.table(source)
+                  projections += source -> MvProjectionSource.projection(table.queryExecution.analyzed).nonEmpty
+                  table.schema
+                }
               source -> schema
             }.toMap
             val identityMap: Map[String, String] = {
@@ -5985,7 +5992,7 @@ case class RefreshMaterializedViewCommand(
               }.toMap
             }
             val fp = MvCatalog.schemaFingerprint(schemas, identityMap)
-            (schemas, identityMap, fp)
+            (schemas, identityMap, fp, projections.result())
           }
         }
       if (freshFingerprint != meta.sourceSchemaFingerprint) {
@@ -6674,10 +6681,23 @@ case class RefreshMaterializedViewCommand(
                         propagation match {
                           case cdf: CdfChangePropagation if meta.refreshType == RefreshTypeCode.WindowPartition =>
                             val (sql, coverage) =
-                              cdf.registerSourceDeltaWithCoverage(spark, qualTable, schema, tableBatches)
+                              cdf.registerSourceDeltaWithCoverage(
+                                spark,
+                                qualTable,
+                                schema,
+                                tableBatches,
+                                resolvedSourceProjections.get(qualTable)
+                              )
                             coverage.foreach(view => registeredCdfDeltaViews(view.batch) = view)
                             sql
-                          case _ => propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches)
+                          case _ =>
+                            propagation.registerSourceDeltaView(
+                              spark,
+                              qualTable,
+                              schema,
+                              tableBatches,
+                              resolvedSourceProjections.get(qualTable)
+                            )
                         }
                     }
                     registrationSucceeded = true

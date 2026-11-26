@@ -119,11 +119,21 @@ final class CdfChangePropagation extends ChangePropagation {
   ): String =
     registerSourceDeltaWithCoverage(spark, sourceTable, sourceSchema, batches)._1
 
+  override def registerSourceDeltaView(
+      spark: SparkSession,
+      sourceTable: String,
+      sourceSchema: StructType,
+      batches: Seq[ChangeBatch],
+      sourceIsProjection: Option[Boolean]
+  ): String =
+    registerSourceDeltaWithCoverage(spark, sourceTable, sourceSchema, batches, sourceIsProjection)._1
+
   private[spark] def registerSourceDeltaWithCoverage(
       spark: SparkSession,
       sourceTable: String,
       sourceSchema: StructType,
-      batches: Seq[ChangeBatch]
+      batches: Seq[ChangeBatch],
+      sourceIsProjection: Option[Boolean] = None
   ): (String, Option[CdfChangePropagation.RegisteredDeltaView]) = {
     import CdfChangePropagation.RegisteredDeltaView
 
@@ -139,7 +149,8 @@ final class CdfChangePropagation extends ChangePropagation {
         val raw = MvProjectionSource.read(
           spark,
           sourceTable,
-          Map("readChangeFeed" -> "true", "startingVersion" -> from.toString, "endingVersion" -> to.toString)
+          Map("readChangeFeed" -> "true", "startingVersion" -> from.toString, "endingVersion" -> to.toString),
+          sourceIsProjection
         )
 
         val userCols         = sourceSchema.fieldNames.map(n => s"`${n.replace("`", "``")}`").mkString(", ")

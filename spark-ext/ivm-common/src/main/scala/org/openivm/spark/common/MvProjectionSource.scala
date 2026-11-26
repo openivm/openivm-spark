@@ -39,10 +39,19 @@ object MvProjectionSource {
   /** Delta's DataFrameReader cannot time-travel or read CDF through a Spark VIEW.
     * Resolve the same backing log, then reapply the persisted public schema.
     * This reads catalog/Delta metadata only; it never opens OpenIVM state.
+    * `sourceIsProjection = Some(false)` is this command's earlier resolution of
+    * `source` as a non-projection relation and skips re-analysing it.
     */
-  def read(spark: SparkSession, source: String, options: Map[String, String]): DataFrame = {
-    val logical = spark.table(source)
-    projection(logical.queryExecution.analyzed) match {
+  def read(
+      spark: SparkSession,
+      source: String,
+      options: Map[String, String],
+      sourceIsProjection: Option[Boolean] = None
+  ): DataFrame = {
+    lazy val logical = spark.table(source)
+    val resolved =
+      if (sourceIsProjection.contains(false)) None else projection(logical.queryExecution.analyzed)
+    resolved match {
       case Some(_) =>
         val log = DeltaTableVersion.deltaLogOption(spark, source).getOrElse {
           throw new IllegalStateException(s"Public MV projection '$source' has no committed Delta backing")
