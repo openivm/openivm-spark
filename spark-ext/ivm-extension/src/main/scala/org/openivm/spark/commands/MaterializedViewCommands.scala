@@ -7012,6 +7012,7 @@ case class RefreshMaterializedViewCommand(
               val snapshotRelations = snapshotVersions.flatMap { case (source, version) =>
                 if (
                   !executionSnapshotPinsByQualified.keys.exists(_.equalsIgnoreCase(source)) &&
+                  !resolvedSourceProjections.get(source).contains(false) &&
                   MvProjectionSource.isProjection(spark, source)
                 ) {
                   val tempName = s"openivm_source_snapshot_${source.split("\\.").last}"
