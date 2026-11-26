@@ -420,14 +420,13 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
     archive.length() == lines.get(2).trim.toLong
   }
 
-  private def queueEvents(ids: Set[String]): Vector[JsonNode] =
+  private def queueEvents: Vector[JsonNode] =
     Option(queue.listFiles()).toVector.flatten.filter(_.getName.endsWith(".jsonl")).sortBy(_.getName).flatMap { f =>
       Files
         .readAllLines(f.toPath, StandardCharsets.UTF_8)
         .asScala
         .iterator
         .map(line => mapper.readTree(line))
-        .filter(n => ids.contains(n.path("request_id").asText("")))
         .toVector
     }
 
@@ -447,8 +446,17 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
     def at(ns: Long): Double = ms(ns - b.startNs)
     val phases =
       events.filter(n => n.path("request_id").asText("") == r.requestId && n.path("event_type").asText("") == "phase")
-    def named(p: String => Boolean): Seq[StateGuardInterval] =
-      phases.filter(n => p(n.path("phase").asText(""))).map(interval)
+    def named(p: String => Boolean): Seq[StateGuardInterval] = {
+      val selected = phases.filter(n => p(n.path("phase").asText("")))
+      val domains  = selected.map(_.path("clock_domain_id").asText("")).distinct
+      if (
+        domains.size == 1 && domains.head.nonEmpty && selected.forall(n =>
+          n.path("start_monotonic_ns").isIntegralNumber && n.path("inclusive_ns").isIntegralNumber &&
+            n.path("inclusive_ns").asLong() >= 0L
+        )
+      ) selected.map(interval)
+      else Seq.empty
+    }
     Map[String, Any](
       "view"                     -> r.view,
       "request_id"               -> r.requestId,
@@ -614,7 +622,7 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
       "state_sync_committed"   -> generationAfter.exists(a => generationBefore.forall(_ < a) && committedSnapshot(a))
     )
     val captured = (creates.toSeq :+ serial :+ primary).flatMap(_.requests)
-    val events   = queueEvents(captured.map(_.requestId).toSet)
+    val events   = queueEvents
     val confKeys = Seq(
       FeatureGate.ChangeFeedModeKey,
       FeatureGate.CatalogBackendKey,
@@ -712,6 +720,12 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
     StateGuardReport.writeLines(
       "r7-walkthrough-spans.jsonl",
       captured.flatMap(_.span).map(n => mapper.writeValueAsString(n))
+    )
+    StateGuardReport.writeLines(
+      "r7-walkthrough-receipts.jsonl",
+      (captured ++ Seq(serialInsert, parallelInsert)).map { r =>
+        Files.readString(new File(receipts, s"${r.requestId}/report.json").toPath, StandardCharsets.UTF_8)
+      }
     )
 
     withClue(failures.take(10).mkString("; ")) {

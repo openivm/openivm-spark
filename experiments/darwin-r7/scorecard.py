@@ -309,8 +309,9 @@ def main(argv):
         raw = arm.get("evidence_sha256") or {}
         role = plan.get("workload")
         report_name = contract["workloads"].get(role, {}).get("report")
-        required = {"nx.log", report_name, "r7-walkthrough-events.jsonl", "r7-walkthrough-spans.jsonl"} if role == \
-            "primary" else {"nx.log", report_name, "r7-matched-intercept-events.jsonl"}
+        required = ({"nx.log", report_name, "r7-walkthrough-events.jsonl", "r7-walkthrough-spans.jsonl",
+                     "r7-walkthrough-receipts.jsonl"} if role == "primary" else
+                    {"nx.log", report_name, "r7-matched-intercept-events.jsonl", "r7-matched-intercept-receipts.jsonl"})
         if arm.get("status") == "completed":
             def matches(name):
                 return isinstance(name, str) and Path(name).name == name and (p.parent / name).is_file() and \

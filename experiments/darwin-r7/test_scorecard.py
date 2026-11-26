@@ -10,6 +10,7 @@ from pathlib import Path
 
 import paired
 import scorecard
+import observer
 
 HERE = Path(__file__).resolve().parent
 CANDIDATE = "1" * 40
@@ -214,6 +215,20 @@ class ScorecardTest(unittest.TestCase):
         digest, listing = paired.harness_digest(paired.repo_root(), contract()["harness_paths"])
         self.assertEqual(listing, lock["files"])
         self.assertEqual(digest, lock["harness_digest"])
+
+    def test_shared_stage_work_is_counted_once_and_partial_metrics_remain_partial(self):
+        jobs = [{"event_type": "spark_job_start", "request_id": i, "clock_domain_id": "d", "stage_ids": [1, 2],
+                 "stage_tracking_truncated": False} for i in ("a", "b")]
+        stage = {"event_type": "spark_stage_completed", "clock_domain_id": "d", "stage_id": 1, "stage_attempt": 0,
+                 "task_summary_status": "observed", "task_summary": {"attempts": 3, "attempts_with_metrics": 2,
+                                                                    "attempts_without_metrics": 1}}
+        got = observer.physical_work([*jobs, stage], {"a", "b"})
+        self.assertEqual(got["physical_stage_attempts"], 1)
+        self.assertEqual(got["shared_stage_attempts"], 1)
+        self.assertEqual(got["referenced_stages_without_completion"], 1)
+        self.assertEqual(got["observed_task_counts"]["attempts_without_metrics"], 1)
+        with self.assertRaisesRegex(ValueError, "duplicate stage"):
+            observer.physical_work([*jobs, stage, stage], {"a", "b"})
 
 
 if __name__ == "__main__":

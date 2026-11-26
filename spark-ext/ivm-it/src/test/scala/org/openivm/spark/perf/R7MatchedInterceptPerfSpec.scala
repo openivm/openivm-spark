@@ -200,6 +200,14 @@ class R7MatchedInterceptPerfSpec extends IvmParitySpecBase("r7-matched-intercept
       StateGuardInterval(s, s + node.get("inclusive_ns").asLong())
     }
     def at(ns: Long): Double = (ns - start) / 1e6
+    val completedDir         = new File(warehouseDir, "completed-telemetry/completed/v1")
+    val completed = Option(completedDir.listFiles())
+      .getOrElse(fail(s"Cannot list completed spans: $completedDir"))
+      .toVector
+      .filter(_.getName.endsWith(".json"))
+      .map(f => mapper.readTree(f))
+      .groupBy(_.path("request_id").asText(""))
+    val receipts = Vector.newBuilder[String]
     val result = views.indices.map { idx =>
       val view   = views(idx)
       val mine   = records.filter(n => text(n, "request_id") == ids(idx))
@@ -235,6 +243,12 @@ class R7MatchedInterceptPerfSpec extends IvmParitySpecBase("r7-matched-intercept
       val actionMs   = actions.head.get("duration_ms").asLong()
       val diagnostic = actions.head.get("sql_text").asText()
       diagnostic should include(pending(idx).stagingPath.replace("`", "``"))
+      val spans = completed.getOrElse(ids(idx), Vector.empty)
+      spans.size shouldBe 1
+      val receipt = mapper.createObjectNode().put("request_id", ids(idx))
+      receipt.set[JsonNode]("span", spans.head)
+      receipt.set[JsonNode]("query_log", capture)
+      receipts += mapper.writeValueAsString(receipt)
       QueryLogExport.release(spark, ids(idx))
       val row = Map[String, Any](
         "view"                     -> view,
@@ -262,7 +276,8 @@ class R7MatchedInterceptPerfSpec extends IvmParitySpecBase("r7-matched-intercept
     }
     val client = views.indices.map(i => StateGuardInterval(submit(i), ack(i)))
     StateGuardReport.maxConcurrent(client) shouldBe 6
-    StateGuardReport.writeLines("r7-matched-intercept-events.jsonl", records.map(n => mapper.writeValueAsString(n)))
+    StateGuardReport.writeLines("r7-matched-intercept-events.jsonl", events.map(n => mapper.writeValueAsString(n)))
+    StateGuardReport.writeLines("r7-matched-intercept-receipts.jsonl", receipts.result())
     StateGuardReport.write(
       "r7-matched-intercept.json",
       Map[String, Any](
