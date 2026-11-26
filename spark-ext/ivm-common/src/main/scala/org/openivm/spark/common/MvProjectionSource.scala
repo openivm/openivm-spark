@@ -40,21 +40,24 @@ object MvProjectionSource {
     * Resolve the same backing log, then reapply the persisted public schema.
     * This reads catalog/Delta metadata only; it never opens OpenIVM state.
     */
-  def read(spark: SparkSession, source: String, options: Map[String, String]): DataFrame = {
-    val logical = spark.table(source)
-    projection(logical.queryExecution.analyzed) match {
-      case Some(_) =>
-        val log = DeltaTableVersion.deltaLogOption(spark, source).getOrElse {
-          throw new IllegalStateException(s"Public MV projection '$source' has no committed Delta backing")
-        }
-        val raw = spark.read.format("delta").options(options).load(log.dataPath.toString)
-        val metadata =
-          if (options.get("readChangeFeed").exists(_.equalsIgnoreCase("true")))
-            Seq("_change_type", "_commit_version", "_commit_timestamp")
-          else Nil
-        project(raw, logical.schema, metadata)
-      case None =>
-        spark.read.format("delta").options(options).table(source)
+  def read(spark: SparkSession, source: String, options: Map[String, String]): DataFrame =
+    readProjection(spark, spark.table(source), options)
+      .getOrElse(spark.read.format("delta").options(options).table(source))
+
+  def readProjection(spark: SparkSession, logical: DataFrame, options: Map[String, String]): Option[DataFrame] = {
+    val plan = logical.queryExecution.analyzed
+    projection(plan).map { view =>
+      val log = DeltaTableVersion.deltaLogFromPlan(view.child).filter(_.tableExists).getOrElse {
+        throw new IllegalStateException(
+          s"Public MV projection '${view.desc.identifier}' has no committed Delta backing"
+        )
+      }
+      val raw = spark.read.format("delta").options(options).load(log.dataPath.toString)
+      val metadata =
+        if (options.get("readChangeFeed").exists(_.equalsIgnoreCase("true")))
+          Seq("_change_type", "_commit_version", "_commit_timestamp")
+        else Nil
+      project(raw, logical.schema, metadata)
     }
   }
 

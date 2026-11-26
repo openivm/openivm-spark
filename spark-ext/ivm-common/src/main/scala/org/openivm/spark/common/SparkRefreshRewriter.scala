@@ -1,6 +1,13 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedRelation}
+import org.apache.spark.sql.catalyst.expressions.{And, Cast, EqualTo, Expression}
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.plans.logical.{Filter, Join, LogicalPlan, Project, SubqueryAlias}
+
+import scala.util.Try
 
 /** Output of [[SparkRefreshRewriter.rewrite]]: the ordered list of Spark-SQL
   * statements that, when executed, perform one incremental refresh.
@@ -67,6 +74,14 @@ final class PinnedSourcePathMissingException(message: String) extends IllegalSta
   * back from that path and updates the user-visible MV.
   */
 object SparkRefreshRewriter {
+  private[spark] def stringTargetKeyLiteral(bytes: Array[Byte]): Option[String] = {
+    try {
+      java.nio.charset.StandardCharsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(bytes))
+      Some(s"CAST(${org.apache.spark.sql.catalyst.expressions.Literal(bytes).sql} AS STRING)")
+    } catch {
+      case _: java.nio.charset.CharacterCodingException => None
+    }
+  }
 
   final case class SelectiveBroadcastTable(shortName: String, qualifiedName: String, sizeBytes: Long)
   final case class SkewFanoutDeltaBroadcast(
@@ -163,8 +178,63 @@ object SparkRefreshRewriter {
   private[spark] def isSimpleProjectionDeleteMerge(sql: String): Boolean =
     sql.contains(SimpleProjectionDeleteMergeMarker)
 
+  /** Fuse our bag-correct DELETE/INSERT pair into one Delta commit. The insert
+    * source already restores partially retracted duplicates from the pinned
+    * pre-refresh snapshot; insert rows must never match the delete branch.
+    */
+  private[spark] def fuseSimpleProjectionApply(
+      deleteSql: String,
+      insertSql: String,
+      mvName: TableIdentifier,
+      columns: Seq[String],
+      targetPredicate: Option[String]
+  ): Option[String] = {
+    if (!isSimpleProjectionDeleteMerge(deleteSql) || columns.exists(_.equalsIgnoreCase("__openivm_apply_delete")))
+      return None
+    val target = backtickMvName(mvName)
+    val cols   = columns.map(c => s"`${c.replace("`", "``")}`")
+    val sql    = stripExecutionMarker(deleteSql)
+    val header = s"MERGE INTO $target AS v\nUSING ("
+    if (!sql.startsWith(header)) return None
+    val open  = header.length - 1
+    val close = findMatchingCloseParen(sql, open)
+    if (close < 0) return None
+    val expectedOn = cols.map(c => s"v.$c IS NOT DISTINCT FROM d.$c").mkString(" AND ")
+    if (sql.substring(close + 1).trim != s"AS d ON $expectedOn\nWHEN MATCHED THEN DELETE") return None
+    val insertPrefix = s"INSERT INTO $target\nSELECT ${cols.mkString(", ")}\n"
+    if (!insertSql.startsWith(insertPrefix)) return None
+    val query     = insertSql.substring(s"INSERT INTO $target\n".length)
+    val countJoin = "ON n2.__openivm_net < 0 AND "
+    if (!query.contains(countJoin)) return None
+    val prunedQuery =
+      targetPredicate.fold(query)(p => query.replace(countJoin, s"ON ($p) AND n2.__openivm_net < 0 AND "))
+    val matchPredicate = targetPredicate.fold(expectedOn)(p => s"$expectedOn AND ($p)")
+    val deleteSource   = sql.substring(open + 1, close)
+    Some(
+      s"""|MERGE INTO $target AS v
+          |USING (
+          |  SELECT ${cols.mkString(", ")}, true AS __openivm_apply_delete
+          |  FROM ($deleteSource) __openivm_delete_rows
+          |  UNION ALL
+          |  SELECT ${cols.mkString(", ")}, false AS __openivm_apply_delete
+          |  FROM ($prunedQuery) __openivm_insert_rows
+          |) AS d
+          |ON d.__openivm_apply_delete AND $matchPredicate
+          |WHEN MATCHED THEN DELETE
+          |WHEN NOT MATCHED AND NOT d.__openivm_apply_delete THEN
+          |  INSERT (${cols.mkString(", ")}) VALUES (${cols.map(c => s"d.$c").mkString(", ")})""".stripMargin
+    )
+  }
+
+  private[spark] val RunningWindowFallbackMarker = "/*OPENIVM_RUNNING_WINDOW_FALLBACK*/"
+  private[spark] val RunningWindowSuffixMarker   = "/*OPENIVM_RUNNING_WINDOW_SUFFIX*/"
+
   private[spark] def stripExecutionMarker(sql: String): String =
-    sql.replace(SimpleProjectionDeleteMergeMarker, "").trim
+    sql
+      .replace(SimpleProjectionDeleteMergeMarker, "")
+      .replace(RunningWindowFallbackMarker, "")
+      .replace(RunningWindowSuffixMarker, "")
+      .trim
 
   private[spark] def injectSelectiveBroadcastHints(
       sql: String,
@@ -482,6 +552,8 @@ object SparkRefreshRewriter {
     * @param sourceSnapshotAdvanceOldVersions Pre-advance snapshot versions for
     *                         pinned sources whose live reads are intentionally
     *                         moved to a caller-supplied target pin.
+    * @param reusePublishedSnapshotForCascade Allow the signed cascade to read the target
+    *                         after the target has been fully replaced.
     * @param mvVersionBeforeRefresh Delta version visible before this refresh starts.
     *                         Required when pragma-gated recompute cascade emits an
     *                         `openivm_old_<view>` snapshot that must stay pinned to
@@ -509,7 +581,8 @@ object SparkRefreshRewriter {
       uniqueJoinSimplifyEnabled: Boolean = false,
       windowPartitionSingleDeleteMergeEnabled: Boolean = false,
       mvVersionBeforeRefresh: Option[Long] = None,
-      sourceSnapshotRelations: Map[String, String] = Map.empty
+      sourceSnapshotRelations: Map[String, String] = Map.empty,
+      reusePublishedSnapshotForCascade: Boolean = true
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
 
@@ -523,7 +596,19 @@ object SparkRefreshRewriter {
     activeSnapshotPins.set(sourceSnapshotPins)
     activePinnedPaths.set(sourceSnapshotPinnedPaths)
     try {
-      val stmts = splitStatements(compiledSql).map(_.trim).filter(_.nonEmpty)
+      // Preserve column exclusion before individual rewrites strip DuckDB's
+      // EXCLUDE syntax. Native source-reconstruction UNIONs require both arms
+      // to contain source columns, without the delta's bookkeeping columns.
+      val stmts = splitStatements(compiledSql)
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .map(s => expandSelectStarExcept(s, sourceSchemas))
+      val runningSuffix = stmts.exists(
+        _.toUpperCase.startsWith(
+          s"CREATE OR REPLACE TEMP TABLE OPENIVM_RUN_RESULT_${viewLogicalName.toUpperCase} AS"
+        )
+      )
+
       val cascade =
         affectedGroupCascade(stmts, viewLogicalName, viewDeltaPath, mvName, mvLocation, mvVersionBeforeRefresh)
       val inputPath = cascade.map(_.inputPath).getOrElse(viewDeltaPath)
@@ -531,7 +616,8 @@ object SparkRefreshRewriter {
       var viewDeltaMaterialized   = false
       var hasRunningWindowProgram = false
       def rewriteStatement(stmt: String): Seq[String] = {
-        classify(stmt, viewLogicalName) match {
+        val kind = classify(stmt, viewLogicalName)
+        val emitted = kind match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
           case StatementKind.ViewDeltaInsert =>
             val rewritten =
@@ -597,12 +683,10 @@ object SparkRefreshRewriter {
             Seq(rewriteGroupRecomputeRowsInsert(stmt, viewLogicalName, mvName))
           case StatementKind.GroupRecomputeRowsDrop =>
             Seq(rewriteGroupRecomputeRowsDrop(viewLogicalName))
-          case StatementKind.CurrentSnapshotCreate =>
-            Seq(rewriteCurrentSnapshotCreate(stmt))
+          case StatementKind.CurrentSnapshotCreate | StatementKind.NewSnapshotCreate =>
+            Seq(rewriteSourceSnapshotCreate(stmt))
           case StatementKind.OldSnapshotCreate =>
             Seq(rewriteOldSnapshotCreate(stmt, viewLogicalName, mvLocation, mvVersionBeforeRefresh))
-          case StatementKind.NewSnapshotCreate =>
-            Seq(rewriteNewSnapshotCreate(stmt))
           case StatementKind.SnapshotDataInsert =>
             Seq(rewriteSnapshotDataInsert(stmt, viewLogicalName, mvName))
           case StatementKind.CurrentSnapshotDrop =>
@@ -611,6 +695,30 @@ object SparkRefreshRewriter {
             Seq(rewriteSnapshotDrop(stmt, viewLogicalName))
           case StatementKind.Unknown => Nil
         }
+        // Only the materialized suffix protocol has independently skippable
+        // branches. Keep schema-only old/new views and all cleanup unconditional.
+        val marker =
+          if (!runningSuffix) ""
+          else
+            kind match {
+              case StatementKind.RunningWindowFastInsert | StatementKind.RunningWindowCascadeInsert =>
+                RunningWindowSuffixMarker
+              case StatementKind.RunningWindowTempCreate
+                  if stmt.toUpperCase.startsWith(
+                    s"CREATE OR REPLACE TEMP TABLE OPENIVM_RUN_RESULT_${viewLogicalName.toUpperCase} AS"
+                  ) ||
+                    stmt.toUpperCase.startsWith(
+                      s"CREATE OR REPLACE TEMP TABLE OPENIVM_RUN_SUFFIX_${viewLogicalName.toUpperCase} AS"
+                    ) =>
+                RunningWindowSuffixMarker
+              case StatementKind.ViewDeltaInsert | StatementKind.SnapshotDataInsert |
+                  StatementKind.PartitionScopedDelete | StatementKind.PartitionScopedInsert |
+                  StatementKind.ScalarDeleteMv | StatementKind.ScalarFullRecomputeInsert |
+                  StatementKind.SimpleProjectionDataInsert =>
+                RunningWindowFallbackMarker
+              case _ => ""
+            }
+        emitted.map(s => if (marker.isEmpty) s else s"$marker\n$s")
       }
 
       val rewritten = stmts.flatMap { stmt =>
@@ -628,7 +736,10 @@ object SparkRefreshRewriter {
       val withDedupedSource  = withAliasFixup.map(s => deduplicateNullSafeMergeSource(s, mvName))
       val withSemiJoinRewrite =
         withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
-      val withPublishedSnapshotReuse = reuseFullyReplacedTargetInCascade(withSemiJoinRewrite, mvName, viewLogicalName)
+      val withPublishedSnapshotReuse =
+        if (reusePublishedSnapshotForCascade)
+          reuseFullyReplacedTargetInCascade(withSemiJoinRewrite, mvName, viewLogicalName)
+        else withSemiJoinRewrite
       RewrittenRefresh(withPublishedSnapshotReuse.map(postProcess), hasRunningWindowProgram, cascade.map(_.inputPath))
     } finally {
       activeQualifiedNames.set(prior)
@@ -851,6 +962,7 @@ object SparkRefreshRewriter {
     val newSnapshotName   = s"OPENIVM_NEW_${viewLogicalName.toUpperCase}"
     val runTempPrefix     = "OPENIVM_RUN_"
     val runTempViewSuffix = s"_${viewLogicalName.toUpperCase}"
+    val runResultName     = s"OPENIVM_RUN_RESULT_${viewLogicalName.toUpperCase}"
     val compactName       = s"OPENIVM_OLD_COMPACT_${viewLogicalName.toUpperCase}"
     // openivm-side compact_delta_view cleanup statements:
     //   1. CREATE TEMP TABLE openivm_old_compact_<view> AS SELECT ... FROM openivm_delta_<view> GROUP BY ...
@@ -896,11 +1008,11 @@ object SparkRefreshRewriter {
       StatementKind.SnapshotDrop
     } else if (
       upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}") &&
-      (upper.contains("OPENIVM_RUN_FAST_") || upper.contains("OPENIVM_RUN_RESULT_"))
+      (upper.contains("OPENIVM_RUN_FAST_") || upper.contains(s"FROM $runResultName"))
     ) {
       // WINDOW running-suffix fast-path cascade delta: an APPEND of the
       // suffix-appended rows (multiplicity +1) into openivm_delta_<view>, whose
-      // SELECT reads the source delta + the run_fast/run_state temp views. The
+      // SELECT reads either the cached run_result or the legacy fast/state views. The
       // fallback cascade (openivm_old/openivm_new signed-multiset) is emitted
       // FIRST and CTAS-creates the view-delta path (ViewDeltaInsert); this
       // statement appends to it. Distinguished from the fallback cascade by the
@@ -951,7 +1063,7 @@ object SparkRefreshRewriter {
       StatementKind.SnapshotDataInsert
     } else if (
       upper.contains(s"INSERT INTO OPENIVM_DATA_${viewLogicalName.toUpperCase}") &&
-      (upper.contains(" OPENIVM_RUN_FAST_") || upper.contains(" OPENIVM_RUN_RESULT_"))
+      (upper.contains(" OPENIVM_RUN_FAST_") || upper.contains(s"FROM $runResultName"))
     ) {
       StatementKind.RunningWindowFastInsert
     } else if (
@@ -1084,8 +1196,10 @@ object SparkRefreshRewriter {
     def terminalScan(cteName: String, seen: Set[String] = Set.empty): Option[(String, String)] = {
       if (seen(cteName)) return None
       byName.get(cteName).flatMap { cte =>
+        // The native compiler normalizes internal delta references to bare
+        // names. The source/delta identity check below still guards the fold.
         val scan =
-          "(?is)^\\s*SELECT\\s+(.+?)\\s+FROM\\s+`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*`?([A-Za-z0-9_]+)`?\\s*$".r
+          "(?is)^\\s*SELECT\\s+(.+?)\\s+FROM\\s+(?:`?memory`?\\s*\\.\\s*`?main`?\\s*\\.\\s*)?`?(openivm_delta_[A-Za-z0-9_]+)`?\\s*$".r
         cte.body match {
           case scan(columns, table) => Some(table -> columns.trim)
           case _                    => singleDependency(cte.body).flatMap(terminalScan(_, seen + cteName))
@@ -1279,17 +1393,45 @@ object SparkRefreshRewriter {
         )
     }
 
-    val operand =
-      "((?:(?i:CAST)\\s*\\(\\s*)?(?:(`?[A-Za-z][A-Za-z0-9_]*`?)\\s*\\.\\s*)?(`?[A-Za-z][A-Za-z0-9_]*`?)(?:\\s+(?i:AS)\\s+([A-Za-z][A-Za-z0-9_]*(?:\\s*\\([^)]*\\))?)\\s*\\))?)"
-    val equality = ("(?s)" + operand + "\\s*=\\s*" + operand).r
+    // Only inner joins of direct relations can safely constrain the entire CTE.
+    def innerJoinConditions(plan: LogicalPlan): Option[Seq[Expression]] = plan match {
+      case project: Project      => innerJoinConditions(project.child)
+      case filter: Filter        => innerJoinConditions(filter.child)
+      case alias: SubqueryAlias  => innerJoinConditions(alias.child)
+      case _: UnresolvedRelation => Some(Seq.empty)
+      case join: Join if join.joinType == Inner =>
+        for {
+          left      <- innerJoinConditions(join.left)
+          right     <- innerJoinConditions(join.right)
+          condition <- join.condition
+        } yield left ++ right :+ condition
+      case _ => None
+    }
+
+    def equalityConjuncts(expression: Expression): Seq[EqualTo] = expression match {
+      case And(left, right)  => equalityConjuncts(left) ++ equalityConjuncts(right)
+      case equality: EqualTo => Seq(equality)
+      case _                 => Seq.empty
+    }
+
+    def columnRef(expression: Expression): Option[(Option[String], String, Option[String])] = expression match {
+      case attr: UnresolvedAttribute =>
+        attr.nameParts match {
+          case Seq(name)        => Some((None, name, None))
+          case Seq(alias, name) => Some((Some(alias), name, None))
+          case _                => None
+        }
+      case cast: Cast if cast.child.isInstanceOf[UnresolvedAttribute] =>
+        columnRef(cast.child).map { case (alias, name, _) => (alias, name, Some(cast.dataType.sql)) }
+      case _ => None
+    }
 
     ctes.flatMap { cte =>
       val refs = collectScd2RelationRefs(cte.body).filter(ref => byName.contains(ref.shortName.toLowerCase))
       if (refs.size < 2 || !"(?is)\\bINNER\\s+JOIN\\b".r.findFirstIn(cte.body).isDefined) Seq.empty
       else {
-        def relationFor(alias: String, column: String): Option[Scd2RelationRef] = {
-          val normalizedAlias = stripBackticks(Option(alias).getOrElse(""))
-          val normalizedCol   = stripBackticks(column)
+        def relationFor(alias: Option[String], column: String): Option[Scd2RelationRef] = {
+          val normalizedAlias = alias.getOrElse("")
           val candidates =
             if (normalizedAlias.nonEmpty)
               refs.filter(ref =>
@@ -1300,7 +1442,7 @@ object SparkRefreshRewriter {
               refs.filter { ref =>
                 byName
                   .get(ref.shortName.toLowerCase)
-                  .exists(parsedCteColumns(_).exists(_.equalsIgnoreCase(normalizedCol)))
+                  .exists(parsedCteColumns(_).exists(_.equalsIgnoreCase(column)))
               }
           candidates.distinct match {
             case Seq(single) => Some(single)
@@ -1308,31 +1450,35 @@ object SparkRefreshRewriter {
           }
         }
 
-        equality
-          .findAllMatchIn(cte.body)
-          .flatMap { m =>
-            val leftRef  = relationFor(m.group(2), m.group(3))
-            val rightRef = relationFor(m.group(6), m.group(7))
+        Try(CatalystSqlParser.parsePlan(cte.body)).toOption
+          .flatMap(innerJoinConditions)
+          .filter(_.size + 1 == refs.size)
+          .iterator
+          .flatten
+          .flatMap(equalityConjuncts)
+          .flatMap { equality =>
             for {
-              left        <- leftRef
-              right       <- rightRef
-              leftOrigin  <- origin(left.shortName)
-              rightOrigin <- origin(right.shortName)
+              (leftAlias, leftCol, leftCast)    <- columnRef(equality.left)
+              (rightAlias, rightCol, rightCast) <- columnRef(equality.right)
+              left                              <- relationFor(leftAlias, leftCol)
+              right                             <- relationFor(rightAlias, rightCol)
+              leftOrigin                        <- origin(left.shortName)
+              rightOrigin                       <- origin(right.shortName)
               site <- (leftOrigin, rightOrigin) match {
                 case (base, delta) if !base.isDelta && delta.isDelta =>
                   Some(
                     RegularNtermPruneSite(
                       cte.name,
-                      m.group(1).trim,
-                      RegularNtermKeyRequest(delta.shortName, stripBackticks(m.group(7)), Option(m.group(8)))
+                      equality.left.sql,
+                      RegularNtermKeyRequest(delta.shortName, rightCol, rightCast)
                     )
                   )
                 case (delta, base) if delta.isDelta && !base.isDelta =>
                   Some(
                     RegularNtermPruneSite(
                       cte.name,
-                      m.group(5).trim,
-                      RegularNtermKeyRequest(delta.shortName, stripBackticks(m.group(3)), Option(m.group(4)))
+                      equality.right.sql,
+                      RegularNtermKeyRequest(delta.shortName, leftCol, leftCast)
                     )
                   )
                 case _ => None
@@ -2081,7 +2227,7 @@ object SparkRefreshRewriter {
     *   3. Leading AND: `WHERE openivm_timestamp OP '...'::TIMESTAMP AND <filter>`
     *      — strip only the `openivm_timestamp … AND ` prefix.
     */
-  private[common] def stripTimestampPredicate(sql: String): String = {
+  private[spark] def stripTimestampPredicate(sql: String): String = {
     // The column can be optionally qualified with a table alias prefix
     // (e.g. `d.openivm_timestamp` in the AGGREGATE_GROUP retract companion
     // emitted by openivm when `force_view_delta_cascade=true`).
@@ -3215,16 +3361,27 @@ object SparkRefreshRewriter {
               }
               .getOrElse(stmt)
           case None =>
-            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)(?:\s+(?:AS\s+)?(\w+))?\s+WHERE\s+(.+?)\s*$""".r
+            val tempRe = """(?is)^\s*SELECT\s+\S+\s+FROM\s+(\S+)\s+(?:(?:AS\s+)?(\w+)\s+)?WHERE\s+(.+?)\s*$""".r
             tempRe
               .findFirstMatchIn(existsBody)
               .map { t =>
-                val src      = t.group(1)
-                val affAlias = Option(t.group(2)).getOrElse(src)
-                val onCond   = normalizeDeleteExistsMatchAliases(t.group(3), tgtAlias, affAlias)
-                val source   = if (ctePrefix.isEmpty) src else s"(\n$ctePrefix\nSELECT * FROM $src\n)"
+                val src = t.group(1)
+                val onCond = Option(t.group(2)) match {
+                  case Some(affAlias) => normalizeDeleteExistsMatchAliases(t.group(3), tgtAlias, affAlias)
+                  case None if src.equalsIgnoreCase("openivm_affected") =>
+                    // Native FULL OUTER projection deletes use an alias-free
+                    // one-column affected-key CTE. Qualify its key separately
+                    // from the target's two hidden join keys for Delta MERGE.
+                    val keys = "(?i)(?<![A-Za-z0-9_.])(_k|openivm_left_key|openivm_right_key)(?![A-Za-z0-9_])".r
+                    keys.replaceAllIn(
+                      t.group(3),
+                      k => s"${if (k.group(1).equalsIgnoreCase("_k")) "d" else "v"}.${k.group(1)}"
+                    )
+                  case None => normalizeDeleteExistsMatchAliases(t.group(3), tgtAlias, src)
+                }
+                val usingSql = if (ctePrefix.isEmpty) src else s"(\n$ctePrefix\nSELECT * FROM $src\n)"
                 s"""|MERGE INTO $mvRef AS v
-                  |USING $source AS d
+                  |USING $usingSql AS d
                   |ON $onCond
                   |WHEN MATCHED THEN DELETE""".stripMargin
               }
@@ -3551,8 +3708,9 @@ object SparkRefreshRewriter {
     * lazy Spark `TEMPORARY VIEW` re-evaluates the snapshot AFTER the MV is
     * mutated, so bounds/fallback/state go stale (the backdated partition loses
     * its recomputed rows; the fast cascade reads post-insert state). We
-    * therefore emit the view AND an eager `CACHE TABLE` so the snapshot is
-    * frozen at creation time, matching openivm's materialised-temp-table
+    * therefore eagerly cache snapshots at creation time. The fast/fallback
+    * filters stay lazy over cached bounds and need no separate materialization.
+    * This matches openivm's materialised-temp-table
     * semantics. The trailing `DROP VIEW` (RunningWindowTempDrop) auto-uncaches.
     */
   private def rewriteRunningWindowTempCreate(
@@ -3567,6 +3725,10 @@ object SparkRefreshRewriter {
     val nameRe =
       "(?is)CREATE\\s+OR\\s+REPLACE\\s+TEMPORARY\\s+VIEW\\s+`?([A-Za-z0-9_]+)`?\\s+AS".r
     nameRe.findFirstMatchIn(s) match {
+      case Some(m)
+          if m.group(1).equalsIgnoreCase(s"openivm_run_fast_$viewLogicalName") ||
+            m.group(1).equalsIgnoreCase(s"openivm_run_fallback_$viewLogicalName") =>
+        Seq(s)
       case Some(m) => Seq(s, s"CACHE TABLE `${m.group(1)}`")
       case None    => Seq(s)
     }
@@ -3584,11 +3746,8 @@ object SparkRefreshRewriter {
     * openivm emits (for a cascade-source cumulative window):
     * {{{
     *   INSERT INTO openivm_delta_<view>
-    *   SELECT <running-adjusted cols>, CAST(1 AS INTEGER), CURRENT_TIMESTAMP
-    *   FROM   openivm_delta_<src> d
-    *   JOIN   openivm_run_fast_<view>  fk ON …
-    *   LEFT JOIN openivm_run_state_<view> s ON …
-    *   WHERE  d.openivm_multiplicity > 0 AND openivm_timestamp > '…'
+    *   SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP
+    *   FROM openivm_run_result_<view>
     * }}}
     *
     * The fallback cascade (`openivm_old`/`openivm_new` signed-multiset, emitted
@@ -3692,20 +3851,11 @@ object SparkRefreshRewriter {
     s
   }
 
-  /** Rewrites the current-diff full-query snapshot into a Spark TEMPORARY VIEW. */
-  private def rewriteCurrentSnapshotCreate(stmt: String): String = {
-    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
-    s = stripTimestampPredicate(s)
-    s = rewriteMemoryMainPrefix(s)
-    s = rewriteExcludeAsExcept(s)
-    s
-  }
-
-  /** Rewrites the pragma-gated `openivm_new_<view>` snapshot create into a
-    * Spark TEMPORARY VIEW. The query itself stays live because it only depends
-    * on stable source staging / base tables during the current refresh.
+  /** Rewrites current-diff and new-state source snapshots into Spark TEMPORARY
+    * VIEWs. Their queries stay live over stable source staging / base tables
+    * during the current refresh.
     */
-  private def rewriteNewSnapshotCreate(stmt: String): String = {
+  private def rewriteSourceSnapshotCreate(stmt: String): String = {
     var s = rewriteCreateOrReplaceTempTableAsView(stmt)
     s = stripTimestampPredicate(s)
     s = rewriteMemoryMainPrefix(s)
@@ -3950,7 +4100,7 @@ object SparkRefreshRewriter {
     // an optional table alias after FROM.  The trailing `)` / token boundary
     // is captured so we can splice cleanly.
     val re =
-      """(?is)SELECT\s+\*\s+EXCEPT\s*\(([^)]+)\)\s+FROM\s+`?(openivm_delta_[A-Za-z0-9_]+)`?""".r
+      """(?is)SELECT\s+\*\s+(?:EXCEPT|EXCLUDE)\s*\(([^)]+)\)\s+FROM\s+`?(openivm_delta_[A-Za-z0-9_]+)`?""".r
     re.replaceAllIn(
       sql,
       mm => {

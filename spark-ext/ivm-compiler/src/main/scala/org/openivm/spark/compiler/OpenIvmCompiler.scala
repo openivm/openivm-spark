@@ -2,7 +2,9 @@ package org.openivm.spark.compiler
 
 import java.io.{File, IOException}
 import java.nio.file.{Files, Path, Paths}
-import java.util.{Comparator, Locale}
+import java.nio.ByteBuffer
+import java.security.MessageDigest
+import java.util.{Comparator, Locale, UUID}
 import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
 
 import org.apache.spark.sql.types._
@@ -10,6 +12,7 @@ import org.openivm.spark.common.{
   DeltaShape,
   ForeignKeyRelation,
   MemoryMainRefs,
+  MvMetadata,
   PinnedSourcePathMissingException,
   WorkloadFacts
 }
@@ -97,6 +100,53 @@ class OpenIvmCompiler private (
 
   @volatile private var closed: Boolean = false
 
+  val cacheGeneration: String = UUID.randomUUID().toString
+
+  /** Cache the raw native program, never rewritten executable statements. The
+    * generation prevents reuse after a compiler/bridge restart or upgrade.
+    * Quantitative statistics are deliberately absent: the pinned native facts
+    * parser ignores them; Spark consumes current statistics after lookup.
+    */
+  def compileCacheTier(req: CompileRequest): String = {
+    val digest = MessageDigest.getInstance("SHA-256")
+    def add(value: String): Unit = {
+      val bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      digest.update(ByteBuffer.allocate(4).putInt(bytes.length).array())
+      digest.update(bytes)
+    }
+    Seq(req.viewName, req.viewSql, MvMetadata.compileCacheTier(req.facts)).foreach(add)
+    add(req.sources.size.toString)
+    req.sources.toSeq.sortBy(_._1).foreach { case (name, schema) => add(name); add(schema.json) }
+    Seq(req.sourceQualifiedNames, req.sourceSnapshotPinnedPaths).foreach { bindings =>
+      add(bindings.size.toString)
+      bindings.toSeq.sortBy(_._1).foreach { case (name, value) => add(name); add(value) }
+    }
+    s"$cacheGeneration:${digest.digest().map("%02x".format(_)).mkString}"
+  }
+
+  /** Verify the native deployment once before allowing query-specific fallbacks.
+    * The probe uses empty compiler tables; it never reads or writes Spark data.
+    */
+  def verifyRuntime(): Unit = {
+    try {
+      val result = compile(
+        CompileRequest(
+          viewName = "openivm_runtime_probe",
+          viewSql = "SELECT id FROM openivm_runtime_source",
+          sources = Map("openivm_runtime_source" -> StructType(Seq(StructField("id", IntegerType))))
+        )
+      )
+      if (result.refreshTypeName == "FULL_REFRESH" || result.sql.trim.isEmpty)
+        throw new IllegalStateException("Native compiler probe did not produce an incremental projection")
+    } catch {
+      case e: OpenIvmCompileException =>
+        throw new IllegalStateException(
+          s"OpenIVM native compiler is unavailable; refusing full-refresh fallback: ${e.getMessage}",
+          e
+        )
+    }
+  }
+
   /** Translates `req.viewSql` into a [[CompiledRefresh]] by registering empty
     * source tables, creating a temporary materialized view, invoking
     * `openivm_compile_with_facts`, and tearing down the ephemeral DuckDB
@@ -179,17 +229,17 @@ class OpenIvmCompiler private (
       }
       lastStdout = stdout
       lastStderr = stderr
-      val nativeKey = stdout.linesIterator
-        .find(_.contains("\"openivm_compiler_view_key\""))
+      val nativeViewName = stdout.linesIterator
+        .find(_.contains("\"openivm_bridge_view_key\""))
         .map { line =>
-          val valueStart = nextStringStart(line, line.indexOf(':') + 1)
-          decodeJsonString(line, valueStart)._1
+          val key = "\"openivm_bridge_view_key\""
+          decodeJsonString(line, nextStringStart(line, line.indexOf(key) + key.length))._1
         }
         .getOrElse(req.viewName)
       val partial  = parseCompileResult(stdout, req.viewName, stderr)
-      val initLoad = parseInitialLoadSql(tmpDir, req, nativeKey)
+      val initLoad = parseInitialLoadSql(tmpDir, req, nativeViewName)
       partial.copy(
-        sql = OpenIvmCompiler.normalizeNativeViewObjects(partial.sql, nativeKey, req.viewName),
+        sql = OpenIvmCompiler.normalizeNativeViewObjects(partial.sql, nativeViewName, req.viewName),
         initialLoadSql = initLoad
       )
     } catch {
@@ -308,7 +358,8 @@ class OpenIvmCompiler private (
     // return); DuckDB only needs the binder to succeed during compile.
     sb ++= OpenIvmCompiler.sparkFunctionShimsPrologue
     sb ++= s"CREATE OR REPLACE MATERIALIZED VIEW ${req.viewName} AS $normalizedViewSql;\n"
-    sb ++= s"SELECT view_name AS openivm_compiler_view_key FROM openivm_views WHERE view_sql_name='${escapeSql(req.viewName)}';\n"
+    sb ++= "SELECT view_name AS openivm_bridge_view_key FROM openivm_views " +
+      s"WHERE view_sql_name='${escapeSql(req.viewName)}' AND view_catalog=current_database() AND view_schema=current_schema();\n"
     // Spark owns the public Delta view; the private DuckDB instance only binds maintenance state.
     sb ++= s"UPDATE openivm_views SET published_query=NULL WHERE view_sql_name='${escapeSql(req.viewName)}';\n"
     // openivm_compile_with_facts is the per-call compile entry point. It
@@ -324,9 +375,7 @@ class OpenIvmCompiler private (
     //                                   for AGGREGATE_GROUP / AGGREGATE_HAVING /
     //                                   WINDOW_PARTITION / GROUP_RECOMPUTE so depth-2
     //                                   MV-over-MV chains never fall back to FULL_REFRESH.
-    // The temporary DuckDB source tables use short names, so qualified Spark facts need the same identity.
-    val nativeFacts = req.facts.copy(deltaShape = nativeDeltaShape(req))
-    sb ++= s"SELECT * FROM openivm_compile_with_facts('${escapeSql(req.viewName)}', '${escapeSql(nativeFacts.toJson)}');\n"
+    sb ++= s"SELECT * FROM openivm_compile_with_facts('${escapeSql(req.viewName)}', '${escapeSql(compilerSourceFacts(req).toJson)}');\n"
     sb.toString
   }
 
@@ -518,23 +567,43 @@ class OpenIvmCompiler private (
     )
   }
 
-  private[compiler] def nativeSourceName(req: CompileRequest, table: String): Option[String] = {
-    val exactShort = req.sources.keys.find(_.equalsIgnoreCase(table))
-    val fromQual = req.sourceQualifiedNames.collectFirst {
-      case (short, qualified) if qualified.equalsIgnoreCase(table) && req.sources.contains(short) => short
-    }
-    val trailing =
-      table.split('.').lastOption.flatMap(short => req.sources.keys.find(_.equalsIgnoreCase(short))).filter { short =>
-        !req.sourceQualifiedNames.keys.exists(_.equalsIgnoreCase(short))
-      }
-    exactShort.orElse(fromQual).orElse(trailing)
+  private def compilerSourceName(req: CompileRequest, table: String): Option[String] = {
+    val parts = SparkTimeTravelSql.caseSensitiveSegments(table)
+    val matches = req.sources.keysIterator.filter { short =>
+      SparkTimeTravelSql.caseSensitiveSegments(short) == parts ||
+      req.sourceQualifiedNames.get(short).exists(SparkTimeTravelSql.caseSensitiveSegments(_) == parts)
+    }.toVector
+    if (matches.size == 1) Some(matches.head) else None
   }
 
-  private[compiler] def nativeDeltaShape(req: CompileRequest): Map[String, DeltaShape] =
-    req.facts.deltaShape.foldLeft(Map.empty[String, DeltaShape]) { case (mapped, (table, shape)) =>
-      val source = nativeSourceName(req, table).getOrElse(table)
-      mapped.updated(source, mapped.get(source).filter(_ != shape).map(_ => DeltaShape.General).getOrElse(shape))
-    }
+  /** The body is bound against synthetic main.<short> tables. Structural facts
+    * must use those same identities; a Spark schema is not a DuckDB schema.
+    * Ignore unbound/ambiguous facts rather than matching another schema by suffix.
+    * Preserve case because the caller's physical catalog can be case-sensitive.
+    */
+  private[compiler] def compilerSourceFacts(req: CompileRequest): WorkloadFacts = {
+    val shapes = req.facts.deltaShape.toSeq
+      .flatMap { case (table, shape) =>
+        compilerSourceName(req, table).map(_ -> shape)
+      }
+      .groupBy(_._1)
+      .map { case (table, entries) =>
+        val distinct = entries.map(_._2).distinct
+        table -> (if (distinct.size == 1) distinct.head else DeltaShape.General)
+      }
+    req.facts.copy(
+      deltaShape = shapes,
+      fkRelations = req.facts.fkRelations.flatMap { fk =>
+        for {
+          child  <- compilerSourceName(req, fk.childTable)
+          parent <- compilerSourceName(req, fk.parentTable)
+        } yield fk.copy(childTable = child, parentTable = parent)
+      }.distinct,
+      uniqueKeys = req.facts.uniqueKeys.flatMap { key =>
+        compilerSourceName(req, key.table).map(table => key.copy(table = table))
+      }.distinct
+    )
+  }
 
   private[compiler] def declareRelyFkStatements(req: CompileRequest): Seq[String] = {
     if (!req.facts.declareRelyFk) return Seq.empty
@@ -543,8 +612,8 @@ class OpenIvmCompiler private (
       .filter(fk => fk.rely && fk.childColumns.nonEmpty && fk.parentColumns.nonEmpty)
       .flatMap { fk =>
         for {
-          child  <- nativeSourceName(req, fk.childTable)
-          parent <- nativeSourceName(req, fk.parentTable)
+          child  <- compilerSourceName(req, fk.childTable)
+          parent <- compilerSourceName(req, fk.parentTable)
         } yield declareRelyFkStatement(fk.copy(childTable = child, parentTable = parent))
       }
       .distinct
@@ -754,13 +823,16 @@ class OpenIvmCompiler private (
     * `req.sourceQualifiedNames`), and is run through [[LptsSparkDialect.translate]]
     * to handle DuckDB-isms (e.g. `count_star()`, `::TIMESTAMP` casts).
     */
-  private[compiler] def parseInitialLoadSql(tmpDir: Path, req: CompileRequest, nativeKey: String = ""): String = {
+  private[compiler] def parseInitialLoadSql(tmpDir: Path, req: CompileRequest, nativeViewName: String = ""): String = {
     import java.util.regex.Pattern
-    val key  = if (nativeKey.isEmpty) req.viewName else nativeKey
-    val file = tmpDir.resolve(s"openivm_compiled_queries_$key.sql")
+    val nativeName = if (nativeViewName.isEmpty) req.viewName else nativeViewName
+    val file       = tmpDir.resolve(s"openivm_compiled_queries_$nativeName.sql")
     if (!Files.exists(file)) return ""
-    val content =
-      OpenIvmCompiler.normalizeNativeViewObjects(new String(Files.readAllBytes(file), "UTF-8"), key, req.viewName)
+    val content = OpenIvmCompiler.normalizeNativeViewObjects(
+      new String(Files.readAllBytes(file), "UTF-8"),
+      nativeName,
+      req.viewName
+    )
 
     val pat = Pattern.compile(
       s"(?is)create\\s+table\\s+openivm_data_${Pattern.quote(req.viewName)}\\s+as\\s+((?:WITH\\b|SELECT\\b).+?);",
@@ -921,7 +993,7 @@ object OpenIvmCompiler {
       if (objects.lookingAt()) {
         val replacement = Option(objects.group(4)).getOrElse {
           val name = Option(objects.group(1)).orElse(Option(objects.group(2))).getOrElse(objects.group(3))
-          name.replace(nativeKey, viewName)
+          if (nativeKey.nonEmpty && name.endsWith(nativeKey)) name.stripSuffix(nativeKey) + viewName else name
         }
         Some(objects.end() -> replacement)
       } else None

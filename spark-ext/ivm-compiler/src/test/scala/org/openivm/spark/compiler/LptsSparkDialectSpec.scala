@@ -11,6 +11,14 @@ import org.scalatest.matchers.should.Matchers
   */
 class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
+  describe("quoted null cast types in native fallback queries") {
+    it("unquotes type names while preserving literals and quoted column aliases") {
+      val query    = "SELECT CAST(NULL AS \"DATE\"), CAST(NULL AS `TIMESTAMP`), 'CAST(NULL AS \"DATE\")' AS \"DATE\""
+      val expected = "SELECT CAST(NULL AS DATE), CAST(NULL AS TIMESTAMP), 'CAST(NULL AS \"DATE\")' AS `DATE`"
+      LptsSparkDialect.translate(query) shouldBe expected
+    }
+  }
+
   describe("parenthesized boolean scan filters") {
     it("removes redundant parentheses that Spark misanalyzes in generated CTEs") {
       val sql        = "WITH r(flag) AS (SELECT flag FROM source WHERE   (flag)) SELECT * FROM r"

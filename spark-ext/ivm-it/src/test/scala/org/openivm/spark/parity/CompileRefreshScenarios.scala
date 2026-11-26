@@ -187,6 +187,9 @@ abstract class CompileRefreshScenarios extends IvmParitySpecBase("compile-refres
       result.sql should include regex """(?is)\bFROM\s+openivm_delta_sales\b"""
       result.sql should not include "`memory`.`main`.`openivm_delta_sales`"
       result.initialLoadSql should include("`analytics`.`sales`")
+      result.sql should include("INSERT INTO openivm_delta_mv_sales_proj")
+      result.sql should include("FROM openivm_data_mv_sales_proj")
+      result.sql should not include "openivm_data___openivm_mv_"
     }
 
     // openivm Test 5 — AGGREGATE_GROUP shape, compile returns non-empty SQL.
