@@ -5275,9 +5275,10 @@ case class RefreshMaterializedViewCommand(
       // Resolve current source schemas and check for schema drift. Include
       // upstream MV identity hashes so a DROP + recreate-with-same-schema
       // upstream is also caught.
-      val (freshSchemas, freshMvIdentityBySource, freshFingerprint) =
+      val (freshSchemas, freshFingerprint, currentSourceRelations) =
         profile.timeStep("metadata_pre_sql", "phase=schema_resolve") {
           RefreshPerf.timePhase(refreshId, viewLabel, "schema_resolve") {
+            val relations = Map.newBuilder[String, DataFrame]
             val schemas = meta.sourceTables.map { source =>
               val schema = preparedSourceAdvance
                 .flatMap(_.batchFor(source))
@@ -5285,7 +5286,11 @@ case class RefreshMaterializedViewCommand(
                   val expected = SourceVersionDelta.schemaAt(spark, source, batch.startVersionInclusive)
                   SourceVersionDelta.validate(spark, batch, expected)
                 }
-                .getOrElse(spark.table(source).schema)
+                .getOrElse {
+                  val relation = spark.table(source)
+                  relations += source -> relation
+                  relation.schema
+                }
               source -> schema
             }.toMap
             val identityMap: Map[String, String] = {
@@ -5297,7 +5302,7 @@ case class RefreshMaterializedViewCommand(
               }.toMap
             }
             val fp = MvCatalog.schemaFingerprint(schemas, identityMap)
-            (schemas, identityMap, fp)
+            (schemas, fp, relations.result())
           }
         }
       if (freshFingerprint != meta.sourceSchemaFingerprint) {
@@ -5313,11 +5318,6 @@ case class RefreshMaterializedViewCommand(
           )
         )
       }
-      // Reference the identity map so the unused-binding inference doesn't trip
-      // the -Ywarn-unused:imports compile flag (the value is intentionally kept
-      // local — debugging will want it).
-      val _ = freshMvIdentityBySource
-
       def verdictForSource(source: String): Option[BatchVerdict] =
         cdfBatchVerdicts
           .get(source)
@@ -6184,17 +6184,21 @@ case class RefreshMaterializedViewCommand(
                 case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
               } ++ sourceSnapshotAdvanceOldVersions
               val snapshotRelations = snapshotVersions.flatMap { case (source, version) =>
-                if (
-                  !executionSnapshotPinsByQualified.keys.exists(_.equalsIgnoreCase(source)) &&
-                  MvProjectionSource.isProjection(spark, source)
-                ) {
-                  val tempName = s"openivm_source_snapshot_${source.split("\\.").last}"
-                  MvProjectionSource
-                    .read(spark, source, Map("versionAsOf" -> version.toString))
-                    .createOrReplaceTempView(tempName)
-                  sourceSnapshotTempViews += tempName
-                  Some(source -> s"`${tempName.replace("`", "``")}`")
-                } else None
+                if (executionSnapshotPinsByQualified.keys.exists(_.equalsIgnoreCase(source))) None
+                else {
+                  val relation = currentSourceRelations.get(source).orElse {
+                    try Some(spark.table(source))
+                    catch { case _: AnalysisException => None }
+                  }
+                  relation
+                    .flatMap(MvProjectionSource.readProjection(spark, _, Map("versionAsOf" -> version.toString)))
+                    .map { snapshot =>
+                      val tempName = s"openivm_source_snapshot_${source.split("\\.").last}"
+                      snapshot.createOrReplaceTempView(tempName)
+                      sourceSnapshotTempViews += tempName
+                      source -> s"`${tempName.replace("`", "``")}`"
+                    }
+                }
               }
               SparkRefreshRewriter.rewrite(
                 compiledSql = compiled.sql,
