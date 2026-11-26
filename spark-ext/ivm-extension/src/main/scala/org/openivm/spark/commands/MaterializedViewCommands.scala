@@ -36,18 +36,25 @@ import org.apache.spark.sql.catalyst.plans.logical.{
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
-import org.apache.spark.sql.functions.{col, lit, sum, when}
+import org.apache.spark.sql.functions.{col, count, lit, sum, when}
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.types.{
   ArrayType,
+  BooleanType,
   ByteType,
   DataType,
+  DateType,
+  DecimalType,
+  DoubleType,
+  FloatType,
   IntegerType,
   LongType,
   MapType,
   ShortType,
   StructField,
-  StructType
+  StructType,
+  TimestampNTZType,
+  TimestampType
 }
 import org.openivm.spark.analyzer.{IvmDmlInterceptorRule, SourceChangeLedger}
 import org.openivm.spark.common._
@@ -6465,7 +6472,7 @@ case class RefreshMaterializedViewCommand(
               // reads in-memory. If downstream MVs exist, the global-temp view name
               // is recorded as an MV_VIEW_DELTA staging ref so the cascade input is
               // still readable without writing the scratch to disk.
-              val fusedView: Option[String] =
+              val fusedScratch =
                 if (fuseEligible)
                   SparkRefreshRewriter
                     .extractViewDeltaCtasBody(
@@ -6477,14 +6484,30 @@ case class RefreshMaterializedViewCommand(
                       val qOrder      = qlogOrder.getAndIncrement()
                       val t0          = System.nanoTime()
                       try {
-                        val rowCount = withPlanTimeBroadcastDisabled {
-                          val d = spark.sql(selectBody)
-                          d.createOrReplaceGlobalTempView(scratchView)
-                          spark.catalog.cacheTable(s"global_temp.$scratchView")
-                          // Force materialisation so the cache holds the rows before
-                          // any negative-row probe / INSERT read. count() is the
-                          // cheapest force-eval action that respects the cache.
-                          spark.table(s"global_temp.$scratchView").count()
+                        val (rowCount, scratch) = withPlanTimeBroadcastDisabled {
+                          val delta = spark.sql(selectBody)
+                          delta.createOrReplaceGlobalTempView(scratchView)
+                          val ref = s"global_temp.$scratchView"
+                          spark.catalog.cacheTable(ref)
+                          // Force the cache and derive both append checks in the
+                          // same scan, including NULL weights from partial recomputes.
+                          val weight = col("openivm_multiplicity")
+                          val stats = spark
+                            .table(ref)
+                            .agg(
+                              count(lit(1)),
+                              count(when(weight.isNull || weight < lit(0), lit(1))),
+                              count(when(weight === lit(0), lit(1))),
+                              count(when(weight =!= lit(1), lit(1)))
+                            )
+                            .head()
+                          val rows        = stats.getLong(0)
+                          val hasRetracts = stats.getLong(1) != 0L
+                          val allPositive = !hasRetracts && stats.getLong(2) == 0L
+                          val partitions =
+                            if (allPositive && stats.getLong(3) == 0L) compactAppendPartitions(delta.schema, rows)
+                            else None
+                          (rows, FusedProjectionScratch(scratchView, hasRetracts, allPositive, partitions))
                         }
                         val elapsedMs = (System.nanoTime() - t0) / 1000000L
                         advanceStmtCounterPast(0)
@@ -6510,7 +6533,7 @@ case class RefreshMaterializedViewCommand(
                           durationMs = elapsedMs
                         )
                         fusedScratchView = Some(scratchView)
-                        Some(scratchView)
+                        Some(scratch)
                       } catch {
                         case t: Throwable =>
                           sqlLog.record(
@@ -6535,19 +6558,9 @@ case class RefreshMaterializedViewCommand(
                     }
                 else None
 
-              // The non-append-row probe operates against either the cached temp
-              // view (fuse) or the on-disk scratch (existing path).
-              lazy val hasNonAppendRowsHere: Boolean = fusedView match {
-                case Some(view) =>
-                  spark
-                    .sql(
-                      s"SELECT 1 FROM ${StagingDeltaView.CachedViewDeltaRef.sqlRef(view)} " +
-                        "WHERE `openivm_multiplicity` < 0 OR `openivm_multiplicity` IS NULL LIMIT 1"
-                    )
-                    .head(1)
-                    .nonEmpty
-                case None => hasNonAppendRows
-              }
+              val fusedView = fusedScratch.map(_.viewName)
+              lazy val hasNonAppendRowsHere =
+                fusedScratch.fold(hasNonAppendRows)(_.hasNonAppendRows)
 
               if (fusedView.isEmpty) {
                 withPlanTimeBroadcastDisabled {
@@ -6589,12 +6602,15 @@ case class RefreshMaterializedViewCommand(
                         .contains("openivm_multiplicity") && mvCols.nonEmpty && mvCols.forall(deltaCols.contains) &&
                       // Partial-recompute deltas may carry keys with unknown weights.
                       // They cannot be expanded as an exact bag of appended rows.
-                      deltaRows.filter("openivm_multiplicity IS NULL OR openivm_multiplicity <= 0").head(1).isEmpty
+                      fusedScratch.fold(
+                        deltaRows.filter("openivm_multiplicity IS NULL OR openivm_multiplicity <= 0").head(1).isEmpty
+                      )(_.allPositive)
                     ) {
                       val colList = mvCols.map(c => s"`$c`").mkString(", ")
+                      val hint    = fusedScratch.flatMap(_.appendPartitions).fold("")(n => s"/*+ COALESCE($n) */ ")
                       Some(
                         s"""|INSERT INTO ${sqlIdent(mergeTargetId)} ($colList)
-                        |SELECT $colList FROM $src
+                        |SELECT $hint$colList FROM $src
                         |LATERAL VIEW EXPLODE(SEQUENCE(CAST(1 AS BIGINT), CAST(`openivm_multiplicity` AS BIGINT)))
                         |  _ivm_lv AS _ivm_i
                         |WHERE `openivm_multiplicity` > 0""".stripMargin
@@ -7801,6 +7817,29 @@ case class RefreshMaterializedViewCommand(
   private sealed trait WindowSinglePassPlan
 
   private case object WindowSinglePassNoAffectedPartitions extends WindowSinglePassPlan
+
+  private case class FusedProjectionScratch(
+      viewName: String,
+      hasNonAppendRows: Boolean,
+      allPositive: Boolean,
+      appendPartitions: Option[Int]
+  )
+
+  /** Small fixed-width, unit-weight bags need few output files. Coalesce only
+    * their direct append, after the cached delta has been computed in parallel.
+    */
+  private def compactAppendPartitions(schema: StructType, rows: Long): Option[Int] =
+    if (
+      rows <= 0 || rows > 32768 || schema.length > 64 || !schema.fields.forall { field =>
+        field.dataType match {
+          case BooleanType | ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType | DateType |
+              TimestampType | TimestampNTZType | _: DecimalType =>
+            true
+          case _ => false
+        }
+      }
+    ) None
+    else Some(((rows + 4095) / 4096).toInt)
 
   private case class WindowSinglePassWrite(
       directSql: String,

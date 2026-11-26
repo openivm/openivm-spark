@@ -2,6 +2,10 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
+import org.apache.hadoop.fs.Path
+import org.apache.spark.sql.delta.DeltaLog
+import org.apache.spark.sql.delta.actions.AddFile
+
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.core.appender.AbstractAppender
 import org.apache.logging.log4j.core.config.Property
@@ -11,7 +15,7 @@ import org.apache.logging.log4j.core.{LogEvent, Logger}
 import java.util.UUID
 import scala.collection.mutable.ArrayBuffer
 
-import org.openivm.spark.common.ChangeFeedMode
+import org.openivm.spark.common.{ChangeFeedMode, FeatureGate, RefreshSqlLogCatalog}
 
 /** Verifies the scratch-CTAS fuse fast path emits `fused='true'` on
   * stmt_kind='view_delta_ctas' for SIMPLE_PROJECTION MVs, reuses the cached
@@ -22,17 +26,17 @@ abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] =
-    if (changeFeedMode == ChangeFeedMode.Cdf)
-      Map(
-        // CDF must fuse automatically without either intercept-only opt-in.
-        "spark.openivm.fuseScratch.enabled"              -> "false",
-        "spark.openivm.fuseScratch.cascadeCache.enabled" -> "false"
-      )
-    else
-      Map(
-        "spark.openivm.fuseScratch.enabled"              -> "true",
-        "spark.openivm.fuseScratch.cascadeCache.enabled" -> "true"
-      )
+    (if (changeFeedMode == ChangeFeedMode.Cdf)
+       Map(
+         // CDF must fuse automatically without either intercept-only opt-in.
+         "spark.openivm.fuseScratch.enabled"              -> "false",
+         "spark.openivm.fuseScratch.cascadeCache.enabled" -> "false"
+       )
+     else
+       Map(
+         "spark.openivm.fuseScratch.enabled"              -> "true",
+         "spark.openivm.fuseScratch.cascadeCache.enabled" -> "true"
+       )) + (FeatureGate.QueryLogEnabledKey -> "true")
 
   private final class BufferingAppender(name: String)
       extends AbstractAppender(
@@ -88,6 +92,38 @@ abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
         } shouldBe true
       }
       assertMvCorrect("fuse_mv_leaf", "SELECT id, name FROM fuse_users_a WHERE age >= 25")
+    }
+
+    it("coalesces a small fixed-width outer-join append and keeps the mixed-change path correct") {
+      sql("CREATE TABLE fuse_write_source(id BIGINT, key INT) USING DELTA")
+      sql("CREATE TABLE fuse_write_dimension(key INT, value INT) USING DELTA")
+      sql("INSERT INTO fuse_write_source VALUES (1, 1)")
+      sql("INSERT INTO fuse_write_dimension VALUES (1, 10)")
+      val query =
+        "SELECT s.id, s.key, d.value FROM fuse_write_source s LEFT JOIN fuse_write_dimension d USING (key)"
+      sql(s"CREATE MATERIALIZED VIEW fuse_write_mv AS $query")
+      sql("INSERT INTO fuse_write_source SELECT id, 1 FROM range(2, 102, 1, 20)")
+
+      val before = mvDataVersion("fuse_write_mv")
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("fuse_write_mv")
+      assertMvCorrect("fuse_write_mv", query)
+      val statements = sql("SHOW OPENIVM QUERY LOG").collect().map(_.getString(9))
+      statements.exists(_.contains("/*+ COALESCE(1) */")) shouldBe true
+      val deltaLog = DeltaLog.forTable(spark, new Path(mvDataLocation("fuse_write_mv")))
+      val files = deltaLog
+        .getChanges(before + 1L, failOnDataLoss = true)
+        .flatMap { case (_, actions) => actions.collect { case add: AddFile if add.dataChange => add } }
+        .toVector
+      files should have size 1
+
+      sql("INSERT INTO fuse_write_source VALUES (102, 1), (103, 2)")
+      sql("UPDATE fuse_write_source SET key = 2 WHERE id = 102")
+      sql("DELETE FROM fuse_write_source WHERE id IN (1, 103)")
+      RefreshSqlLogCatalog.removeAll(spark)
+      refreshMv("fuse_write_mv")
+      assertMvCorrect("fuse_write_mv", query)
+      sql("SHOW OPENIVM QUERY LOG").collect().exists(_.getString(9).contains("/*+ COALESCE(")) shouldBe false
     }
 
     it("uses the fused scratch cache as the cascade input when an MV-over-MV chain depends on it") {
