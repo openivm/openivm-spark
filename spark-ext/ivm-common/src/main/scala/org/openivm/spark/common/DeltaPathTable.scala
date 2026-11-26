@@ -173,11 +173,11 @@ private[spark] object DeltaGroupCommit {
   /** Tags this thread's ready refresh as one that publishes a synchronous state backup under `key`. */
   private[common] def expectStateBackup(key: String): Unit = currentRefresh().foreach(_.stateKey = key)
 
-  /** Drops from `seen` the refreshes no longer ready and returns how many ready refreshes tagged with `key` have
-    * reached a group commit but are not in `seen`.
-    */
+  /** Drops from `seen` the refreshes no longer ready, so it never outgrows the refreshes in flight. */
+  private[common] def retainReady(seen: java.util.Set[AnyRef]): Unit = { seen.retainAll(readyArrivals); () }
+
+  /** Returns how many ready refreshes tagged with `key` have reached a group commit but are not in `seen`. */
   private[common] def unseenCommittingRefreshes(key: String, seen: java.util.Set[AnyRef]): Int = {
-    seen.retainAll(readyArrivals)
     var unseen = 0
     val it     = readyArrivals.iterator
     while (it.hasNext) {

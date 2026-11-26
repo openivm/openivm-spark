@@ -193,7 +193,10 @@ object OpenIvmStateSync {
       synchronousMonitor.synchronized {
         submittedRequests += 1L
         synchronousRequests += submitted
-        refresh.foreach(arrivedRefreshes.add)
+        refresh.foreach { arrival =>
+          DeltaGroupCommit.retainReady(arrivedRefreshes)
+          arrivedRefreshes.add(arrival)
+        }
         synchronousMonitor.notifyAll()
       }
       try {
