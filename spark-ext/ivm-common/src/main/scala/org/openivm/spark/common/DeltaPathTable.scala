@@ -22,9 +22,12 @@ private[common] object DeltaPathTable {
   * A writer enqueues its request. If no commit is in flight it becomes the leader, drains every pending request and
   * commits them together; writers that arrive meanwhile queue behind the in-flight commit and form the next batch.
   * Before draining, a leader may wait briefly for refreshes that hold their locks but have not reached this queue yet
-  * (see [[DeltaGroupCommit.RefreshArrival]]). It waits only while the expected saving outweighs the delay: with `k`
-  * requests pending, `m` refreshes awaited and a typical commit taking `C`, a straggler that misses the batch waits
-  * up to `2C` instead of `C`, so the leader waits at most `C * m / (k + m)`.
+  * (see [[DeltaGroupCommit.RefreshArrival]]). With `k` requests pending, `m` refreshes awaited and a typical commit
+  * taking `C`, it keeps the batch open until the oldest pending request has waited `C`, or for `C * m / (k + m)` if
+  * that is longer. A straggler that joins within `C` is durable no later than if it had queued behind the closed
+  * batch and then committed alone, so waiting for it never delays the last commit of the group. A batch whose
+  * requests already waited `C` behind an in-flight commit keeps only the per-request bound `C * m / (k + m)`, and
+  * the wait ends as soon as every awaited refresh has queued or ended.
   *
   * Every caller returns only after the commit covering its request is durable. A batch of one runs the caller's own
   * single-request path. If a multi-request batch fails, each caller re-runs its own recovery path (by default its
@@ -32,6 +35,7 @@ private[common] object DeltaPathTable {
   */
 private[common] final class DeltaGroupCommit[R] {
   private final class Slot(val request: R) {
+    val enqueued: Long       = System.nanoTime()
     var done: Boolean        = false
     var retrySingle: Boolean = false
     var failure: Throwable   = _
@@ -78,15 +82,19 @@ private[common] final class DeltaGroupCommit[R] {
     else if (mine.failure != null) throw mine.failure
   }
 
-  /** Holding leadership and this monitor, waits for awaited refreshes within the cost bound. False if interrupted. */
+  /** Holding leadership and this monitor, waits for awaited refreshes within the bounds above. False if interrupted.
+    * The leader's own request is pending, so the oldest pending request was enqueued no later than `start`.
+    */
   private def collect(): Boolean = {
-    val start = System.nanoTime()
-    var open  = true
+    val start  = System.nanoTime()
+    val oldest = pending.peekFirst().enqueued
+    var open   = true
     while (open) {
       val awaited = DeltaGroupCommit.readyRefreshes - arrived.size
+      val window  = math.min(commitNanos, DeltaGroupCommit.MaxWindowNanos)
       val budget =
         if (awaited <= 0) 0L
-        else math.min(commitNanos, DeltaGroupCommit.MaxWindowNanos) * awaited / (pending.size + awaited)
+        else math.max(window * awaited / (pending.size + awaited), oldest + window - start)
       val remaining = start + budget - System.nanoTime()
       if (remaining <= 0) open = false
       else
