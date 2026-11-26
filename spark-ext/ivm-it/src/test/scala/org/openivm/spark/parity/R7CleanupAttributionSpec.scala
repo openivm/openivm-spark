@@ -1,7 +1,6 @@
 package org.openivm.spark.parity
 
 import org.apache.hadoop.fs.{FSDataInputStream, FileStatus, LocalFileSystem, Path}
-import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.types.{LongType, StructField, StructType}
 import org.apache.spark.storage.StorageLevel
 import org.openivm.spark.common.{StagingDelta, StagingDeltaView}
@@ -13,9 +12,11 @@ import java.nio.file.{Files, Paths, StandardOpenOption}
 import java.sql.Timestamp
 
 object R7CleanupFs {
-  var active: Boolean        = false
-  var deltaLogCalls: Int     = 0
-  var uncacheStackCalls: Int = 0
+  private val current                = new ThreadLocal[java.lang.Boolean]()
+  def active: Boolean                = java.lang.Boolean.TRUE == current.get()
+  def active_=(value: Boolean): Unit = if (value) current.set(true) else current.remove()
+  var deltaLogCalls: Int             = 0
+  var uncacheStackCalls: Int         = 0
   def observe(path: Path): Unit = if (active && path.toString.contains("_delta_log")) {
     deltaLogCalls += 1
     if (R7CleanupProbe.inUncache) uncacheStackCalls += 1
@@ -74,19 +75,10 @@ class R7CleanupAttributionSpec extends IvmParitySpecBase("r7-cleanup-attribution
       val elapsed = System.nanoTime() - start
       R7CleanupFs.active = false
       R7CleanupProbe.track = false
-      val intervals = R7CleanupProbe.trackers.toVector
-        .flatMap(_.phases.get(QueryPlanningTracker.ANALYSIS))
-        .map(p => (p.startTimeMs, p.endTimeMs))
-        .sortBy(_._1)
-      var coveredUntil = Long.MinValue
-      var unionMs      = 0L
-      intervals.foreach { case (from, to) =>
-        unionMs += math.max(0L, to - math.max(from, coveredUntil))
-        coveredUntil = math.max(coveredUntil, to)
-      }
-      val analysis = if (intervals.isEmpty) "unavailable" else unionMs.toString
+      val (phases, unionMs) = R7CleanupProbe.analysisCoverage
+      val analysis          = unionMs.fold("unavailable")(_.toString)
       emit(
-        s"api-probe-only\t$caseName\t$pair\t$arm\t$operation\t$elapsed\t${intervals.size}\t$analysis\t" +
+        s"api-probe-only\t$caseName\t$pair\t$arm\t$operation\t$elapsed\t$phases\t$analysis\t" +
           s"${R7CleanupFs.deltaLogCalls}\t${R7CleanupFs.uncacheStackCalls}\t$succeeded"
       )
     }
