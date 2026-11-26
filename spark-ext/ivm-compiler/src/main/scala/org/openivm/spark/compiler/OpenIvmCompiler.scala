@@ -105,9 +105,9 @@ class OpenIvmCompiler private (
 
   @volatile private var closed: Boolean = false
 
-  @volatile private var runtimeVerificationDeferred: Boolean = false
-  @volatile private var runtimeVerified: Boolean             = false
-  private val runtimeVerificationLock                        = new Object
+  @volatile private var fallbackProbePending = false
+
+  private[spark] def isClosed: Boolean = closed
 
   val cacheGeneration: String = UUID.randomUUID().toString
 
@@ -148,7 +148,6 @@ class OpenIvmCompiler private (
       )
       if (isFallback(result))
         throw new IllegalStateException("Native compiler probe did not produce an incremental projection")
-      runtimeVerified = true
     } catch {
       case e: OpenIvmCompileException =>
         throw new IllegalStateException(
@@ -173,12 +172,17 @@ class OpenIvmCompiler private (
   def compile(req: CompileRequest): CompiledRefresh = compile(req, None)
 
   def compile(req: CompileRequest, trace: Option[CompileTraceContext]): CompiledRefresh =
-    if (!runtimeVerificationDeferred || runtimeVerified) compileWithTrace(req, new CompilerTrace(trace))
+    if (!fallbackProbePending) compileWithTrace(req, new CompilerTrace(trace))
     else {
       val compiled =
         try compileWithTrace(req, new CompilerTrace(trace))
         catch {
-          case scala.util.control.NonFatal(failure) =>
+          case failure: OpenIvmCompileException =>
+            if (Thread.currentThread().isInterrupted)
+              throw new IllegalStateException(
+                "OpenIVM runtime probe interrupted; refusing full-refresh fallback",
+                failure
+              )
             try requireVerifiedRuntime()
             catch {
               case scala.util.control.NonFatal(probeFailure) =>
@@ -187,21 +191,29 @@ class OpenIvmCompiler private (
             }
             throw failure
         }
-      if (isFallback(compiled)) requireVerifiedRuntime() else runtimeVerified = true
+      if (isFallback(compiled)) requireVerifiedRuntime()
       compiled
     }
 
-  /** Run [[verifyRuntime]] only before the first compile that would deliver a fallback. An incremental compile
-    * proves the native runtime as well as the probe does, so a healthy runtime skips the probe entirely; a broken one
-    * still refuses the full-refresh fallback before any caller can observe it.
+  /** A query that compiled incrementally needs no fallback. Before delivering any fallback, run the
+    * known-good projection even if a different query shape succeeded earlier.
     */
   private[spark] def deferRuntimeVerification(): this.type = {
-    runtimeVerificationDeferred = true
+    fallbackProbePending = true
     this
   }
 
-  private def requireVerifiedRuntime(): Unit =
-    if (!runtimeVerified) runtimeVerificationLock.synchronized(if (!runtimeVerified) verifyRuntime())
+  private def requireVerifiedRuntime(): Unit = synchronized {
+    if (fallbackProbePending) {
+      try verifyRuntime()
+      catch {
+        case scala.util.control.NonFatal(failure) =>
+          close()
+          throw failure
+      }
+      fallbackProbePending = false
+    }
+  }
 
   private def isFallback(compiled: CompiledRefresh): Boolean =
     compiled.refreshTypeName == "FULL_REFRESH" || compiled.sql.trim.isEmpty

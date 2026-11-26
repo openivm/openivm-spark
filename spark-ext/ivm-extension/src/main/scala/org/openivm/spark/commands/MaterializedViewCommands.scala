@@ -112,8 +112,10 @@ private[commands] object OpenIvmCompilers {
 
   private val sessions: java.util.Map[SparkSession, (Option[String], SessionCompiler)] =
     Collections.synchronizedMap(new java.util.WeakHashMap[SparkSession, (Option[String], SessionCompiler)]())
-  private val runtimes: java.util.Map[SparkContext, Map[Option[String], OpenIvmCompiler]] =
-    Collections.synchronizedMap(new java.util.WeakHashMap[SparkContext, Map[Option[String], OpenIvmCompiler]]())
+  private final class RuntimeSlot(@volatile var compiler: OpenIvmCompiler)
+
+  private val runtimes: java.util.Map[SparkContext, Map[Option[String], RuntimeSlot]] =
+    Collections.synchronizedMap(new java.util.WeakHashMap[SparkContext, Map[Option[String], RuntimeSlot]]())
 
   def forSession(spark: SparkSession): OpenIvmCompiler = session(spark).compiler
 
@@ -124,7 +126,9 @@ private[commands] object OpenIvmCompilers {
       .filter(_.nonEmpty)
       .orElse(sys.env.get("OPENIVM_CLI_LD_LIBRARY_PATH").map(_.trim).filter(_.nonEmpty))
     def cached: Option[SessionCompiler] =
-      Option(sessions.get(spark)).collect { case (key, session) if key == cliLibraryPath => session }
+      Option(sessions.get(spark)).collect {
+        case (key, session) if key == cliLibraryPath && !session.compiler.isClosed => session
+      }
     cached match {
       case Some(existing) => return existing
       case None           =>
@@ -143,17 +147,24 @@ private[commands] object OpenIvmCompilers {
   }
 
   private def sharedRuntime(spark: SparkSession, cliLibraryPath: Option[String]): OpenIvmCompiler = {
-    val context  = spark.sparkContext
-    val existing = Option(runtimes.get(context)).flatMap(_.get(cliLibraryPath))
+    val context = spark.sparkContext
+    def usable(slots: Map[Option[String], RuntimeSlot]): Option[OpenIvmCompiler] =
+      slots.get(cliLibraryPath).map(_.compiler).filterNot(_.isClosed)
+    val existing = Option(runtimes.get(context)).flatMap(usable)
     if (existing.isDefined) return existing.get
     runtimes.synchronized {
       val contextRuntimes = Option(runtimes.get(context)).getOrElse(Map.empty)
-      contextRuntimes.get(cliLibraryPath) match {
+      usable(contextRuntimes) match {
         case Some(compiler) => compiler
         case None =>
           val compiler = buildForSession(spark, cliLibraryPath).deferRuntimeVerification()
-          runtimes.put(context, contextRuntimes + (cliLibraryPath -> compiler))
-          Runtime.getRuntime.addShutdownHook(new Thread(() => compiler.close()))
+          contextRuntimes.get(cliLibraryPath) match {
+            case Some(slot) => slot.compiler = compiler
+            case None =>
+              val slot = new RuntimeSlot(compiler)
+              Runtime.getRuntime.addShutdownHook(new Thread(() => slot.compiler.close()))
+              runtimes.put(context, contextRuntimes + (cliLibraryPath -> slot))
+          }
           compiler
       }
     }
