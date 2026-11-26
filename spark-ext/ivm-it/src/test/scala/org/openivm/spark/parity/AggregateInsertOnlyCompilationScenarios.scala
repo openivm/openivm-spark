@@ -1,5 +1,7 @@
 package org.openivm.spark.parity
 
+import org.apache.hadoop.fs.Path
+import org.apache.spark.sql.delta.DeltaLog
 import org.openivm.spark.common.{DeltaTableVersion, MvCatalog, RefreshSqlLogCatalog, RewriteLineage}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
@@ -145,15 +147,22 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
   describe("downstream identity") {
     itCdf("uses one direct MERGE and publishes both images to a real downstream consumer") {
       sql("CREATE TABLE aio_real_cascade_source (grp INT, value INT) USING DELTA")
-      sql("INSERT INTO aio_real_cascade_source VALUES (1, 10)")
+      sql("INSERT INTO aio_real_cascade_source VALUES (1, 10), (2, 20), (4, 40)")
       val upstreamBody   = "SELECT grp, SUM(value) AS total FROM aio_real_cascade_source GROUP BY grp"
       val downstreamBody = "SELECT grp, total FROM aio_real_cascade_rollup"
       sql(s"CREATE MATERIALIZED VIEW aio_real_cascade_rollup AS $upstreamBody")
+      val log               = DeltaLog.forTable(spark, new Path(mvDataLocation("aio_real_cascade_rollup")))
+      def liveDvFiles: Long = log.update().allFiles.filter("deletionVector IS NOT NULL").count()
+
+      sql("UPDATE aio_real_cascade_source SET value = 21 WHERE grp = 2")
+      refreshMv("aio_real_cascade_rollup")
+      liveDvFiles shouldBe 1L
       sql(s"CREATE MATERIALIZED VIEW aio_rollup_consumer AS $downstreamBody")
 
       RefreshSqlLogCatalog.removeAll(spark)
       sql("INSERT INTO aio_real_cascade_source VALUES (1, 2), (3, 30)")
       refreshMv("aio_real_cascade_rollup")
+      liveDvFiles shouldBe 0L
       refreshMv("aio_rollup_consumer")
       assertMvCorrect("aio_real_cascade_rollup", upstreamBody)
       assertMvCorrect("aio_rollup_consumer", downstreamBody)
