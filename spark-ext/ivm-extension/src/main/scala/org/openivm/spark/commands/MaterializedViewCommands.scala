@@ -7388,7 +7388,9 @@ case class RefreshMaterializedViewCommand(
                 )
               }
               withPlanTimeBroadcastDisabled {
-                executeSqlAt(prunedMerge, 1, fusedAggregateSources = Seq(0, 1))
+                withSessionConf(spark, directAggregateMergeConf(spark, meta.location)) {
+                  executeSqlAt(prunedMerge, 1, fusedAggregateSources = Seq(0, 1))
+                }
               }
             } else if (meta.refreshType == RefreshTypeCode.SimpleProjection && rewritten.statements.nonEmpty) {
               // ── Scratch-CTAS fuse fast path ────────────────────────────────────
@@ -8905,6 +8907,32 @@ case class RefreshMaterializedViewCommand(
             |LIMIT 1""".stripMargin
       )
     }
+  }
+
+  private val DirectAggregateCopyOnWriteMaxBytes = 16L * 1024 * 1024
+
+  /** A small direct-aggregate MERGE target is rewritten copy-on-write instead of through
+    * persistent deletion vectors, which saves Delta's separate deletion-vector join job.
+    */
+  private def directAggregateMergeConf(spark: SparkSession, targetLocation: String): Map[String, String] = {
+    val smallTarget =
+      try {
+        val snapshot = DeltaLog.forTable(spark, new Path(targetLocation)).unsafeVolatileSnapshot
+        snapshot.version >= 0 && snapshot.sizeInBytes <= DirectAggregateCopyOnWriteMaxBytes
+      } catch { case NonFatal(_) => false }
+    if (smallTarget) Map("spark.databricks.delta.merge.deletionVectors.persistent" -> "false")
+    else Map.empty
+  }
+
+  private def withSessionConf[A](spark: SparkSession, overrides: Map[String, String])(body: => A): A = {
+    val prev = overrides.keys.map(k => k -> spark.conf.getOption(k)).toList
+    overrides.foreach { case (k, v) => spark.conf.set(k, v) }
+    try body
+    finally
+      prev.foreach {
+        case (k, Some(v)) => spark.conf.set(k, v)
+        case (k, None)    => spark.conf.unset(k)
+      }
   }
 
   private def pruneInsertOnlyAggregateTarget(
