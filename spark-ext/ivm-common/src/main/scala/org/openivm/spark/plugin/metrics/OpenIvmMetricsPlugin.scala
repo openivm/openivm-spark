@@ -56,7 +56,14 @@ class OpenIvmMetricsDriverPlugin extends DriverPlugin with Logging {
       case NonFatal(_) => logWarning("OpenIVM telemetry queue configuration failed; queue is disabled")
     }
     telemetryQueue.foreach { _ =>
-      val listener = new TelemetryJobListener()
+      val tasksEnabled =
+        try ctx.conf.getBoolean(TelemetryJobListener.TaskMetricsKey, false)
+        catch {
+          case _: IllegalArgumentException =>
+            logWarning("invalid OpenIVM task metrics flag; task summaries are disabled")
+            false
+        }
+      val listener = new TelemetryJobListener(taskMetricsEnabled = tasksEnabled)
       sc.addSparkListener(listener)
       jobListener = Some(sc -> listener)
     }
@@ -64,6 +71,10 @@ class OpenIvmMetricsDriverPlugin extends DriverPlugin with Logging {
   }
 
   override def registerMetrics(appId: String, ctx: PluginContext): Unit = {
+    jobListener.foreach { case (_, listener) =>
+      try listener.registerMetrics(ctx.metricRegistry)
+      catch { case NonFatal(_) => logWarning("some OpenIVM telemetry listener metrics could not be registered") }
+    }
     if (!BoundedTelemetryRuntime.registerMetrics(ctx.metricRegistry))
       logWarning("some OpenIVM telemetry queue metrics could not be registered")
     if (OpenIvmMetrics.enabled) OpenIvmMetricsPlugin.registerMetrics(ctx)
