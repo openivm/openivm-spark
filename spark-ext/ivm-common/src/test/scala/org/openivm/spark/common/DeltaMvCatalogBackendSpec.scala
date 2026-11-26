@@ -10,10 +10,11 @@ import org.scalatest.matchers.should.Matchers
 
 import java.io.File
 import java.sql.Timestamp
-import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.{CountDownLatch, CyclicBarrier, TimeUnit}
 import java.util.UUID
+import scala.collection.mutable
 import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{blocking, Await, ExecutionContext, Future}
 
 class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers {
 
@@ -268,6 +269,76 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       }
     }
 
+    it("keeps a group commit open for a ready refresh that queues within one commit time") {
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val queue                                       = DeltaGroupCommit.forPath[Int](s"$root/group-straggler")
+      val ready                                       = new CyclicBarrier(6)
+      val batches                                     = mutable.ArrayBuffer.empty[Seq[Int]]
+      def record(requests: Seq[Int]): Unit = batches.synchronized { batches += requests.sorted; () }
+
+      Await.result(
+        Future.sequence((0 until 6).map { index =>
+          Future(blocking {
+            val arrival = DeltaGroupCommit.refreshStarted()
+            try {
+              arrival.ready()
+              ready.await()
+              if (index == 5) Thread.sleep(400L)
+              queue.submit(index)(request => record(Seq(request)))(record)
+            } finally arrival.close()
+          })
+        }),
+        1.minute
+      )
+
+      batches shouldBe Seq(0 until 6)
+    }
+
+    it("bounds the wait for a ready refresh that never queues and ends it when that refresh closes") {
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val queue                                       = DeltaGroupCommit.forPath[Int](s"$root/group-absent")
+
+      def leaderMillis(peerClosesAfterMs: Long): Long = {
+        val peerReady  = new CountDownLatch(1)
+        val leaderDone = new CountDownLatch(1)
+        val peer = Future(blocking {
+          val arrival = DeltaGroupCommit.refreshStarted()
+          try {
+            arrival.ready()
+            peerReady.countDown()
+            leaderDone.await(peerClosesAfterMs, TimeUnit.MILLISECONDS)
+          } finally arrival.close()
+        })
+        val arrival = DeltaGroupCommit.refreshStarted()
+        try {
+          arrival.ready()
+          peerReady.await()
+          val start = System.nanoTime()
+          queue.submit(0)(_ => ())(_ => fail("a lone request must commit on its own path"))
+          (System.nanoTime() - start) / 1000000L
+        } finally {
+          arrival.close()
+          leaderDone.countDown()
+          Await.result(peer, 1.minute)
+        }
+      }
+
+      leaderMillis(peerClosesAfterMs = 100L) should be < 800L
+      leaderMillis(peerClosesAfterMs = 60000L) should be < 4000L
+    }
+
+    it("commits at once when no other ready refresh is expected") {
+      val queue = DeltaGroupCommit.forPath[Int](s"$root/group-alone")
+      val start = System.nanoTime()
+      queue.submit(0)(_ => ())(_ => fail("a lone request must commit on its own path"))
+      val arrival = DeltaGroupCommit.refreshStarted()
+      try {
+        arrival.ready()
+        queue.submit(1)(_ => ())(_ => fail("a lone request must commit on its own path"))
+      } finally arrival.close()
+
+      (System.nanoTime() - start) / 1000000L should be < 500L
+    }
     it("discards cached metadata when the catalog is recreated at the same Delta version") {
       val catalogPath = s"$root/cached-recreation"
       val tablePath   = s"$catalogPath/mv_metadata"
