@@ -964,6 +964,26 @@ object MvCatalog {
   private val catalogVersions = new java.util.concurrent.ConcurrentHashMap[String, CatalogVersion]()
   private val catalogLoads    = new java.util.concurrent.ConcurrentHashMap[String, Object]()
 
+  private final class LogRefresh(val startedNs: Long, val snapshot: org.apache.spark.sql.delta.Snapshot)
+  private val catalogRefreshGates = new java.util.concurrent.ConcurrentHashMap[String, Object]()
+  private val catalogRefreshes    = new java.util.concurrent.ConcurrentHashMap[String, LogRefresh]()
+
+  /** The catalog log as listed by a `DeltaLog.update()` that began after this request. Such a listing already includes
+    * every commit, by any driver, that completed before the request, so concurrent readers share one listing instead
+    * of queueing a listing each on the Delta log lock.
+    */
+  private def refreshedSnapshot(path: String, log: DeltaLog): org.apache.spark.sql.delta.Snapshot = {
+    val requestedNs = System.nanoTime()
+    catalogRefreshGates.computeIfAbsent(path, _ => new Object).synchronized {
+      Option(catalogRefreshes.get(path)).filter(_.startedNs > requestedNs).map(_.snapshot).getOrElse {
+        val startedNs = System.nanoTime()
+        val snapshot  = log.update()
+        catalogRefreshes.put(path, new LogRefresh(startedNs, snapshot))
+        snapshot
+      }
+    }
+  }
+
   private def decodeCatalogRow(row: Row): MvMetadata = {
     import scala.jdk.CollectionConverters._
     MvMetadata(
@@ -991,22 +1011,23 @@ object MvCatalog {
         val path = FeatureGate.catalogPath(spark).stripSuffix("/") + "/mv_metadata"
         val log  = DeltaLog.forTable(spark, new org.apache.hadoop.fs.Path(path))
         def latest(): Option[(String, Long)] = {
-          val snapshot = log.update()
+          val snapshot = refreshedSnapshot(path, log)
           if (snapshot.version < 0L) None else Some(snapshot.metadata.id -> snapshot.version)
         }
+        // A cached committed version at or after the listed one is at least as fresh as that listing.
         def cached(key: (String, Long)): Option[CatalogVersion] =
-          Option(catalogVersions.get(path)).filter(entry => entry.tableId == key._1 && entry.version == key._2)
+          Option(catalogVersions.get(path)).filter(entry => entry.tableId == key._1 && entry.version >= key._2)
         latest().flatMap { key =>
           cached(key).orElse {
             catalogLoads.computeIfAbsent(path, _ => new Object).synchronized {
-              latest().map { current =>
+              cached(key).orElse(latest().map { current =>
                 cached(current).getOrElse {
                   val rows  = spark.read.format("delta").load(path).collect()
                   val entry = new CatalogVersion(current._1, current._2, rows)
                   if (latest().contains(current)) catalogVersions.put(path, entry)
                   entry
                 }
-              }
+              })
             }
           }
         }
