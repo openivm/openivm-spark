@@ -1,0 +1,14 @@
+tasks_per_stage=32 pair=1 order=AB groups=4096 task_events=131072 legacy_ns=15217343 deep_ns=127439963
+tasks_per_stage=32 pair=2 order=BA groups=4096 task_events=131072 legacy_ns=15131644 deep_ns=127993564
+tasks_per_stage=32 pair=3 order=AB groups=4096 task_events=131072 legacy_ns=15291243 deep_ns=124744956
+tasks_per_stage=32 pair=4 order=BA groups=4096 task_events=131072 legacy_ns=15930145 deep_ns=128398266
+tasks_per_stage=32 pair=5 order=AB groups=4096 task_events=131072 legacy_ns=15533244 deep_ns=128257665
+tasks_per_stage=32 pair=6 order=BA groups=4096 task_events=131072 legacy_ns=15142043 deep_ns=124924456
+tasks_per_stage=32 records_per_arm=73728 legacy_chars=18382848 deep_chars=64880640
+tasks_per_stage=1024 pair=1 order=AB groups=128 task_events=131072 legacy_ns=828502 deep_ns=16012346
+tasks_per_stage=1024 pair=2 order=BA groups=128 task_events=131072 legacy_ns=850102 deep_ns=16641348
+tasks_per_stage=1024 pair=3 order=AB groups=128 task_events=131072 legacy_ns=907502 deep_ns=16254947
+tasks_per_stage=1024 pair=4 order=BA groups=128 task_events=131072 legacy_ns=896102 deep_ns=16135046
+tasks_per_stage=1024 pair=5 order=AB groups=128 task_events=131072 legacy_ns=891103 deep_ns=16215546
+tasks_per_stage=1024 pair=6 order=BA groups=128 task_events=131072 legacy_ns=848602 deep_ns=16121146
+tasks_per_stage=1024 records_per_arm=2304 legacy_chars=574464 deep_chars=2042112
