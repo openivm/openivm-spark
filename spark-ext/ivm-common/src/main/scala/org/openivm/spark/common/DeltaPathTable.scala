@@ -34,8 +34,12 @@ private[common] object DeltaPathTable {
   * single-request path), so batching never changes what is recorded, only how many Delta commits record it.
   */
 private[common] final class DeltaGroupCommit[R] {
+  // Qualification-only seams; the immutable product scoring commit does not include them.
+  private[common] var nanoTime: () => Long    = () => System.nanoTime()
+  private[common] var waitNanos: Long => Unit = remaining => wait(math.max(1L, remaining / 1000000L))
+
   private final class Slot(val request: R) {
-    val enqueued: Long       = System.nanoTime()
+    val enqueued: Long       = nanoTime()
     var done: Boolean        = false
     var retrySingle: Boolean = false
     var failure: Throwable   = _
@@ -86,7 +90,7 @@ private[common] final class DeltaGroupCommit[R] {
     * The leader's own request is pending, so the oldest pending request was enqueued no later than `start`.
     */
   private def collect(): Boolean = {
-    val start  = System.nanoTime()
+    val start  = nanoTime()
     val oldest = pending.peekFirst().enqueued
     var open   = true
     while (open) {
@@ -95,10 +99,10 @@ private[common] final class DeltaGroupCommit[R] {
       val budget =
         if (awaited <= 0) 0L
         else math.max(window * awaited / (pending.size + awaited), oldest + window - start)
-      val remaining = start + budget - System.nanoTime()
+      val remaining = start + budget - nanoTime()
       if (remaining <= 0) open = false
       else
-        try wait(math.max(1L, remaining / 1000000L))
+        try waitNanos(remaining)
         catch { case _: InterruptedException => return false }
     }
     true
@@ -110,7 +114,7 @@ private[common] final class DeltaGroupCommit[R] {
   }
 
   private def lead(mine: Slot, slots: Vector[Slot], single: R => Unit, batch: Seq[R] => Unit): Unit = {
-    val start     = System.nanoTime()
+    val start     = nanoTime()
     var committed = false
     try {
       if (slots.size == 1)
@@ -127,7 +131,7 @@ private[common] final class DeltaGroupCommit[R] {
         }
     } finally
       synchronized {
-        if (committed) commitNanos = (3 * commitNanos + (System.nanoTime() - start)) / 4
+        if (committed) commitNanos = (3 * commitNanos + (nanoTime() - start)) / 4
         slots.foreach(_.done = true)
         leaderActive = false
         notifyAll()
