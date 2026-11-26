@@ -6,8 +6,7 @@ import org.apache.spark.sql.types.StructType
 /**
  * [[ChangePropagation]] implementation that delegates to the existing
  * [[StagingCatalog]] / [[StagingDeltaView]] machinery written by the DML
- * interceptor.  All semantics of the pre-trait code path are preserved
- * verbatim — this class is a pure forwarding shim.
+ * interceptor.
  */
 final class InterceptChangePropagation extends ChangePropagation {
 
@@ -64,7 +63,15 @@ final class InterceptChangePropagation extends ChangePropagation {
       sourceSchema: StructType,
       batches: Seq[ChangeBatch]
   ): String = {
-    val sql = super.registerSourceDeltaView(spark, sourceTable, sourceSchema, batches)
+    val sql = batches match {
+      case Seq(StagingChangeBatch(_, Seq(delta), _)) if delta.opType == StagingDelta.OpTypes.Insert =>
+        val viewName = StagingDeltaView.deltaViewName(sourceTable)
+        spark
+          .sql(StagingDeltaView.insertSelect(sourceSchema, delta))
+          .createOrReplaceTempView(s"`${viewName.replace("`", "``")}`")
+        buildSourceDeltaViewSql(sourceTable, sourceSchema, batches)
+      case _ => super.registerSourceDeltaView(spark, sourceTable, sourceSchema, batches)
+    }
     if (MvProjectionSource.isProjection(spark, sourceTable)) {
       val name = StagingDeltaView.deltaViewName(sourceTable)
       MvProjectionSource

@@ -77,6 +77,16 @@ object StagingDeltaView {
     s"openivm_delta_$short"
   }
 
+  private def userColumns(schema: StructType): String =
+    schema.fieldNames.iterator.map(n => s"`${n.replace("`", "``")}`").mkString(", ")
+
+  private[common] def insertSelect(schema: StructType, delta: StagingDelta): String = {
+    val cols        = userColumns(schema)
+    val escapedPath = delta.stagingPath.replace("`", "``")
+    s"""SELECT $cols, CAST('${delta.txnTs}' AS TIMESTAMP) AS openivm_timestamp, CAST(1 AS INT) AS openivm_multiplicity
+       |FROM delta.`$escapedPath`""".stripMargin
+  }
+
   /** Build a `CREATE OR REPLACE TEMP VIEW openivm_delta_<sourceTable>` SQL
     * that UNION ALL-s all consumable staging Delta paths with the correct
     * `openivm_multiplicity`.
@@ -91,9 +101,9 @@ object StagingDeltaView {
       sourceSchema: StructType,
       deltas: Seq[StagingDelta]
   ): String = {
-    val short    = sourceTable.split("\\.").last
-    val viewName = s"`openivm_delta_$short`"
-    val cols     = sourceSchema.fieldNames.map(n => s"`${n.replace("`", "``")}`").mkString(", ")
+    val short     = sourceTable.split("\\.").last
+    val viewName  = s"`openivm_delta_$short`"
+    lazy val cols = userColumns(sourceSchema)
 
     val parts: Seq[String] = deltas.flatMap { d =>
       val escapedPath = d.stagingPath.replace("`", "``")
@@ -127,11 +137,7 @@ object StagingDeltaView {
           )
 
         case StagingDelta.OpTypes.Insert | StagingDelta.OpTypes.Overwrite | StagingDelta.OpTypes.UpdateAfter =>
-          val ts = d.txnTs.toString
-          Some(
-            s"""SELECT $cols, CAST('$ts' AS TIMESTAMP) AS openivm_timestamp, CAST(1 AS INT) AS openivm_multiplicity
-               |FROM delta.`$escapedPath`""".stripMargin
-          )
+          Some(insertSelect(sourceSchema, d))
 
         case StagingDelta.OpTypes.Delete | StagingDelta.OpTypes.UpdateBefore =>
           val ts = d.txnTs.toString
