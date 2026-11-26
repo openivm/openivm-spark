@@ -349,6 +349,8 @@ cmd_state_guard_perf() {
     local perf="ivmIt/testOnly org.openivm.spark.perf.StateGuardConcurrentRefreshPerfSpec -- -n org.openivm.spark.tags.StateGuardPerf"
     local rocks="org.openivm.spark.common.rocksdb"
     local crash="ivmIt/testOnly $rocks.StateGuardCrashRecoverySpec $rocks.InterceptStaleSnapshotCrashSpec $rocks.InterceptStaleSnapshotDeltaSpec $rocks.InterceptStaleSnapshotRocksSpec $rocks.LegacyInterceptWitnessSpec"
+    local r7="ivmIt/testOnly org.openivm.spark.perf"
+    local tag="-- -n org.openivm.spark.tags.StateGuardPerf"
     local suites=()
 
     if [[ -n "${OPENIVM_STATE_GUARD_REPORT_DIR:-}" ]]; then
@@ -360,8 +362,10 @@ cmd_state_guard_perf() {
         all)   suites=("$perf" "$crash") ;;
         perf)  suites=("$perf") ;;
         crash) suites=("$crash") ;;
+        r7-primary)   suites=("$r7.R7WalkthroughCdfPerfSpec $tag") ;;
+        r7-companion) suites=("$r7.R7MatchedInterceptPerfSpec $tag") ;;
         *)
-            echo "[spark-ext/run] OPENIVM_STATE_GUARD_SUITE must be all, perf or crash" >&2
+            echo "[spark-ext/run] OPENIVM_STATE_GUARD_SUITE must be all, perf, crash, r7-primary or r7-companion" >&2
             exit 2
             ;;
     esac
