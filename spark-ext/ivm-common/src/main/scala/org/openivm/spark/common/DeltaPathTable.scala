@@ -158,9 +158,15 @@ private[spark] object DeltaGroupCommit {
       arrival
     }
 
-  private def currentRefresh(): Option[AnyRef] = Option(current.get).filter(readyArrivals.contains)
+  private[common] def currentRefresh(): Option[AnyRef] = Option(current.get).filter(readyArrivals.contains)
 
   private def readyRefreshes: Int = readyArrivals.size
+
+  /** Drops from `seen` the refreshes no longer ready and returns how many ready refreshes it does not hold. */
+  private[common] def unseenReadyRefreshes(seen: java.util.Set[AnyRef]): Int = {
+    seen.retainAll(readyArrivals)
+    math.max(0, readyArrivals.size - seen.size)
+  }
 
   private[common] def forPath[R](path: String): DeltaGroupCommit[R] =
     queues.computeIfAbsent(path, _ => new DeltaGroupCommit[R]).asInstanceOf[DeltaGroupCommit[R]]
