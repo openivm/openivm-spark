@@ -2,6 +2,7 @@ package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.types.StructType
+import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 
 /**
  * [[ChangePropagation]] implementation that delegates to the existing
@@ -65,11 +66,17 @@ final class InterceptChangePropagation extends ChangePropagation {
       batches: Seq[ChangeBatch]
   ): String = {
     val sql = super.registerSourceDeltaView(spark, sourceTable, sourceSchema, batches)
-    if (MvProjectionSource.isProjection(spark, sourceTable)) {
+    if (
+      OpenIvmExecutionSpan.measureActivePhase("register_projection_probe")(
+        MvProjectionSource.isProjection(spark, sourceTable)
+      )
+    ) {
       val name = StagingDeltaView.deltaViewName(sourceTable)
-      MvProjectionSource
-        .project(spark.table(name), sourceSchema, Seq("openivm_multiplicity", "openivm_timestamp"))
-        .createOrReplaceTempView(name)
+      OpenIvmExecutionSpan.measureActivePhase("register_projection_rebind") {
+        MvProjectionSource
+          .project(spark.table(name), sourceSchema, Seq("openivm_multiplicity", "openivm_timestamp"))
+          .createOrReplaceTempView(name)
+      }
     }
     sql
   }

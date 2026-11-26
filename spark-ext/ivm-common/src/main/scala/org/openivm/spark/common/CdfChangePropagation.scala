@@ -3,6 +3,7 @@ package org.openivm.spark.common
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.plans.logical.View
 import org.apache.spark.sql.types.StructType
+import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import org.slf4j.LoggerFactory
 
 /**
@@ -134,17 +135,19 @@ final class CdfChangePropagation extends ChangePropagation {
 
     cdfBatch match {
       case Some(b) =>
-        val from = b.startVersionExclusive + 1L
-        val to   = b.endVersionInclusive
-        val raw = MvProjectionSource.read(
-          spark,
-          sourceTable,
-          Map("readChangeFeed" -> "true", "startingVersion" -> from.toString, "endingVersion" -> to.toString)
-        )
-
+        val from             = b.startVersionExclusive + 1L
+        val to               = b.endVersionInclusive
         val userCols         = sourceSchema.fieldNames.map(n => s"`${n.replace("`", "``")}`").mkString(", ")
         val transformedAlias = s"_openivm_cdf_raw_$short"
-        raw.createOrReplaceTempView(transformedAlias)
+        OpenIvmExecutionSpan.measureActivePhase("register_cdf_raw_alias") {
+          MvProjectionSource
+            .read(
+              spark,
+              sourceTable,
+              Map("readChangeFeed" -> "true", "startingVersion" -> from.toString, "endingVersion" -> to.toString)
+            )
+            .createOrReplaceTempView(transformedAlias)
+        }
         val sql = s"""CREATE OR REPLACE TEMP VIEW `$viewName` AS
                      |SELECT $userCols,
                      |       CAST(`_commit_timestamp` AS TIMESTAMP) AS ${CdfChangePropagation.TimestampColumn},
@@ -154,7 +157,7 @@ final class CdfChangePropagation extends ChangePropagation {
                      |       END AS ${CdfChangePropagation.SignColumn}
                      |FROM `$transformedAlias`
                      |WHERE `_change_type` IN ('insert', 'delete', 'update_preimage', 'update_postimage')""".stripMargin
-        spark.sql(sql)
+        OpenIvmExecutionSpan.measureActivePhase("register_cdf_view_ddl")(spark.sql(sql))
         // The existing registration reads only the first CDF range. Do not certify broader coverage.
         val coverage =
           if (batches.size == 1 && b.baseTable == sourceTable && b.hasBaseline)
@@ -163,7 +166,12 @@ final class CdfChangePropagation extends ChangePropagation {
         (sql, coverage)
 
       case None =>
-        (registerEmptyDeltaView(spark, sourceTable, sourceSchema), None)
+        (
+          OpenIvmExecutionSpan.measureActivePhase("register_empty_view")(
+            registerEmptyDeltaView(spark, sourceTable, sourceSchema)
+          ),
+          None
+        )
     }
   }
 

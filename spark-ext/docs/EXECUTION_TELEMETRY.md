@@ -43,3 +43,82 @@ with final release timestamps, and is emitted only after both guards release.
 The legacy `same_mv_lock_wait_ms` equals the sum of all recorded `wait_ms`,
 including CREATE publication waits; `driver_admission_wait_ms` continues to
 report admission separately.
+
+## Deep driver telemetry (opt-in)
+
+Set `spark.openivm.telemetry.deep.enabled=true` to add bounded driver-side
+phase, timer and work-counter totals to each completed CREATE/REFRESH span.
+The setting is read once when the span starts and gates only that span; a
+concurrent or later span with the setting off emits no deep field. With the
+setting off (the default), the log line and exported object are byte-identical
+to builds without deep telemetry. A reader that predates these fields rejects
+deep-on exports, so enable deep telemetry only when every exporter and
+consumer in the campaign uses this build.
+
+Deep figures add no SQL, scans, per-row logs, profile rows or Dropwizard
+metrics. All `*_ns` values come from `System.nanoTime()` on the driver and
+share the emitted `clock_domain_id`; never compare them across clock domains.
+Durations measured elsewhere in milliseconds are imported only as
+`phase_totals[].external_ms`; they never enter a `*_ns` field.
+
+Top-level fields:
+
+| Field | Meaning |
+| --- | --- |
+| `clock_domain_id` | Monotonic clock domain of every `*_ns` value. |
+| `duration_ns` | Span start to completion. |
+| `post_completion_ns` | Completion to emission (durable profile write, export handoff). |
+| `owner_thread_wrapped_ns` | Union of owner-thread top-level wrapped phases, clipped to the span. |
+| `owner_thread_post_completion_wrapped_ns` | Owner-thread top-level wrapped time after completion. |
+| `owner_thread_coverage_status` | `complete`, `incomplete` or `inconsistent`. |
+| `owner_thread_coverage_reason` | `active_wrappers_at_freeze` or `wrapped_exceeds_span`, when not complete. |
+| `owner_thread_unattributed_ns` | `duration_ns - owner_thread_wrapped_ns`, only when status is `complete`. |
+| `owner_thread_overcoverage_ns` | Positive excess, only when status is `inconsistent`. |
+| `active_wrappers_at_freeze` | Wrappers on any thread still open at emission. |
+| `deep_observer_ns` | Recorder self-time; a lower bound, not total overhead. |
+| `*_dropped_count`, `deep_names_truncated_count` | Entries refused by the caps, names cut at 128 characters. |
+
+`phase_totals` (at most 64) has one entry per phase name: `wrapped_count`,
+`wrapped_failed_count`, `wrapped_ns`, `wrapped_max_ns`,
+`owner_top_level_count`, `off_thread_count`, `external_count`, `external_ms`
+and `skipped_count`. Phases are nested and shared, so their totals are not
+additive: only owner-thread depth-0 wrappers feed coverage, and nested,
+off-thread, imported and skipped observations never do. The unattributed
+figure is owner-thread time outside top-level wrappers, not idle or wait time;
+`incomplete` and `inconsistent` spans report no unattributed value, never zero.
+
+Phase names are the `RefreshProfile` step names, `profile_flush_persist`,
+`perf_<phase>` for each `[openivm-perf]` phase, and these REFRESH internals:
+`register_source_delta`, `register_stage_view_ddl`, `register_empty_view`,
+`register_projection_probe`, `register_projection_rebind`,
+`register_cdf_raw_alias`, `register_cdf_view_ddl`,
+`register_source_version_validate`, `rewrite_projection_probe`,
+`rewrite_source_snapshot_view`, `cleanup_source_snapshot_view_drop`,
+`cleanup_delta_view_uncache`, `cleanup_delta_view_drop`,
+`cleanup_fused_scratch_uncache`, `cleanup_fused_scratch_drop`,
+`cleanup_window_affected_uncache` and `cleanup_window_affected_drop`.
+
+`timer_totals` (at most 128: `count`, `total_ns`, `max_ns`) mirrors the
+`OpenIvmMetrics` timers observed on the owner thread, excluding the
+`refresh.phase.*` and `create.phase.*` mirrors of profile steps.
+`work_counters` (at most 128: signed `value`) mirrors `OpenIvmMetrics`
+counters and adds `refresh.sql_stmt.<kind>.{statements,elapsed_ms,sql_chars,retries}`,
+`register.sources`, `register.batch_kind.{staging,source_version,cdf_window,empty}`,
+`register.stage_parts`, `register.op_type.<op>` and `cleanup.delta_views`.
+Observations on threads without the span (Spark executors, unbound pools) are
+not captured; executor work belongs to the task-metrics listener sidecar.
+
+REFRESH completes after cleanup and before the durable profile write, so the
+cleanup phases are inside `duration_ns`. CREATE completes when its query span
+ends; later publication work appears in `owner_thread_post_completion_wrapped_ns`.
+
+### Interpreting across layers
+
+Keep four intervals separate: the caller's driver command interval, the span
+`duration_ns`, Spark job/stage boundaries from the listener sidecar, and the
+end-to-end makespan of concurrent requests. SQL return is not durable
+publication, and an accepted queue drain snapshot does not prove that every
+producer has finished; report a drain or export failure as a gap, not as zero.
+Listener stage summaries count only task ends delivered while a tracked job
+references the stage. Do not sum them per job, and do not read the listener's
+callback self-time as total observer overhead.

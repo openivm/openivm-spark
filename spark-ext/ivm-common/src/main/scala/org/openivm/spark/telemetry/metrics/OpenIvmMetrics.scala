@@ -75,7 +75,10 @@ object OpenIvmMetrics extends Logging {
 
   def gauge[T](name: String, gauge: Gauge[T]): Gauge[T] = metric(name, gauge).asInstanceOf[Gauge[T]]
 
-  def increment(name: String, value: Long = 1L): Unit = if (enabled) counter(name).inc(value)
+  def increment(name: String, value: Long = 1L): Unit = {
+    OpenIvmExecutionSpan.recordActiveWork(name, value)
+    if (enabled) counter(name).inc(value)
+  }
 
   def updateHistogram(name: String, value: Long): Unit = if (enabled) histogram(name).update(value)
 
@@ -229,6 +232,15 @@ object OpenIvmMetrics extends Logging {
     )
 
   def recordSqlStatement(kind: String, nanos: Long, bytes: Int, retryAttempt: Int): Unit = {
+    if (OpenIvmExecutionSpan.deepActive) {
+      // Callers time statements in milliseconds, so deep keeps them as ms work counters rather than ns timers.
+      val prefix = s"refresh.sql_stmt.${sanitize(kind)}"
+      OpenIvmExecutionSpan.recordActiveWork(s"$prefix.statements")
+      if (nanos >= 0L)
+        OpenIvmExecutionSpan.recordActiveWork(s"$prefix.elapsed_ms", TimeUnit.NANOSECONDS.toMillis(nanos))
+      OpenIvmExecutionSpan.recordActiveWork(s"$prefix.sql_chars", math.max(0, bytes).toLong)
+      if (retryAttempt > 0) OpenIvmExecutionSpan.recordActiveWork(s"$prefix.retries")
+    }
     if (!enabled) return
     val handles = sqlStmtHandlesFor(kind)
     if (nanos >= 0L) handles.timer.update(nanos, TimeUnit.NANOSECONDS)

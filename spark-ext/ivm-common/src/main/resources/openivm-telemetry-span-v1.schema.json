@@ -278,6 +278,192 @@
       "type": "integer",
       "minimum": 0
     },
+    "clock_domain_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "duration_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "post_completion_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "owner_thread_wrapped_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "owner_thread_post_completion_wrapped_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "owner_thread_coverage_status": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "incomplete",
+        "inconsistent"
+      ]
+    },
+    "owner_thread_coverage_reason": {
+      "type": "string",
+      "enum": [
+        "active_wrappers_at_freeze",
+        "wrapped_exceeds_span"
+      ]
+    },
+    "owner_thread_unattributed_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "owner_thread_overcoverage_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "active_wrappers_at_freeze": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "phase_totals_dropped_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "timer_totals_dropped_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "work_counters_dropped_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "deep_names_truncated_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "deep_observer_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "phase_totals": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "phase",
+          "wrapped_count",
+          "wrapped_failed_count",
+          "wrapped_ns",
+          "wrapped_max_ns",
+          "owner_top_level_count",
+          "off_thread_count",
+          "external_count",
+          "external_ms",
+          "skipped_count"
+        ],
+        "properties": {
+          "phase": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "wrapped_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "wrapped_failed_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "wrapped_ns": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "wrapped_max_ns": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "owner_top_level_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "off_thread_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "external_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "external_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "skipped_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "timer_totals": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "timer",
+          "count",
+          "total_ns",
+          "max_ns"
+        ],
+        "properties": {
+          "timer": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "total_ns": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_ns": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "work_counters": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "counter",
+          "value"
+        ],
+        "properties": {
+          "counter": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "value": {
+            "type": "integer"
+          }
+        }
+      }
+    },
     "lock_acquisitions": {
       "type": "array",
       "items": {

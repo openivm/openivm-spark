@@ -4,6 +4,7 @@ import org.apache.spark.sql.functions.{col, current_timestamp, lit, when}
 import org.apache.spark.sql.types.{ArrayType, DataType, IntegerType, MapType, StructType, TimestampType}
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.storage.StorageLevel
+import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import org.slf4j.LoggerFactory
 
 import scala.util.control.NonFatal
@@ -55,7 +56,7 @@ object SourceVersionDelta {
       batch: SourceVersionChangeBatch,
       sourceSchema: StructType
   ): String = {
-    validate(spark, batch, sourceSchema)
+    OpenIvmExecutionSpan.measureActivePhase("register_source_version_validate")(validate(spark, batch, sourceSchema))
     if (CdfChangePropagation.tableHasCdf(spark, batch.baseTable)) {
       try registerCdfView(spark, batch, sourceSchema)
       catch {

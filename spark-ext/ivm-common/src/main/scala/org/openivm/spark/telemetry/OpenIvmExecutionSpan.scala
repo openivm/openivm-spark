@@ -40,8 +40,14 @@ final class OpenIvmExecutionSpan private[telemetry] (
     private val enabled: Boolean,
     private val configuredExport: Option[ConfiguredTelemetryExport],
     private val oneLakeSink: Option[SpanSink] = None,
-    private val sinkDisjoint: Option[Path => Boolean] = None
+    private val sinkDisjoint: Option[Path => Boolean] = None,
+    deepRequested: Boolean = false
 ) {
+
+  private[spark] val deepEnabled: Boolean = enabled && deepRequested
+
+  private val deepState: OpenIvmExecutionSpan.DeepState =
+    if (deepEnabled) new OpenIvmExecutionSpan.DeepState(startedAtNanos, Thread.currentThread()) else null
 
   private[spark] def stateSyncEvidenceEnabled: Boolean = enabled
 
@@ -403,9 +409,39 @@ final class OpenIvmExecutionSpan private[telemetry] (
           completedAtNanos = Some(endNanos)
           outcome = Some(OpenIvmExecutionSpan.normalizeString(finalOutcome))
           driverThread = Some(OpenIvmExecutionSpan.normalizeString(finalDriverThread))
+          if (deepState != null) deepState.markCompleted(endNanos)
         }
       }
     }
+
+  private[spark] def measureDeepPhase[A](phase: String)(body: => A): A = {
+    val state = deepState
+    if (state == null) return body
+    val token   = state.enter()
+    val started = System.nanoTime()
+    var failed  = false
+    try body
+    catch {
+      case error: Throwable =>
+        if (!error.isInstanceOf[scala.util.control.ControlThrowable]) failed = true
+        throw error
+    } finally {
+      try state.exit(phase, token, started, System.nanoTime(), failed)
+      catch { case NonFatal(_) => () }
+    }
+  }
+
+  private[spark] def recordDeepExternalPhase(phase: String, durationMs: Long): Unit =
+    if (deepState != null) deepState.recordExternal(phase, durationMs)
+
+  private[spark] def recordDeepSkippedPhase(phase: String): Unit =
+    if (deepState != null) deepState.recordSkipped(phase)
+
+  private[telemetry] def recordDeepTimer(timer: String, nanos: Long): Unit =
+    if (deepState != null) deepState.recordTimer(timer, nanos)
+
+  private[telemetry] def recordDeepCounter(counter: String, delta: Long): Unit =
+    if (deepState != null) deepState.recordCounter(counter, delta)
 
   def emitIfNeeded(defaultOutcome: String, defaultDriverThread: String): Unit = {
     val payload =
@@ -420,8 +456,12 @@ final class OpenIvmExecutionSpan private[telemetry] (
               completedAtNanos = Some(endNanos)
               outcome = Some(OpenIvmExecutionSpan.normalizeString(defaultOutcome))
               driverThread = Some(OpenIvmExecutionSpan.normalizeString(defaultDriverThread))
+              if (deepState != null) deepState.markCompleted(endNanos)
             }
             emitted = true
+            val deepSnapshot =
+              if (deepState == null) None
+              else Some(deepState.freeze(completedAtNanos.getOrElse(startedAtNanos)))
             val completedEpochMs = completedAtEpochMs.getOrElse(startedAtEpochMs)
             val durationMs =
               TimeUnit.NANOSECONDS.toMillis(completedAtNanos.getOrElse(startedAtNanos) - startedAtNanos)
@@ -473,7 +513,10 @@ final class OpenIvmExecutionSpan private[telemetry] (
               droppedStateSyncRequests,
               droppedStateSyncPublications
             )
-            val finalLogPayload = OpenIvmExecutionSpan.withStateSyncBestEffort(logPayload, stateSyncEvidence)
+            val finalLogPayload = OpenIvmExecutionSpan.withStateSyncBestEffort(
+              OpenIvmExecutionSpan.withDeepBestEffort(logPayload, deepSnapshot),
+              stateSyncEvidence
+            )
             val exportPayload = configuredExport.map { export =>
               export -> OpenIvmExecutionSpan.renderExportJson(
                 identity = export.identity,
@@ -519,7 +562,10 @@ final class OpenIvmExecutionSpan private[telemetry] (
               )
             }
             val finalExportPayload = exportPayload.map { case (export, payload) =>
-              export -> OpenIvmExecutionSpan.withStateSyncBestEffort(payload, stateSyncEvidence)
+              export -> OpenIvmExecutionSpan.withStateSyncBestEffort(
+                OpenIvmExecutionSpan.withDeepBestEffort(payload, deepSnapshot),
+                stateSyncEvidence
+              )
             }
             val emittedPayload = finalExportPayload.map(_._2).getOrElse(finalLogPayload)
             lastLogPayload = Some(emittedPayload)
@@ -711,6 +757,329 @@ object OpenIvmExecutionSpan extends Logging {
         logWarning(s"[openivm-telemetry-sink] cannot capture state-sync receipt sink (${error.getClass.getSimpleName})")
         None
     }
+
+  private final class DeepPhaseAccumulator {
+    var wrappedCount       = 0L
+    var wrappedFailedCount = 0L
+    var wrappedNanos       = 0L
+    var wrappedMaxNanos    = 0L
+    var ownerTopLevelCount = 0L
+    var offThreadCount     = 0L
+    var externalCount      = 0L
+    var externalMs         = 0L
+    var skippedCount       = 0L
+  }
+
+  private[telemetry] final case class DeepPhaseTotals(
+      phase: String,
+      wrappedCount: Long,
+      wrappedFailedCount: Long,
+      wrappedNanos: Long,
+      wrappedMaxNanos: Long,
+      ownerTopLevelCount: Long,
+      offThreadCount: Long,
+      externalCount: Long,
+      externalMs: Long,
+      skippedCount: Long
+  )
+
+  private[telemetry] final case class DeepTimerTotals(timer: String, count: Long, totalNanos: Long, maxNanos: Long)
+
+  private[telemetry] final case class DeepSnapshot(
+      durationNanos: Long,
+      postCompletionNanos: Long,
+      ownerWrappedNanos: Long,
+      ownerPostCompletionWrappedNanos: Long,
+      coverageStatus: String,
+      coverageReason: Option[String],
+      unattributedNanos: Option[Long],
+      overcoverageNanos: Option[Long],
+      activeWrappersAtFreeze: Long,
+      observerNanos: Long,
+      phases: Vector[DeepPhaseTotals],
+      timers: Vector[DeepTimerTotals],
+      counters: Vector[(String, Long)],
+      phasesDropped: Long,
+      timersDropped: Long,
+      countersDropped: Long,
+      namesTruncated: Long
+  )
+
+  /** Bounded per-span deep accumulator. Owner-thread depth-0 wrappers are disjoint by construction,
+    * so their clipped sum is the only figure used for coverage; nested, off-thread, imported
+    * (`external_ms`) and skipped observations never contribute to it. Recorders after freeze are ignored.
+    */
+  private[telemetry] final class DeepState(startedAtNanos: Long, ownerThread: Thread) {
+    private val stateLock                       = new Object
+    private val activeWrappers                  = new java.util.concurrent.atomic.AtomicInteger(0)
+    @volatile private var ownerDepth            = 0
+    @volatile private var completedNanos        = 0L
+    @volatile private var completed             = false
+    private var frozen                          = false
+    private val phases                          = new LinkedHashMap[String, DeepPhaseAccumulator]()
+    private val timers                          = new LinkedHashMap[String, Array[Long]]()
+    private val counters                        = new LinkedHashMap[String, Array[Long]]()
+    private var phasesDropped                   = 0L
+    private var timersDropped                   = 0L
+    private var countersDropped                 = 0L
+    private var namesTruncated                  = 0L
+    private var ownerWrappedNanos               = 0L
+    private var ownerPostCompletionWrappedNanos = 0L
+    private var observerNanos                   = 0L
+
+    def markCompleted(nanos: Long): Unit = {
+      completedNanos = nanos
+      completed = true
+    }
+
+    def enter(): Int = {
+      activeWrappers.incrementAndGet()
+      if (Thread.currentThread() eq ownerThread) {
+        val depth = ownerDepth
+        ownerDepth = depth + 1
+        depth
+      } else -1
+    }
+
+    def exit(phase: String, token: Int, startedNanos: Long, endedNanos: Long, failed: Boolean): Unit = {
+      if (token >= 0) ownerDepth = token
+      activeWrappers.decrementAndGet()
+      val name = normalizeName(phase)
+      stateLock.synchronized {
+        if (!frozen) {
+          val elapsed = math.max(0L, endedNanos - startedNanos)
+          val phaseAcc = retained(phases, name, OpenIvmTelemetryContract.DeepPhaseTotalsCap)(
+            new DeepPhaseAccumulator
+          )
+          if (phaseAcc == null) phasesDropped += 1L
+          else {
+            phaseAcc.wrappedCount += 1L
+            if (failed) phaseAcc.wrappedFailedCount += 1L
+            phaseAcc.wrappedNanos += elapsed
+            phaseAcc.wrappedMaxNanos = math.max(phaseAcc.wrappedMaxNanos, elapsed)
+            if (token == 0) phaseAcc.ownerTopLevelCount += 1L
+            else if (token < 0) phaseAcc.offThreadCount += 1L
+          }
+          if (token == 0) {
+            val clippedStart = math.max(startedNanos, startedAtNanos)
+            if (completed) {
+              val completion = completedNanos
+              ownerWrappedNanos += math.max(0L, math.min(endedNanos, completion) - clippedStart)
+              ownerPostCompletionWrappedNanos += math.max(0L, endedNanos - math.max(clippedStart, completion))
+            } else ownerWrappedNanos += math.max(0L, endedNanos - clippedStart)
+          }
+          observerNanos += math.max(0L, System.nanoTime() - endedNanos)
+        }
+      }
+    }
+
+    def recordExternal(phase: String, durationMs: Long): Unit =
+      record(phase, phases, OpenIvmTelemetryContract.DeepPhaseTotalsCap, new DeepPhaseAccumulator) { acc =>
+        acc.externalCount += 1L
+        acc.externalMs += math.max(0L, durationMs)
+      }(phasesDropped += 1L)
+
+    def recordSkipped(phase: String): Unit =
+      record(phase, phases, OpenIvmTelemetryContract.DeepPhaseTotalsCap, new DeepPhaseAccumulator)(acc =>
+        acc.skippedCount += 1L
+      )(phasesDropped += 1L)
+
+    def recordTimer(timer: String, nanos: Long): Unit =
+      if (nanos >= 0L)
+        record(timer, timers, OpenIvmTelemetryContract.DeepTimerTotalsCap, new Array[Long](3)) { acc =>
+          acc(0) += 1L
+          acc(1) += nanos
+          acc(2) = math.max(acc(2), nanos)
+        }(timersDropped += 1L)
+
+    def recordCounter(counter: String, delta: Long): Unit =
+      record(counter, counters, OpenIvmTelemetryContract.DeepWorkCountersCap, new Array[Long](1))(acc =>
+        acc(0) += delta
+      )(countersDropped += 1L)
+
+    def freeze(completionNanos: Long): DeepSnapshot = stateLock.synchronized {
+      val frozenAt = System.nanoTime()
+      frozen = true
+      val duration    = math.max(0L, completionNanos - startedAtNanos)
+      val ownerActive = ownerDepth > 0
+      val (status, reason, unattributed, overcoverage): (String, Option[String], Option[Long], Option[Long]) =
+        if (ownerActive)
+          (
+            OpenIvmTelemetryContract.DeepCoverageIncomplete,
+            Some(OpenIvmTelemetryContract.DeepActiveWrappersAtFreeze),
+            None,
+            None
+          )
+        else if (ownerWrappedNanos > duration)
+          (
+            OpenIvmTelemetryContract.DeepCoverageInconsistent,
+            Some(OpenIvmTelemetryContract.DeepWrappedExceedsSpan),
+            None,
+            Some(ownerWrappedNanos - duration)
+          )
+        else (OpenIvmTelemetryContract.DeepCoverageComplete, None, Some(duration - ownerWrappedNanos), None)
+      DeepSnapshot(
+        durationNanos = duration,
+        postCompletionNanos = math.max(0L, frozenAt - completionNanos),
+        ownerWrappedNanos = ownerWrappedNanos,
+        ownerPostCompletionWrappedNanos = ownerPostCompletionWrappedNanos,
+        coverageStatus = status,
+        coverageReason = reason,
+        unattributedNanos = unattributed,
+        overcoverageNanos = overcoverage,
+        activeWrappersAtFreeze = math.max(0, activeWrappers.get()).toLong,
+        observerNanos = observerNanos,
+        phases = phases.asScala.iterator.map { case (name, acc) =>
+          DeepPhaseTotals(
+            name,
+            acc.wrappedCount,
+            acc.wrappedFailedCount,
+            acc.wrappedNanos,
+            acc.wrappedMaxNanos,
+            acc.ownerTopLevelCount,
+            acc.offThreadCount,
+            acc.externalCount,
+            acc.externalMs,
+            acc.skippedCount
+          )
+        }.toVector,
+        timers = timers.asScala.iterator.map { case (name, acc) =>
+          DeepTimerTotals(name, acc(0), acc(1), acc(2))
+        }.toVector,
+        counters = counters.asScala.iterator.map { case (name, acc) => name -> acc(0) }.toVector,
+        phasesDropped = phasesDropped,
+        timersDropped = timersDropped,
+        countersDropped = countersDropped,
+        namesTruncated = namesTruncated
+      )
+    }
+
+    private def record[T <: AnyRef](raw: String, map: LinkedHashMap[String, T], cap: Int, create: => T)(
+        update: T => Unit
+    )(dropped: => Unit): Unit = {
+      val started = System.nanoTime()
+      val name    = normalizeName(raw)
+      stateLock.synchronized {
+        if (!frozen) {
+          val acc = retained(map, name, cap)(create)
+          if (acc == null) dropped else update(acc)
+          observerNanos += math.max(0L, System.nanoTime() - started)
+        }
+      }
+    }
+
+    private def retained[T <: AnyRef](map: LinkedHashMap[String, T], name: String, cap: Int)(create: => T): T = {
+      val existing = map.get(name)
+      if (existing != null) existing
+      else if (map.size >= cap) null.asInstanceOf[T]
+      else {
+        val created = create
+        map.put(name, created)
+        created
+      }
+    }
+
+    private def normalizeName(raw: String): String = {
+      val source = if (raw == null || raw.isEmpty) "unknown" else raw
+      val limit  = math.min(source.length, OpenIvmTelemetryContract.DeepNameMaxLength)
+      if (source.length > limit) stateLock.synchronized(namesTruncated += 1L)
+      val out = new java.lang.StringBuilder(limit)
+      var i   = 0
+      while (i < limit) {
+        val c = source.charAt(i)
+        out.append(
+          if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-') c
+          else if (c >= 'A' && c <= 'Z') Character.toLowerCase(c)
+          else '_'
+        )
+        i += 1
+      }
+      out.toString
+    }
+  }
+
+  @volatile private var deepEverEnabled = false
+
+  private def deepSpan(): OpenIvmExecutionSpan =
+    if (!deepEverEnabled) null
+    else {
+      val span = current.get()
+      if (span != null && span.deepEnabled) span else null
+    }
+
+  /** True when the current thread's span records opt-in deep driver telemetry. */
+  def deepActive: Boolean = deepSpan() != null
+
+  /** Time `body` as a deep-only phase of the current thread's span. It writes no profile row,
+    * PhaseTimeline event or Dropwizard metric and is a passthrough unless that span enabled deep telemetry.
+    * Nested phases are not additive: only owner-thread depth-0 phases feed coverage.
+    */
+  def measureActivePhase[A](phase: String)(body: => A): A = {
+    val span = deepSpan()
+    if (span == null) body else span.measureDeepPhase(phase)(body)
+  }
+
+  /** Add `delta` to a bounded deep work counter of the current thread's span; no-op unless deep. */
+  def recordActiveWork(counter: String, delta: Long = 1L): Unit = {
+    val span = deepSpan()
+    if (span != null) span.recordDeepCounter(counter, delta)
+  }
+
+  private def withDeepBestEffort(payload: String, snapshot: Option[DeepSnapshot]): String =
+    snapshot.fold(payload) { deep =>
+      try withDeep(payload, deep)
+      catch {
+        case NonFatal(error) =>
+          logWarning(s"[openivm-telemetry-sink] deep augmentation failed (${error.getClass.getSimpleName})")
+          payload
+      }
+    }
+
+  private def withDeep(payload: String, deep: DeepSnapshot): String = {
+    val root = Json.readTree(payload).deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
+    root.put("clock_domain_id", MonotonicClockDomain.id)
+    root.put("duration_ns", deep.durationNanos)
+    root.put("post_completion_ns", deep.postCompletionNanos)
+    root.put("owner_thread_wrapped_ns", deep.ownerWrappedNanos)
+    root.put("owner_thread_post_completion_wrapped_ns", deep.ownerPostCompletionWrappedNanos)
+    root.put("owner_thread_coverage_status", deep.coverageStatus)
+    deep.coverageReason.foreach(value => root.put("owner_thread_coverage_reason", value))
+    deep.unattributedNanos.foreach(value => root.put("owner_thread_unattributed_ns", value))
+    deep.overcoverageNanos.foreach(value => root.put("owner_thread_overcoverage_ns", value))
+    root.put("active_wrappers_at_freeze", deep.activeWrappersAtFreeze)
+    root.put("deep_observer_ns", deep.observerNanos)
+    root.put("phase_totals_dropped_count", deep.phasesDropped)
+    root.put("timer_totals_dropped_count", deep.timersDropped)
+    root.put("work_counters_dropped_count", deep.countersDropped)
+    root.put("deep_names_truncated_count", deep.namesTruncated)
+    val phases = root.putArray("phase_totals")
+    deep.phases.foreach { phase =>
+      phases
+        .addObject()
+        .put("phase", phase.phase)
+        .put("wrapped_count", phase.wrappedCount)
+        .put("wrapped_failed_count", phase.wrappedFailedCount)
+        .put("wrapped_ns", phase.wrappedNanos)
+        .put("wrapped_max_ns", phase.wrappedMaxNanos)
+        .put("owner_top_level_count", phase.ownerTopLevelCount)
+        .put("off_thread_count", phase.offThreadCount)
+        .put("external_count", phase.externalCount)
+        .put("external_ms", phase.externalMs)
+        .put("skipped_count", phase.skippedCount)
+    }
+    val timerArray = root.putArray("timer_totals")
+    deep.timers.foreach { timer =>
+      timerArray
+        .addObject()
+        .put("timer", timer.timer)
+        .put("count", timer.count)
+        .put("total_ns", timer.totalNanos)
+        .put("max_ns", timer.maxNanos)
+    }
+    val counterArray = root.putArray("work_counters")
+    deep.counters.foreach { case (name, value) => counterArray.addObject().put("counter", name).put("value", value) }
+    Json.writeValueAsString(root)
+  }
 
   private def withStateSyncBestEffort(
       payload: String,
@@ -1109,10 +1478,19 @@ object OpenIvmExecutionSpan extends Logging {
             dbtNodeId
           ),
           oneLakeSink = oneLakeDir.map(dir => OneLakeSpanSink.forDir(dir, spark.sessionState.newHadoopConf())),
-          sinkDisjoint = sinkDisjoint
+          sinkDisjoint = sinkDisjoint,
+          deepEnabled = deepTelemetryEnabled(spark)
         )
     }
   }
+
+  private def deepTelemetryEnabled(spark: SparkSession): Boolean =
+    try {
+      spark.conf
+        .getOption(OpenIvmTelemetryContract.DeepEnabledKey)
+        .orElse(spark.sparkContext.getConf.getOption(OpenIvmTelemetryContract.DeepEnabledKey))
+        .exists(_.trim.equalsIgnoreCase("true"))
+    } catch { case NonFatal(_) => false }
 
   def start(
       materializedView: String,
@@ -1148,6 +1526,20 @@ object OpenIvmExecutionSpan extends Logging {
       oneLakeSink = Some(oneLakeSink)
     )
 
+  private[telemetry] def startDeepForTesting(
+      identity: OpenIvmTelemetryContract.ExecutionIdentity,
+      publisher: CompletedSpanPublisher,
+      deepEnabled: Boolean
+  ): OpenIvmExecutionSpan =
+    startInternal(
+      materializedView = identity.materializedView,
+      operation = identity.operation,
+      requestId = Some(identity.requestId),
+      dbtNodeId = Some(identity.dbtNodeId),
+      configuredExport = Some(ConfiguredTelemetryExport(identity.validated, publisher)),
+      deepEnabled = deepEnabled
+    )
+
   private def startInternal(
       materializedView: String,
       operation: String,
@@ -1155,11 +1547,13 @@ object OpenIvmExecutionSpan extends Logging {
       dbtNodeId: Option[String],
       configuredExport: Option[ConfiguredTelemetryExport],
       oneLakeSink: Option[SpanSink] = None,
-      sinkDisjoint: Option[Path => Boolean] = None
+      sinkDisjoint: Option[Path => Boolean] = None,
+      deepEnabled: Boolean = false
   ): OpenIvmExecutionSpan = {
     Option(current.get()).filter(_.matchesCommand(materializedView, operation)).foreach { existing =>
       return existing
     }
+    if (deepEnabled) deepEverEnabled = true
     val nowEpochMs = System.currentTimeMillis()
     val nowNanos   = System.nanoTime()
     val span = new OpenIvmExecutionSpan(
@@ -1174,7 +1568,8 @@ object OpenIvmExecutionSpan extends Logging {
       enabled = true,
       configuredExport = configuredExport,
       oneLakeSink = oneLakeSink,
-      sinkDisjoint = sinkDisjoint
+      sinkDisjoint = sinkDisjoint,
+      deepRequested = deepEnabled
     )
     consumePending(span, nowNanos)
     current.set(span)
@@ -1305,6 +1700,10 @@ object OpenIvmExecutionSpan extends Logging {
 
   def observeTimer(metricName: String, nanos: Long): Unit = {
     if (nanos < 0L) return
+    if (deepEverEnabled && metricName != null && !isLifecyclePhaseMetric(metricName)) {
+      val span = deepSpan()
+      if (span != null) span.recordDeepTimer(metricName, nanos)
+    }
     val durationMs = TimeUnit.NANOSECONDS.toMillis(nanos)
     metricName match {
       case "refresh.lock.wait" => ()
@@ -1321,6 +1720,10 @@ object OpenIvmExecutionSpan extends Logging {
       case _ => ()
     }
   }
+
+  /** RefreshProfile mirrors every profile step to `<mode>.phase.<step>`; deep `phase_totals` already owns those. */
+  private def isLifecyclePhaseMetric(name: String): Boolean =
+    name.startsWith("refresh.phase.") || name.startsWith("create.phase.")
 
   def observeRocksDbWrite(nanos: Long): Unit =
     if (nanos >= 0L) Option(current.get()).foreach(_.recordRocksDbWrite(TimeUnit.NANOSECONDS.toMillis(nanos)))

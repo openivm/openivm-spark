@@ -2,6 +2,7 @@ package org.openivm.spark.common
 
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.types.{IntegerType, StructType, TimestampType}
+import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 
 /**
  * Abstract source of "what changed on base table X since watermark W".
@@ -82,10 +83,12 @@ trait ChangePropagation {
       batches: Seq[ChangeBatch]
   ): String = {
     if (batches.isEmpty) {
-      registerEmptyDeltaView(spark, sourceTable, sourceSchema)
+      OpenIvmExecutionSpan.measureActivePhase("register_empty_view")(
+        registerEmptyDeltaView(spark, sourceTable, sourceSchema)
+      )
     } else {
       val sql = buildSourceDeltaViewSql(sourceTable, sourceSchema, batches)
-      spark.sql(sql)
+      OpenIvmExecutionSpan.measureActivePhase("register_stage_view_ddl")(spark.sql(sql))
       sql
     }
   }
