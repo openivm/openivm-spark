@@ -6039,9 +6039,10 @@ case class RefreshMaterializedViewCommand(
       // generate cross terms. Restrict insert-only aggregate compilation to the
       // single-source, join-free shape whose output is monotone under inserts.
       // Downstream consumers do not affect this proof; they only determine
-      // whether the cascade delta must remain materialized.
+      // whether the cascade delta must remain materialized. Intercept-mode
+      // consumers read that delta from staging, so only a terminal MV qualifies.
       lazy val insertOnlyAggregateShapeCandidate: Boolean =
-        !propagation.requiresDmlInterception &&
+        (!propagation.requiresDmlInterception || downstreamSourceKeysForThisMv.isEmpty) &&
           meta.refreshType == RefreshTypeCode.AggregateGroup &&
           meta.sourceTables.size == 1 &&
           !meta.queryHasJoin
@@ -8300,10 +8301,14 @@ case class RefreshMaterializedViewCommand(
                 RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
                   val triggerKeys: Set[String] = downstreamSourceKeysForThisMv
                   val keysToRecord =
-                    if (triggerKeys.isEmpty && meta.refreshType == RefreshTypeCode.SimpleAggregate) {
+                    if (
+                      triggerKeys.isEmpty &&
+                      (meta.refreshType == RefreshTypeCode.SimpleAggregate || directAggregateMerge.isDefined)
+                    ) {
                       // A scalar snapshot delta is only needed for concrete current
                       // consumers. A downstream created later absorbs the current
                       // scalar in its initial CTAS and starts from a fresh watermark.
+                      // A direct aggregate MERGE never materializes its view delta.
                       Set.empty[String]
                     } else if (triggerKeys.isEmpty && fusedScratchView.isEmpty) {
                       // Keep the legacy on-disk breadcrumb for non-fused refreshes.
