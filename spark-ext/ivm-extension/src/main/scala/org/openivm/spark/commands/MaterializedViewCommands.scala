@@ -4579,6 +4579,7 @@ case class RefreshMaterializedViewCommand(
         metaName(MvCatalog.qualifiedName(spark, name))
       ) {
         groupCommitArrival.ready()
+        OpenIvmStateSync.expectSynchronousBackup(spark)
         val currentMeta = MvCatalog.lookupForRelation(spark, name)
         if (currentMeta.exists(meta => !viewLockKeys.contains(metaName(meta.name))))
           throw new IllegalStateException(s"Materialized view ${sqlIdent(name)} changed while acquiring locks")
