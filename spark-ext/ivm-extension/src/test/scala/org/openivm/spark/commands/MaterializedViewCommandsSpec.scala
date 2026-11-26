@@ -173,6 +173,10 @@ class MaterializedViewCommandsSpec extends AnyFunSpec with Matchers with BeforeA
         OpenIvmCompilers.forSession(cloned) should be theSameInstanceAs compiler
       }
       OpenIvmCompilers.forSession(spark) should be theSameInstanceAs compiler
+      compiler.close()
+      val replacement = OpenIvmCompilers.forSession(spark)
+      replacement.cacheGeneration should not equal compiler.cacheGeneration
+      OpenIvmCompilers.forSession(spark.newSession()) should be theSameInstanceAs replacement
     }
   }
 

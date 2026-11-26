@@ -88,6 +88,25 @@ class CompilerRuntimeProbeSpec extends AnyFunSuite with Matchers {
       val error = intercept[IllegalStateException](compiler.compile(request("v1")))
       error.getMessage should include("refusing full-refresh fallback")
       error.getSuppressed.toSeq.map(_.getClass) shouldBe Seq(classOf[OpenIvmCompileException])
+      compiler.isClosed shouldBe true
+    }
+  }
+
+  test("a prior incremental result does not authorize full refresh without a healthy projection probe") {
+    withCli(
+      s"""$CountProbes
+         |case "$$script" in
+         |  *v_good*) $Incremental ;;
+         |  *) echo '{"refresh_type":4,"refresh_type_name":"FULL_REFRESH","sql":"SELECT id FROM s"}' ;;
+         |esac""".stripMargin
+    ) { compiler =>
+      compiler.deferRuntimeVerification()
+      compiler.compile(request("v_good")).refreshTypeName shouldBe "SIMPLE_PROJECTION"
+      intercept[IllegalStateException](compiler.compile(request("v_full"))).getMessage should include(
+        "incremental projection"
+      )
+      probes(compiler) shouldBe 1
+      compiler.isClosed shouldBe true
     }
   }
 
