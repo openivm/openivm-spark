@@ -74,6 +74,7 @@ Top-level fields:
 | `owner_thread_coverage_reason` | `active_wrappers_at_freeze` or `wrapped_exceeds_span`, when not complete. |
 | `owner_thread_unattributed_ns` | `duration_ns - owner_thread_wrapped_ns`, only when status is `complete`. |
 | `owner_thread_overcoverage_ns` | Positive excess, only when status is `inconsistent`. |
+| `deep_status` | `augmentation_failed` when deep was requested but rendering failed; the deep fields above are then absent. |
 | `active_wrappers_at_freeze` | Wrappers on any thread still open at emission. |
 | `deep_observer_ns` | Recorder self-time; a lower bound, not total overhead. |
 | `*_dropped_count`, `deep_names_truncated_count` | Entries refused by the caps, names cut at 128 characters. |

@@ -103,6 +103,27 @@ class OpenIvmDeepTelemetrySpec extends AnyFunSpec with Matchers with BeforeAndAf
 
   private def fieldNames(payload: JsonNode): Set[String] = payload.fieldNames().asScala.toSet
 
+  private def rendered(
+      suffix: String,
+      snapshot: OpenIvmExecutionSpan.DeepSnapshot
+  ): (OpenIvmTelemetryContract.ExecutionIdentity, ObjectNode) = {
+    val publisher = new CapturingPublisher
+    val span      = OpenIvmExecutionSpan.startForTesting(identity(suffix), publisher)
+    classify(span)
+    finish(span)
+    val payload = OpenIvmExecutionSpan.withDeepBestEffort(publisher.raw.head, Some(snapshot))
+    (identity(suffix), Json.readTree(payload).asInstanceOf[ObjectNode])
+  }
+
+  private def reusable(accepted: OpenIvmTelemetryContract.ExecutionIdentity, payload: JsonNode): Boolean = {
+    val root = new File(s"target/openivm-deep-${UUID.randomUUID().toString}")
+    roots += root
+    val exporter = new OpenIvmTelemetryExporter(root.toURI.toString, new Configuration())
+    val raw      = Json.writeValueAsString(payload)
+    exporter.publish(accepted, raw)
+    exporter.reuseCompleted(accepted, raw)
+  }
+
   describe("deep driver telemetry") {
     it("adds no deep fields and leaves the wire field set unchanged when deep is off") {
       val plain    = new CapturingPublisher
@@ -309,6 +330,41 @@ class OpenIvmDeepTelemetrySpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.path("timer_totals").elements().asScala.map(_.path("timer").asText()).toSeq shouldBe
         Seq("x" * OpenIvmTelemetryContract.DeepNameMaxLength, "delta_commit_attempt")
       publisher.raw.head.length should be < 262144
+    }
+
+    it("reports inconsistent overcoverage with no unattributed figure when owner wrappers exceed the span") {
+      val state = new OpenIvmExecutionSpan.DeepState(1000L, Thread.currentThread())
+      state.exit("completion_race", state.enter(), 1000L, 1600L, failed = false)
+      state.markCompleted(1400L)
+      val (accepted, payload) = rendered("inconsistent", state.freeze(1400L))
+
+      payload.path("owner_thread_coverage_status").asText() shouldBe OpenIvmTelemetryContract.DeepCoverageInconsistent
+      payload.path("owner_thread_coverage_reason").asText() shouldBe OpenIvmTelemetryContract.DeepWrappedExceedsSpan
+      payload.path("duration_ns").asLong() shouldBe 400L
+      payload.path("owner_thread_wrapped_ns").asLong() shouldBe 600L
+      payload.path("owner_thread_overcoverage_ns").asLong() shouldBe 200L
+      payload.has("owner_thread_unattributed_ns") shouldBe false
+      phase(payload, "completion_race").path("owner_top_level_count").asLong() shouldBe 1L
+      reusable(accepted, payload) shouldBe true
+
+      val withResidual = payload.deepCopy().put("owner_thread_unattributed_ns", 0L)
+      an[OpenIvmTelemetryExportException] should be thrownBy reusable(accepted, withResidual)
+      val unknownStatus = payload.deepCopy().put("owner_thread_coverage_status", "partial")
+      an[OpenIvmTelemetryExportException] should be thrownBy reusable(accepted, unknownStatus)
+    }
+
+    it("marks a deep-requested span whose augmentation failed instead of passing as deep-off") {
+      val state               = new OpenIvmExecutionSpan.DeepState(1000L, Thread.currentThread())
+      val broken              = state.freeze(1400L).copy(phases = null)
+      val (accepted, payload) = rendered("augmentation_failed", broken)
+
+      payload.path("deep_status").asText() shouldBe OpenIvmTelemetryContract.DeepStatusAugmentationFailed
+      fieldNames(payload).intersect(DeepFields) shouldBe Set("deep_status")
+      reusable(accepted, payload) shouldBe true
+
+      val mixed = payload.deepCopy().put("owner_thread_coverage_status", OpenIvmTelemetryContract.DeepCoverageComplete)
+      mixed.put("owner_thread_unattributed_ns", 0L)
+      an[OpenIvmTelemetryExportException] should be thrownBy reusable(accepted, mixed)
     }
   }
 }

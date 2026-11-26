@@ -314,6 +314,12 @@
         "wrapped_exceeds_span"
       ]
     },
+    "deep_status": {
+      "type": "string",
+      "enum": [
+        "augmentation_failed"
+      ]
+    },
     "owner_thread_unattributed_ns": {
       "type": "integer",
       "minimum": 0

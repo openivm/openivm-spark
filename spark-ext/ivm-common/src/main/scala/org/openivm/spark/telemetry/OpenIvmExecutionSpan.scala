@@ -1025,17 +1025,21 @@ object OpenIvmExecutionSpan extends Logging {
     if (span != null) span.recordDeepCounter(counter, delta)
   }
 
-  private def withDeepBestEffort(payload: String, snapshot: Option[DeepSnapshot]): String =
+  private[telemetry] def withDeepBestEffort(payload: String, snapshot: Option[DeepSnapshot]): String =
     snapshot.fold(payload) { deep =>
       try withDeep(payload, deep)
       catch {
         case NonFatal(error) =>
           logWarning(s"[openivm-telemetry-sink] deep augmentation failed (${error.getClass.getSimpleName})")
-          payload
+          try {
+            val root = Json.readTree(payload).deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
+            root.put("deep_status", OpenIvmTelemetryContract.DeepStatusAugmentationFailed)
+            Json.writeValueAsString(root)
+          } catch { case NonFatal(_) => payload }
       }
     }
 
-  private def withDeep(payload: String, deep: DeepSnapshot): String = {
+  private[telemetry] def withDeep(payload: String, deep: DeepSnapshot): String = {
     val root = Json.readTree(payload).deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
     root.put("clock_domain_id", MonotonicClockDomain.id)
     root.put("duration_ns", deep.durationNanos)

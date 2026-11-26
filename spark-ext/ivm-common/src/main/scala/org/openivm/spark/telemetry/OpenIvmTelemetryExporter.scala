@@ -314,6 +314,18 @@ private[telemetry] final class OpenIvmTelemetryExporter(
     OpenIvmTelemetryContract.DeepIntegralFields.foreach { field =>
       if (payload.has(field) && !integral(payload.path(field), nonNegative = true)) throw invalidReusable(path)
     }
+    val status   = Option(payload.get("owner_thread_coverage_status")).map(_.asText())
+    val complete = status.contains(OpenIvmTelemetryContract.DeepCoverageComplete)
+    val failed   = Option(payload.get("deep_status")).map(_.asText())
+    if (
+      status.exists(value => !OpenIvmTelemetryContract.DeepCoverageStatuses.contains(value)) ||
+      failed.exists(value => value != OpenIvmTelemetryContract.DeepStatusAugmentationFailed || status.isDefined) ||
+      payload.has("owner_thread_unattributed_ns") != complete ||
+      payload
+        .has("owner_thread_overcoverage_ns") != status.contains(OpenIvmTelemetryContract.DeepCoverageInconsistent) ||
+      payload.has("owner_thread_coverage_reason") != (status.isDefined && !complete)
+    )
+      throw invalidReusable(path)
     OpenIvmTelemetryContract.DeepArrayFields.foreach { case (field, (nameKey, nonNegativeKeys, signedKeys)) =>
       if (payload.has(field)) {
         val items = payload.path(field)

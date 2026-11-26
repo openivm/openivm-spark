@@ -140,10 +140,17 @@ object OpenIvmTelemetryContract {
   val DeepActiveWrappersAtFreeze = "active_wrappers_at_freeze"
   val DeepWrappedExceedsSpan     = "wrapped_exceeds_span"
 
+  /** Emitted instead of the deep fields when a deep-requested span could not be augmented. */
+  val DeepStatusAugmentationFailed = "augmentation_failed"
+
+  private[telemetry] val DeepCoverageStatuses: Set[String] =
+    Set(DeepCoverageComplete, DeepCoverageIncomplete, DeepCoverageInconsistent)
+
   private[telemetry] val DeepTextFields: Set[String] = Set(
     "clock_domain_id",
     "owner_thread_coverage_status",
-    "owner_thread_coverage_reason"
+    "owner_thread_coverage_reason",
+    "deep_status"
   )
 
   private[telemetry] val DeepIntegralFields: Set[String] = Set(
