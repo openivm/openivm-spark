@@ -40,8 +40,8 @@ class R7CleanupFs extends LocalFileSystem {
 class R7CleanupAttributionSpec extends IvmParitySpecBase("r7-cleanup-attribution") with InterceptMode {
   override protected def extraSparkConf: Map[String, String] = Map(
     "spark.sql.extensions" ->
-      "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions," +
-      "org.openivm.spark.parity.R7CleanupProbeExtensions",
+      ("io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions," +
+        "org.openivm.spark.parity.R7CleanupProbeExtensions"),
     "spark.hadoop.fs.file.impl"               -> classOf[R7CleanupFs].getName,
     "spark.hadoop.fs.file.impl.disable.cache" -> "true"
   )
@@ -109,17 +109,17 @@ class R7CleanupAttributionSpec extends IvmParitySpecBase("r7-cleanup-attribution
       spark.table(alias).count()
       spark.table(dependent).count()
     }
-    val aliasPlan     = spark.table(alias).queryExecution.normalized
-    val dependentPlan = spark.table(dependent).queryExecution.normalized
-    spark.sharedState.cacheManager.lookupCachedData(aliasPlan).nonEmpty shouldBe cached
-    spark.sharedState.cacheManager.lookupCachedData(dependentPlan).nonEmpty shouldBe cached
+    val aliasData     = spark.table(alias)
+    val dependentData = spark.table(dependent)
+    (aliasData.storageLevel != StorageLevel.NONE) shouldBe cached
+    (dependentData.storageLevel != StorageLevel.NONE) shouldBe cached
     try {
       if (arm == "control")
         timed(caseName, pair, arm, "explicit_uncache") { spark.catalog.uncacheTable(alias) }
       timed(caseName, pair, arm, "sql_drop") { spark.sql(s"DROP VIEW IF EXISTS $alias"); () }
       spark.sessionState.catalog.getTempView(alias).isEmpty shouldBe true
-      spark.sharedState.cacheManager.lookupCachedData(aliasPlan).isEmpty shouldBe true
-      spark.sharedState.cacheManager.lookupCachedData(dependentPlan).isEmpty shouldBe true
+      aliasData.storageLevel shouldBe StorageLevel.NONE
+      dependentData.storageLevel shouldBe StorageLevel.NONE
       spark.sessionState.catalog.getTempView(dependent).isDefined shouldBe true
     } finally {
       spark.sql(s"DROP VIEW IF EXISTS $dependent").collect()

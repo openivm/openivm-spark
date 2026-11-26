@@ -1,6 +1,6 @@
 package org.openivm.spark.parity
 
-import org.apache.spark.sql.{SparkSession, SparkSessionExtensions}
+import org.apache.spark.sql.{DataFrame, SparkSession, SparkSessionExtensions}
 import org.apache.spark.sql.catalyst.{QueryPlanningTracker, TableIdentifier}
 import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
@@ -98,13 +98,13 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
   override protected def extraSparkConf: Map[String, String] = Map(
     "spark.openivm.queryLog.enabled" -> "true",
     "spark.sql.extensions" ->
-      "io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions," +
-      "org.openivm.spark.parity.R7CleanupProbeExtensions"
+      ("io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions," +
+        "org.openivm.spark.parity.R7CleanupProbeExtensions")
   )
 
   private val output    = Paths.get(sys.env.getOrElse("R7_CLEANUP_OUT", "target/r7-cleanup-safety.tsv"))
   private val candidate = sys.env.getOrElse("R7_CLEANUP_ARM", "control") == "candidate"
-  private case class CachedAlias(name: String, dependent: String, plan: LogicalPlan, dependentPlan: LogicalPlan)
+  private case class CachedAlias(name: String, dependent: String, data: DataFrame, dependentData: DataFrame)
 
   private def emit(line: String): Unit = {
     Files.createDirectories(output.toAbsolutePath.getParent)
@@ -144,17 +144,17 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
     spark.catalog.cacheTable(dependent, StorageLevel.DISK_ONLY)
     spark.table(alias).count()
     spark.table(dependent).count()
-    val plan    = spark.table(alias).queryExecution.normalized
-    val depPlan = spark.table(dependent).queryExecution.normalized
-    spark.sharedState.cacheManager.lookupCachedData(plan).nonEmpty shouldBe true
-    spark.sharedState.cacheManager.lookupCachedData(depPlan).nonEmpty shouldBe true
-    CachedAlias(alias, dependent, plan, depPlan)
+    val data          = spark.table(alias)
+    val dependentData = spark.table(dependent)
+    data.storageLevel shouldBe StorageLevel.DISK_ONLY
+    dependentData.storageLevel shouldBe StorageLevel.DISK_ONLY
+    CachedAlias(alias, dependent, data, dependentData)
   }
 
   private def assertUncached(cache: CachedAlias): Unit = {
     // Check saved plans before dropping the dependent; that extra DROP could hide a leak.
-    spark.sharedState.cacheManager.lookupCachedData(cache.plan).isEmpty shouldBe true
-    spark.sharedState.cacheManager.lookupCachedData(cache.dependentPlan).isEmpty shouldBe true
+    cache.data.storageLevel shouldBe StorageLevel.NONE
+    cache.dependentData.storageLevel shouldBe StorageLevel.NONE
     spark.sessionState.catalog.getTempView(cache.dependent).isDefined shouldBe true
   }
 
