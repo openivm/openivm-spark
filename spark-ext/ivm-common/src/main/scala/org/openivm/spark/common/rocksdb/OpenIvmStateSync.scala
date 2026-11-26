@@ -145,24 +145,30 @@ object OpenIvmStateSync {
 
     def synchronousRequestCount: Long = synchronousMonitor.synchronized(submittedRequests)
 
-    /** Holding the monitor as the next pass's leader, waits for ready refreshes that have not reached this state yet.
-      * With `k` requests queued, `m` refreshes awaited and a typical pass taking `C`, a refresh that misses the pass
-      * waits up to `2C` instead of `C`, so the leader waits at most `C * m / (k + m)`. False if interrupted.
+    /** Holding the monitor as the next pass's leader, waits for refreshes backing up `key` that have reached a group
+      * commit but not this state yet. With `k` requests queued, `m` refreshes awaited and a typical pass taking `C`, a
+      * refresh that misses the pass waits up to `2C` instead of `C`, so the leader waits at most `C * m / (k + m)`. The
+      * wait is recorded as `state_sync.collect_wait`. False if interrupted.
       */
-    private def collectReadyRefreshes(): Boolean = {
-      val start = System.nanoTime()
-      var open  = true
-      while (open) {
-        val awaited = DeltaGroupCommit.unseenReadyRefreshes(arrivedRefreshes)
-        val budget =
-          if (awaited <= 0) 0L
-          else math.min(passNanos, MaxSynchronousCollectNanos) * awaited / (synchronousRequests.size + awaited)
-        val remaining = start + budget - System.nanoTime()
-        if (remaining <= 0) open = false
-        else
-          try synchronousMonitor.wait(math.max(1L, math.min(remaining / 1000000L, SynchronousCollectPollMillis)))
-          catch { case _: InterruptedException => return false }
-      }
+    private def collectReadyRefreshes(key: String): Boolean = {
+      val start  = System.nanoTime()
+      var open   = true
+      var waited = false
+      try
+        while (open) {
+          val awaited = DeltaGroupCommit.unseenCommittingRefreshes(key, arrivedRefreshes)
+          val budget =
+            if (awaited <= 0) 0L
+            else math.min(passNanos, MaxSynchronousCollectNanos) * awaited / (synchronousRequests.size + awaited)
+          val remaining = start + budget - System.nanoTime()
+          if (remaining <= 0) open = false
+          else {
+            waited = true
+            try synchronousMonitor.wait(math.max(1L, math.min(remaining / 1000000L, SynchronousCollectPollMillis)))
+            catch { case _: InterruptedException => return false }
+          }
+        }
+      finally if (waited) OpenIvmMetrics.updateTimer("state_sync.collect_wait", System.nanoTime() - start)
       true
     }
 
@@ -177,10 +183,12 @@ object OpenIvmStateSync {
       synchronousMonitor.notifyAll()
     }
 
-    def backupSynchronous(request: BackupRequest)(pass: Seq[BackupRequest] => Unit): Unit = {
+    def backupSynchronous(request: BackupRequest, collectKey: Option[String] = None)(
+        pass: Seq[BackupRequest] => Unit
+    ): Unit = {
       val completion         = new CompletableFuture[Unit]()
       val submitted          = SynchronousRequest(request, completion)
-      val refresh            = DeltaGroupCommit.currentRefresh()
+      val refresh            = collectKey.flatMap(_ => DeltaGroupCommit.currentRefresh())
       var collectInterrupted = false
       synchronousMonitor.synchronized {
         submittedRequests += 1L
@@ -194,7 +202,7 @@ object OpenIvmStateSync {
             if (completion.isDone) Vector.empty[SynchronousRequest]
             else if (!synchronousRunning) {
               synchronousRunning = true
-              if (refresh.isDefined && !collectReadyRefreshes()) collectInterrupted = true
+              if (refresh.isDefined && collectKey.exists(key => !collectReadyRefreshes(key))) collectInterrupted = true
               val captured = synchronousRequests.toVector
               synchronousRequests.clear()
               captured
@@ -1180,6 +1188,17 @@ object OpenIvmStateSync {
   /** Synchronously publish a snapshot covering this request's committed state. */
   def backupNow(spark: SparkSession): Unit = backupNowImpl(spark, None)
 
+  /** Lets a concurrent legacy synchronous backup of this refresh's state wait for it once it reaches a group commit.
+    * Advisory: any configuration failure is left to the backup itself.
+    */
+  def expectSynchronousBackup(spark: SparkSession): Unit =
+    try
+      if (
+        DeltaGroupCommit.currentRefresh().isDefined && !guardedSqlEnabled(spark) &&
+        !FeatureGate.stateSyncAsyncEnabled(spark) && !FeatureGate.stateSyncCheckpointEnabled(spark)
+      ) stateSyncUri(spark).foreach(uri => DeltaGroupCommit.expectStateBackup(effectiveStateSyncKey(spark, uri)))
+    catch { case NonFatal(_) => () }
+
   private[openivm] def backupNowBound(spark: SparkSession, binding: PublicationBinding): Unit =
     backupNowImpl(spark, Some(binding))
 
@@ -1244,7 +1263,7 @@ object OpenIvmStateSync {
     try {
       val state = backupStateFor(key)
       if (!FeatureGate.stateSyncCheckpointEnabled(spark)) {
-        state.backupSynchronous(request) { requests =>
+        state.backupSynchronous(request, Some(key)) { requests =>
           runBackupPass(key, spark, uri, requests, "synchronous")
         }
       } else {
