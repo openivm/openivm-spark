@@ -144,6 +144,23 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
     (table, mv, body)
   }
 
+  private def joinedFixture(slug: String): (Seq[String], String) = {
+    val prefix = s"r7cl_${modeLabel.replace("-", "_")}_$slug"
+    val tables = Seq(s"${prefix}_left", s"${prefix}_right")
+    tables.foreach { table =>
+      sql(s"CREATE TABLE $table (k INT, v INT) USING DELTA")
+      sql(s"INSERT INTO $table VALUES (1, 10)")
+    }
+    val mv = s"${prefix}_mv"
+    sql(
+      s"CREATE MATERIALIZED VIEW $mv AS SELECT l.k, l.v AS lv, r.v AS rv " +
+        s"FROM ${tables.head} l JOIN ${tables.last} r ON l.k = r.k"
+    )
+    tables.foreach(table => sql(s"INSERT INTO $table VALUES (1, 20), (2, 30)"))
+    RefreshSqlLogCatalog.removeAll(spark)
+    (tables, mv)
+  }
+
   private def cacheAlias(table: String): CachedAlias = {
     val session   = commandSession
     val alias     = s"openivm_delta_$table"
@@ -291,14 +308,14 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
       } finally finish(caches)
     }
 
-    it("preserves the original REFRESH exception when DROP also fails") {
-      val (table, mv, _) = fixture("primary_failure")
-      val primary        = new IllegalStateException("r7 primary refresh failure")
-      var caches         = Seq.empty[CachedAlias]
+    it("preserves the original REFRESH exception and continues cleanup after DROP failures") {
+      val (tables, mv) = joinedFixture("primary_failure")
+      val primary      = new IllegalStateException("r7 primary refresh failure")
+      var caches       = Seq.empty[CachedAlias]
       try {
         val thrown = intercept[Throwable] {
           CommandConcurrencyInjection.withBeforeRefreshFinalize {
-            caches = Seq(cacheAlias(table))
+            caches = tables.map(cacheAlias)
             R7CleanupProbe.failDrop = caches.map(_.name).toSet
             R7CleanupProbe.armed = true
             throw primary
@@ -308,11 +325,73 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
         }
         R7CleanupProbe.armed = false
         Iterator.iterate(thrown)(_.getCause).takeWhile(_ != null).exists(_ eq primary) shouldBe true
-        caches.size shouldBe 1
+        caches.size shouldBe 2
         R7CleanupProbe.drops.toSet shouldBe caches.map(_.name).toSet
         caches.foreach(assertUncached)
         assertLogged(mv, caches.map(_.name).toSet)
       } finally finish(caches)
+    }
+
+    it("preserves the original exception and later cleanup when DROP and explicit uncache both fail") {
+      val (tables, mv) = joinedFixture("double_failure")
+      val primary      = new IllegalStateException("r7 primary refresh failure with cleanup failures")
+      var caches       = Seq.empty[CachedAlias]
+      try {
+        val thrown = intercept[Throwable] {
+          CommandConcurrencyInjection.withBeforeRefreshFinalize {
+            caches = tables.map(cacheAlias)
+            R7CleanupProbe.failDrop = caches.map(_.name).toSet
+            R7CleanupProbe.failUncache = true
+            R7CleanupProbe.armed = true
+            throw primary
+          } {
+            refreshMv(mv)
+          }
+        }
+        R7CleanupProbe.armed = false
+        Iterator.iterate(thrown)(_.getCause).takeWhile(_ != null).exists(_ eq primary) shouldBe true
+        caches.size shouldBe 2
+        R7CleanupProbe.drops.toSet shouldBe caches.map(_.name).toSet
+        R7CleanupProbe.uncacheFailures shouldBe 2
+        caches.foreach { cache =>
+          cache.data.storageLevel shouldBe StorageLevel.DISK_ONLY
+          cache.dependentData.storageLevel shouldBe StorageLevel.DISK_ONLY
+        }
+        assertLogged(mv, caches.map(_.name).toSet)
+      } finally finish(caches)
+    }
+
+    it("preserves another session's same-name view and unrelated cache") {
+      val (table, mv, body) = fixture("session_isolation")
+      val sibling           = spark.newSession()
+      val alias             = s"openivm_delta_$table"
+      val sentinel          = s"${alias}_unrelated"
+      sibling.sql(s"CREATE TEMP VIEW $alias AS SELECT 999 AS k, 999 AS v")
+      sibling.range(9L, 10L).createOrReplaceTempView(sentinel)
+      sibling.catalog.cacheTable(sentinel, StorageLevel.DISK_ONLY)
+      val sentinelData = sibling.table(sentinel)
+      sentinelData.count()
+      sentinelData.storageLevel shouldBe StorageLevel.DISK_ONLY
+      var caches = Seq.empty[CachedAlias]
+      try {
+        CommandConcurrencyInjection.withBeforeRefreshFinalize {
+          caches = Seq(cacheAlias(table))
+          R7CleanupProbe.armed = true
+        } {
+          refreshMv(mv)
+        }
+        R7CleanupProbe.armed = false
+        caches.size shouldBe 1
+        caches.foreach(assertUncached)
+        sibling.table(alias).collect().map(_.getInt(0)).toSeq shouldBe Seq(999)
+        sentinelData.storageLevel shouldBe StorageLevel.DISK_ONLY
+        assertLogged(mv, caches.map(_.name).toSet)
+        assertMvCorrect(mv, body)
+      } finally {
+        finish(caches)
+        sibling.sql(s"DROP VIEW IF EXISTS $alias")
+        sibling.sql(s"DROP VIEW IF EXISTS $sentinel")
+      }
     }
   }
 }
