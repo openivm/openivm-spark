@@ -53,7 +53,10 @@ private[common] final class DeltaGroupCommit[R] {
     val refresh     = DeltaGroupCommit.currentRefresh()
     var interrupted = false
     val led = synchronized {
-      refresh.foreach(arrived.add)
+      refresh.foreach { arrival =>
+        arrived.add(arrival)
+        DeltaGroupCommit.markCommitting(arrival)
+      }
       pending.addLast(mine)
       notifyAll()
       var drained = Vector.empty[Slot]
@@ -132,13 +135,16 @@ private[spark] object DeltaGroupCommit {
   private val MaxWindowNanos     = 5000000000L
 
   private val queues        = new ConcurrentHashMap[String, DeltaGroupCommit[_]]()
-  private val readyArrivals = ConcurrentHashMap.newKeySet[AnyRef]()
+  private val readyArrivals = ConcurrentHashMap.newKeySet[RefreshArrival]()
   private val current       = new ThreadLocal[RefreshArrival]()
 
   /** One refresh command on this thread that may reach a catalog group commit; a nested refresh shares the outer one.
     * Call [[RefreshArrival.ready]] once the refresh holds its locks and [[RefreshArrival.close]] when it ends.
     */
   final class RefreshArrival private[DeltaGroupCommit] (owner: Boolean) {
+    @volatile private[DeltaGroupCommit] var stateKey: String = null
+    @volatile private[DeltaGroupCommit] var committing       = false
+
     def ready(): Unit = if (owner) { readyArrivals.add(this); () }
 
     def close(): Unit = if (owner) {
@@ -158,9 +164,28 @@ private[spark] object DeltaGroupCommit {
       arrival
     }
 
-  private def currentRefresh(): Option[AnyRef] = Option(current.get).filter(readyArrivals.contains)
+  private[common] def currentRefresh(): Option[RefreshArrival] = Option(current.get).filter(readyArrivals.contains)
 
   private def readyRefreshes: Int = readyArrivals.size
+
+  private def markCommitting(refresh: RefreshArrival): Unit = refresh.committing = true
+
+  /** Tags this thread's ready refresh as one that publishes a synchronous state backup under `key`. */
+  private[common] def expectStateBackup(key: String): Unit = currentRefresh().foreach(_.stateKey = key)
+
+  /** Drops from `seen` the refreshes no longer ready, so it never outgrows the refreshes in flight. */
+  private[common] def retainReady(seen: java.util.Set[AnyRef]): Unit = { seen.retainAll(readyArrivals); () }
+
+  /** Returns how many ready refreshes tagged with `key` have reached a group commit but are not in `seen`. */
+  private[common] def unseenCommittingRefreshes(key: String, seen: java.util.Set[AnyRef]): Int = {
+    var unseen = 0
+    val it     = readyArrivals.iterator
+    while (it.hasNext) {
+      val refresh = it.next()
+      if (refresh.committing && key == refresh.stateKey && !seen.contains(refresh)) unseen += 1
+    }
+    unseen
+  }
 
   private[common] def forPath[R](path: String): DeltaGroupCommit[R] =
     queues.computeIfAbsent(path, _ => new DeltaGroupCommit[R]).asInstanceOf[DeltaGroupCommit[R]]
