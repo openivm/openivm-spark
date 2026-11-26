@@ -10,7 +10,8 @@ import org.scalatest.matchers.should.Matchers
 
 import java.io.File
 import java.sql.Timestamp
-import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.{Callable, CountDownLatch, CyclicBarrier, Executors, LinkedBlockingQueue, TimeUnit}
+import java.util.concurrent.atomic.AtomicLong
 import java.util.UUID
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
@@ -87,6 +88,65 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       createdAt = new Timestamp(1700000000000L),
       properties = Map("owner" -> "openivm")
     )
+
+  private final class GroupCollector(writers: Int, peers: Int = 0) extends AutoCloseable {
+    val queue                 = DeltaGroupCommit.forPath[Int](s"$root/group-${UUID.randomUUID()}")
+    private val time          = new AtomicLong()
+    private val events        = new LinkedBlockingQueue[Either[Long, Seq[Int]]]()
+    private val executor      = Executors.newFixedThreadPool(writers + peers)
+    private val ready         = new CountDownLatch(writers + peers)
+    private val commitRelease = new CountDownLatch(1)
+    val enqueue               = Vector.fill(writers + peers)(new CountDownLatch(1))
+
+    queue.nanoTime = () => time.get()
+    queue.waitNanos = remaining => {
+      events.add(Left(remaining))
+      queue.wait()
+    }
+
+    private def commit(requests: Seq[Int]): Unit = {
+      events.add(Right(requests.sorted))
+      commitRelease.await()
+    }
+
+    val calls = enqueue.indices.map { index =>
+      executor.submit(new Callable[Unit] {
+        override def call(): Unit = {
+          val arrival = DeltaGroupCommit.refreshStarted()
+          try {
+            arrival.ready()
+            ready.countDown()
+            enqueue(index).await()
+            if (index < writers) queue.submit(index)(request => commit(Seq(request)))(commit)
+          } finally arrival.close()
+        }
+      })
+    }
+
+    def awaitReady(): Unit = ready.await(10L, TimeUnit.SECONDS) shouldBe true
+
+    def nextEvent(): Either[Long, Seq[Int]] = {
+      val event = events.poll(10L, TimeUnit.SECONDS)
+      event should not be null
+      event
+    }
+
+    def advanceTo(elapsed: FiniteDuration): Unit = queue.synchronized {
+      time.set(elapsed.toNanos)
+      queue.notifyAll()
+    }
+
+    def finishCommit(): Unit = commitRelease.countDown()
+
+    def completed(): Unit = calls.foreach(_.get(10L, TimeUnit.SECONDS))
+
+    override def close(): Unit = {
+      enqueue.foreach(_.countDown())
+      commitRelease.countDown()
+      executor.shutdownNow()
+      executor.awaitTermination(10L, TimeUnit.SECONDS) shouldBe true
+    }
+  }
 
   describe("Delta MV catalog backend") {
     it("recreates an initialized catalog path after it is deleted") {
@@ -268,6 +328,70 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       }
     }
 
+    it("keeps a group commit open for a ready refresh that queues within one commit time") {
+      val collector = new GroupCollector(writers = 6)
+      try {
+        collector.awaitReady()
+        (0 until 5).foreach { index =>
+          collector.enqueue(index).countDown()
+          collector.nextEvent().isLeft shouldBe true
+        }
+        // Advance only after the collector has observed all five queued callers.
+        collector.advanceTo(400.millis)
+        collector.nextEvent() shouldBe Left(600.millis.toNanos)
+        collector.advanceTo(400.millis)
+        collector.nextEvent() shouldBe Left(600.millis.toNanos)
+        collector.advanceTo(800.millis)
+        collector.nextEvent() shouldBe Left(200.millis.toNanos)
+        collector.enqueue(5).countDown()
+        collector.nextEvent() shouldBe Right(0 until 6)
+        collector.calls.foreach(_.isDone shouldBe false)
+        collector.finishCommit()
+        collector.completed()
+      } finally collector.close()
+    }
+
+    it("bounds the group commit wait when a ready refresh never queues") {
+      val collector = new GroupCollector(writers = 1, peers = 1)
+      try {
+        collector.awaitReady()
+        collector.enqueue(0).countDown()
+        collector.nextEvent().isLeft shouldBe true
+        collector.advanceTo(1.second)
+        collector.nextEvent() shouldBe Right(Seq(0))
+        collector.finishCommit()
+        collector.calls.head.get(10L, TimeUnit.SECONDS)
+        collector.calls(1).isDone shouldBe false
+        collector.enqueue(1).countDown()
+        collector.completed()
+      } finally collector.close()
+    }
+
+    it("wakes a group commit collector when the awaited refresh closes without queuing") {
+      val collector = new GroupCollector(writers = 1, peers = 1)
+      try {
+        collector.awaitReady()
+        collector.enqueue(0).countDown()
+        collector.nextEvent().isLeft shouldBe true
+        collector.enqueue(1).countDown()
+        collector.nextEvent() shouldBe Right(Seq(0))
+        collector.finishCommit()
+        collector.completed()
+      } finally collector.close()
+    }
+
+    it("commits at once when no other ready refresh is expected") {
+      val collector = new GroupCollector(writers = 1)
+      try {
+        collector.awaitReady()
+        collector.enqueue(0).countDown()
+        collector.nextEvent() shouldBe Right(Seq(0))
+        collector.finishCommit()
+        collector.completed()
+        collector.queue.waitNanos = _ => fail("a caller with no ready refresh must not wait")
+        collector.queue.submit(1)(_ => ())(_ => fail("a lone request must commit on its own path"))
+      } finally collector.close()
+    }
     it("discards cached metadata when the catalog is recreated at the same Delta version") {
       val catalogPath = s"$root/cached-recreation"
       val tablePath   = s"$catalogPath/mv_metadata"
