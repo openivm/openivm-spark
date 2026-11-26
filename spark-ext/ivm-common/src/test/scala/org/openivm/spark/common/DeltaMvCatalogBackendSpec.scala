@@ -274,7 +274,7 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       val queue                                       = DeltaGroupCommit.forPath[Int](s"$root/group-straggler")
       val ready                                       = new CyclicBarrier(6)
       val batches                                     = mutable.ArrayBuffer.empty[Seq[Int]]
-      def record(requests: Seq[Int]): Unit = batches.synchronized { batches += requests.sorted; () }
+      def record(requests: Seq[Int]): Unit            = batches.synchronized { batches += requests.sorted; () }
 
       Await.result(
         Future.sequence((0 until 6).map { index =>
