@@ -945,7 +945,8 @@ object MvCatalog {
   }
 
   /** The rows of one committed Delta catalog version. A Delta version is immutable, so the rows stay exact for the
-    * (table id, version) they were read at; callers revalidate that key against `DeltaLog.update()` on every read.
+    * (table id, version) they were read at; callers revalidate that key against a `DeltaLog.update()` listing of their
+    * own log that began after the read.
     */
   private final class CatalogVersion(val tableId: String, val version: Long, rows: Array[Row]) {
     private val byName = rows.reverseIterator.map(row => row.getAs[String]("name") -> row).toMap
@@ -964,23 +965,35 @@ object MvCatalog {
   private val catalogVersions = new java.util.concurrent.ConcurrentHashMap[String, CatalogVersion]()
   private val catalogLoads    = new java.util.concurrent.ConcurrentHashMap[String, Object]()
 
-  private final class LogRefresh(val startedNs: Long, val snapshot: org.apache.spark.sql.delta.Snapshot)
+  /** The last catalog listing of one resolved Delta log. It keeps only the table identity and version, and holds the log
+    * weakly, so a record never pins a `Snapshot` or a `DeltaLog`.
+    */
+  private final class LogRefresh(
+      val log: java.lang.ref.WeakReference[DeltaLog],
+      val startedNs: Long,
+      val key: Option[(String, Long)]
+  )
   private val catalogRefreshGates = new java.util.concurrent.ConcurrentHashMap[String, Object]()
   private val catalogRefreshes    = new java.util.concurrent.ConcurrentHashMap[String, LogRefresh]()
 
-  /** The catalog log as listed by a `DeltaLog.update()` that began after this request. Such a listing already includes
-    * every commit, by any driver, that completed before the request, so concurrent readers share one listing instead
-    * of queueing a listing each on the Delta log lock.
+  /** The catalog table identity and version as listed by a `log.update()` of this same `DeltaLog` instance that began
+    * after this request. Such a listing already includes every commit, by any driver, that completed before the
+    * request, so concurrent readers of one log share a listing instead of queueing a listing each on the Delta log
+    * lock. A record of any other instance, including another resolution of the same configured path, is never reused.
     */
-  private def refreshedSnapshot(path: String, log: DeltaLog): org.apache.spark.sql.delta.Snapshot = {
+  private def refreshedVersion(path: String, log: DeltaLog): Option[(String, Long)] = {
     val requestedNs = System.nanoTime()
     catalogRefreshGates.computeIfAbsent(path, _ => new Object).synchronized {
-      Option(catalogRefreshes.get(path)).filter(_.startedNs > requestedNs).map(_.snapshot).getOrElse {
-        val startedNs = System.nanoTime()
-        val snapshot  = log.update()
-        catalogRefreshes.put(path, new LogRefresh(startedNs, snapshot))
-        snapshot
-      }
+      Option(catalogRefreshes.get(path))
+        .filter(refresh => (refresh.log.get() eq log) && refresh.startedNs - requestedNs > 0L)
+        .map(_.key)
+        .getOrElse {
+          val startedNs = System.nanoTime()
+          val snapshot  = log.update()
+          val key       = if (snapshot.version < 0L) None else Some(snapshot.metadata.id -> snapshot.version)
+          catalogRefreshes.put(path, new LogRefresh(new java.lang.ref.WeakReference(log), startedNs, key))
+          key
+        }
     }
   }
 
@@ -1000,23 +1013,20 @@ object MvCatalog {
     )
   }
 
-  /** The shared Delta catalog at its latest committed version. Every call lists the Delta log, so a commit by any
-    * driver is visible to the next read; only the row scan is shared between reads of the same (table id, version).
+  /** The shared Delta catalog at its latest committed version. Every call observes a listing of its own Delta log that
+    * began after the call, so a commit by any driver is visible to the next read; concurrent reads of one log share
+    * that listing, and the row scan is shared between reads of the same (table id, version).
     * `None` sends the caller down the backend path, which also creates a missing catalog table.
     */
   private def committedCatalog(spark: SparkSession): Option[CatalogVersion] =
     if (!FeatureGate.deltaCatalogEnabled(spark)) None
     else
       try {
-        val path = FeatureGate.catalogPath(spark).stripSuffix("/") + "/mv_metadata"
-        val log  = DeltaLog.forTable(spark, new org.apache.hadoop.fs.Path(path))
-        def latest(): Option[(String, Long)] = {
-          val snapshot = refreshedSnapshot(path, log)
-          if (snapshot.version < 0L) None else Some(snapshot.metadata.id -> snapshot.version)
-        }
-        // A cached committed version at or after the listed one is at least as fresh as that listing.
+        val path                             = FeatureGate.catalogPath(spark).stripSuffix("/") + "/mv_metadata"
+        val log                              = DeltaLog.forTable(spark, new org.apache.hadoop.fs.Path(path))
+        def latest(): Option[(String, Long)] = refreshedVersion(path, log)
         def cached(key: (String, Long)): Option[CatalogVersion] =
-          Option(catalogVersions.get(path)).filter(entry => entry.tableId == key._1 && entry.version >= key._2)
+          Option(catalogVersions.get(path)).filter(entry => entry.tableId == key._1 && entry.version == key._2)
         latest().flatMap { key =>
           cached(key).orElse {
             catalogLoads.computeIfAbsent(path, _ => new Object).synchronized {
