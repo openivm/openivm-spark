@@ -1,7 +1,7 @@
 package org.openivm.spark.analyzer
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, Expression, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, Cast, Expression, Literal}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.analysis.{NamedRelation, ResolvedIdentifier}
@@ -142,13 +142,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
                   .map(_.toLowerCase -> valueExpr)
               }
               .toMap
-          val afterProjections = filteredPlan.output.map { attr =>
-            assignMap.get(attr.name.toLowerCase) match {
-              case Some(newValue) => Alias(newValue, attr.name)()
-              case None           => attr
-            }
-          }
-          val afterPlan: LogicalPlan = Project(afterProjections, filteredPlan)
+          val afterPlan = updateAfterPlan(filteredPlan, assignMap)
           val preOps = Seq(
             (beforePlan, stagingPath(tableName, "UPDATE_BEFORE"), "UPDATE_BEFORE"),
             (afterPlan, stagingPath(tableName, "UPDATE_AFTER"), "UPDATE_AFTER")
@@ -231,13 +225,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
           val assignMap: Map[String, Expression] = u.assignments.collect { case Assignment(attr: Attribute, value) =>
             attr.name.toLowerCase -> value
           }.toMap
-          val afterProjections = filteredPlan.output.map { attr =>
-            assignMap.get(attr.name.toLowerCase) match {
-              case Some(newValue) => Alias(newValue, attr.name)()
-              case None           => attr
-            }
-          }
-          val afterPlan: LogicalPlan = Project(afterProjections, filteredPlan)
+          val afterPlan = updateAfterPlan(filteredPlan, assignMap)
           val preOps = Seq(
             (beforePlan, stagingPath(tableName, "UPDATE_BEFORE"), "UPDATE_BEFORE"),
             (afterPlan, stagingPath(tableName, "UPDATE_AFTER"), "UPDATE_AFTER")
@@ -261,6 +249,18 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
+
+  private def updateAfterPlan(rows: LogicalPlan, assignments: Map[String, Expression]): LogicalPlan = {
+    val columns = rows.output.map { attr =>
+      assignments.get(attr.name.toLowerCase) match {
+        case Some(value) =>
+          // Delta omits NullType fields from Parquet. Stage the target type, not the raw SET expression type.
+          Alias(Cast(value, attr.dataType, Some(session.sessionState.conf.sessionLocalTimeZone)), attr.name)()
+        case None => attr
+      }
+    }
+    Project(columns, rows)
+  }
 
   /**
    * True when [[ReplaceData.query]] contains a [[Project]] with at least one
