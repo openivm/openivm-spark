@@ -2357,11 +2357,20 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           |INSERT INTO openivm_delta_v SELECT * FROM t3_join""".stripMargin
       val request = SparkRefreshRewriter.RegularNtermKeyRequest("orders", "t1_account_id", Some("BIGINT"))
 
-      SparkRefreshRewriter.regularNtermKeyRequests(sql) shouldBe Seq(request)
-      val rewritten = SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(sql, Map(request -> Seq("10", "20")))
-      rewritten should include("WHERE t2_account_id IN (10, 20)")
-      rewritten should include("FROM t1_projection")
-      rewritten should include("FROM `accounts` VERSION AS OF 17")
+      val wrapped = sql.replace(
+        "CAST(t1_account_id AS BIGINT) = t2_account_id",
+        "((t2_account_id) > (0)) AND ((CAST(t1_account_id AS BIGINT)) = (t2_account_id))"
+      )
+      for (program <- Seq(sql, wrapped)) {
+        SparkRefreshRewriter.regularNtermKeyRequests(program) shouldBe Seq(request)
+        val rewritten = SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(program, Map(request -> Seq("10", "20")))
+        rewritten should include("WHERE t2_account_id IN (10, 20)")
+        rewritten should include("FROM t1_projection")
+        rewritten should include("FROM `accounts` VERSION AS OF 17")
+      }
+      val disjunction = wrapped.replace("AND", "OR")
+      SparkRefreshRewriter.regularNtermKeyRequests(disjunction) shouldBe empty
+      SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(disjunction, Map(request -> Seq("10"))) shouldBe disjunction
     }
 
     it("leaves the N-term SQL unchanged when no bounded key set is available") {

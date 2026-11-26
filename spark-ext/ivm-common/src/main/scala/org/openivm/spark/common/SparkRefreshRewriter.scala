@@ -1,6 +1,13 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedRelation}
+import org.apache.spark.sql.catalyst.expressions.{And, Cast, EqualTo, Expression}
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.plans.logical.{Filter, Join, LogicalPlan, Project, SubqueryAlias}
+
+import scala.util.Try
 
 /** Output of [[SparkRefreshRewriter.rewrite]]: the ordered list of Spark-SQL
   * statements that, when executed, perform one incremental refresh.
@@ -1386,17 +1393,45 @@ object SparkRefreshRewriter {
         )
     }
 
-    val operand =
-      "((?:(?i:CAST)\\s*\\(\\s*)?(?:(`?[A-Za-z][A-Za-z0-9_]*`?)\\s*\\.\\s*)?(`?[A-Za-z][A-Za-z0-9_]*`?)(?:\\s+(?i:AS)\\s+([A-Za-z][A-Za-z0-9_]*(?:\\s*\\([^)]*\\))?)\\s*\\))?)"
-    val equality = ("(?s)" + operand + "\\s*=\\s*" + operand).r
+    // Only inner joins of direct relations can safely constrain the entire CTE.
+    def innerJoinConditions(plan: LogicalPlan): Option[Seq[Expression]] = plan match {
+      case project: Project      => innerJoinConditions(project.child)
+      case filter: Filter        => innerJoinConditions(filter.child)
+      case alias: SubqueryAlias  => innerJoinConditions(alias.child)
+      case _: UnresolvedRelation => Some(Seq.empty)
+      case join: Join if join.joinType == Inner =>
+        for {
+          left      <- innerJoinConditions(join.left)
+          right     <- innerJoinConditions(join.right)
+          condition <- join.condition
+        } yield left ++ right :+ condition
+      case _ => None
+    }
+
+    def equalityConjuncts(expression: Expression): Seq[EqualTo] = expression match {
+      case And(left, right)  => equalityConjuncts(left) ++ equalityConjuncts(right)
+      case equality: EqualTo => Seq(equality)
+      case _                 => Seq.empty
+    }
+
+    def columnRef(expression: Expression): Option[(Option[String], String, Option[String])] = expression match {
+      case attr: UnresolvedAttribute =>
+        attr.nameParts match {
+          case Seq(name)        => Some((None, name, None))
+          case Seq(alias, name) => Some((Some(alias), name, None))
+          case _                => None
+        }
+      case cast: Cast if cast.child.isInstanceOf[UnresolvedAttribute] =>
+        columnRef(cast.child).map { case (alias, name, _) => (alias, name, Some(cast.dataType.sql)) }
+      case _ => None
+    }
 
     ctes.flatMap { cte =>
       val refs = collectScd2RelationRefs(cte.body).filter(ref => byName.contains(ref.shortName.toLowerCase))
       if (refs.size < 2 || !"(?is)\\bINNER\\s+JOIN\\b".r.findFirstIn(cte.body).isDefined) Seq.empty
       else {
-        def relationFor(alias: String, column: String): Option[Scd2RelationRef] = {
-          val normalizedAlias = stripBackticks(Option(alias).getOrElse(""))
-          val normalizedCol   = stripBackticks(column)
+        def relationFor(alias: Option[String], column: String): Option[Scd2RelationRef] = {
+          val normalizedAlias = alias.getOrElse("")
           val candidates =
             if (normalizedAlias.nonEmpty)
               refs.filter(ref =>
@@ -1407,7 +1442,7 @@ object SparkRefreshRewriter {
               refs.filter { ref =>
                 byName
                   .get(ref.shortName.toLowerCase)
-                  .exists(parsedCteColumns(_).exists(_.equalsIgnoreCase(normalizedCol)))
+                  .exists(parsedCteColumns(_).exists(_.equalsIgnoreCase(column)))
               }
           candidates.distinct match {
             case Seq(single) => Some(single)
@@ -1415,31 +1450,35 @@ object SparkRefreshRewriter {
           }
         }
 
-        equality
-          .findAllMatchIn(cte.body)
-          .flatMap { m =>
-            val leftRef  = relationFor(m.group(2), m.group(3))
-            val rightRef = relationFor(m.group(6), m.group(7))
+        Try(CatalystSqlParser.parsePlan(cte.body)).toOption
+          .flatMap(innerJoinConditions)
+          .filter(_.size + 1 == refs.size)
+          .iterator
+          .flatten
+          .flatMap(equalityConjuncts)
+          .flatMap { equality =>
             for {
-              left        <- leftRef
-              right       <- rightRef
-              leftOrigin  <- origin(left.shortName)
-              rightOrigin <- origin(right.shortName)
+              (leftAlias, leftCol, leftCast)    <- columnRef(equality.left)
+              (rightAlias, rightCol, rightCast) <- columnRef(equality.right)
+              left                              <- relationFor(leftAlias, leftCol)
+              right                             <- relationFor(rightAlias, rightCol)
+              leftOrigin                        <- origin(left.shortName)
+              rightOrigin                       <- origin(right.shortName)
               site <- (leftOrigin, rightOrigin) match {
                 case (base, delta) if !base.isDelta && delta.isDelta =>
                   Some(
                     RegularNtermPruneSite(
                       cte.name,
-                      m.group(1).trim,
-                      RegularNtermKeyRequest(delta.shortName, stripBackticks(m.group(7)), Option(m.group(8)))
+                      equality.left.sql,
+                      RegularNtermKeyRequest(delta.shortName, rightCol, rightCast)
                     )
                   )
                 case (delta, base) if delta.isDelta && !base.isDelta =>
                   Some(
                     RegularNtermPruneSite(
                       cte.name,
-                      m.group(5).trim,
-                      RegularNtermKeyRequest(delta.shortName, stripBackticks(m.group(3)), Option(m.group(4)))
+                      equality.right.sql,
+                      RegularNtermKeyRequest(delta.shortName, leftCol, leftCast)
                     )
                   )
                 case _ => None
