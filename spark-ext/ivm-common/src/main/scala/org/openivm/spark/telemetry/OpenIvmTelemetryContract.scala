@@ -191,6 +191,10 @@ object OpenIvmTelemetryContract {
     "work_counters" -> (("counter", Set.empty[String], Set("value")))
   )
 
+  /** Deep fields that `deep_status` replaces; none may accompany it. */
+  private[telemetry] val DeepRenderedFields: Set[String] =
+    (DeepTextFields - "deep_status") ++ DeepIntegralFields ++ DeepArrayFields.keySet
+
   private[telemetry] val AllowedFields: Set[String] =
     TextFields ++ IntegralFields ++ DeepTextFields ++ DeepIntegralFields ++ DeepArrayFields.keySet +
       "source_versions" + "lock_acquisitions"

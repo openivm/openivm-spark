@@ -319,7 +319,10 @@ private[telemetry] final class OpenIvmTelemetryExporter(
     val failed   = Option(payload.get("deep_status")).map(_.asText())
     if (
       status.exists(value => !OpenIvmTelemetryContract.DeepCoverageStatuses.contains(value)) ||
-      failed.exists(value => value != OpenIvmTelemetryContract.DeepStatusAugmentationFailed || status.isDefined) ||
+      failed.exists(value =>
+        value != OpenIvmTelemetryContract.DeepStatusAugmentationFailed ||
+          OpenIvmTelemetryContract.DeepRenderedFields.exists(payload.has)
+      ) ||
       payload.has("owner_thread_unattributed_ns") != complete ||
       payload
         .has("owner_thread_overcoverage_ns") != status.contains(OpenIvmTelemetryContract.DeepCoverageInconsistent) ||

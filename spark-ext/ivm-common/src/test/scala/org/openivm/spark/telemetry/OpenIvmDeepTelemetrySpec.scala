@@ -1,5 +1,6 @@
 package org.openivm.spark.telemetry
 
+import com.codahale.metrics.MetricRegistry
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import com.fasterxml.jackson.databind.node.ObjectNode
 import org.apache.hadoop.conf.Configuration
@@ -105,13 +106,14 @@ class OpenIvmDeepTelemetrySpec extends AnyFunSpec with Matchers with BeforeAndAf
 
   private def rendered(
       suffix: String,
-      snapshot: OpenIvmExecutionSpan.DeepSnapshot
+      snapshot: OpenIvmExecutionSpan.DeepSnapshot,
+      marker: String => String = OpenIvmExecutionSpan.markAugmentationFailed
   ): (OpenIvmTelemetryContract.ExecutionIdentity, ObjectNode) = {
     val publisher = new CapturingPublisher
     val span      = OpenIvmExecutionSpan.startForTesting(identity(suffix), publisher)
     classify(span)
     finish(span)
-    val payload = OpenIvmExecutionSpan.withDeepBestEffort(publisher.raw.head, Some(snapshot))
+    val payload = OpenIvmExecutionSpan.withDeepBestEffort(publisher.raw.head, Some(snapshot), marker)
     (identity(suffix), Json.readTree(payload).asInstanceOf[ObjectNode])
   }
 
@@ -354,6 +356,13 @@ class OpenIvmDeepTelemetrySpec extends AnyFunSpec with Matchers with BeforeAndAf
     }
 
     it("marks a deep-requested span whose augmentation failed instead of passing as deep-off") {
+      val registry = new MetricRegistry()
+      BoundedTelemetryRuntime.registerMetrics(registry) shouldBe true
+      def gauge(name: String): Long =
+        registry.getGauges.get(s"openivm.telemetry.deep.$name").getValue.asInstanceOf[java.lang.Number].longValue()
+      val failuresBefore = gauge("augmentation_failures")
+      val unmarkedBefore = gauge("unmarked_payloads")
+
       val state               = new OpenIvmExecutionSpan.DeepState(1000L, Thread.currentThread())
       val broken              = state.freeze(1400L).copy(phases = null)
       val (accepted, payload) = rendered("augmentation_failed", broken)
@@ -361,10 +370,29 @@ class OpenIvmDeepTelemetrySpec extends AnyFunSpec with Matchers with BeforeAndAf
       payload.path("deep_status").asText() shouldBe OpenIvmTelemetryContract.DeepStatusAugmentationFailed
       fieldNames(payload).intersect(DeepFields) shouldBe Set("deep_status")
       reusable(accepted, payload) shouldBe true
+      gauge("augmentation_failures") shouldBe failuresBefore + 1L
+      gauge("unmarked_payloads") shouldBe unmarkedBefore
 
       val mixed = payload.deepCopy().put("owner_thread_coverage_status", OpenIvmTelemetryContract.DeepCoverageComplete)
       mixed.put("owner_thread_unattributed_ns", 0L)
       an[OpenIvmTelemetryExportException] should be thrownBy reusable(accepted, mixed)
+      val withClock = payload.deepCopy().put("clock_domain_id", "clock")
+      an[OpenIvmTelemetryExportException] should be thrownBy reusable(accepted, withClock)
+      val withPhases = payload.deepCopy()
+      withPhases.putArray("phase_totals")
+      an[OpenIvmTelemetryExportException] should be thrownBy reusable(accepted, withPhases)
+
+      val (fallbackAccepted, fallback) =
+        rendered("augmentation_marker_failed", broken, _ => throw new IllegalStateException("marker"))
+      fallback.path("deep_status").asText() shouldBe OpenIvmTelemetryContract.DeepStatusAugmentationFailed
+      fieldNames(fallback).intersect(DeepFields) shouldBe Set("deep_status")
+      reusable(fallbackAccepted, fallback) shouldBe true
+      gauge("augmentation_failures") shouldBe failuresBefore + 2L
+      gauge("unmarked_payloads") shouldBe unmarkedBefore
+
+      OpenIvmExecutionSpan.withDeepBestEffort("unrenderable", Some(broken)) shouldBe "unrenderable"
+      gauge("augmentation_failures") shouldBe failuresBefore + 3L
+      gauge("unmarked_payloads") shouldBe unmarkedBefore + 1L
     }
   }
 }

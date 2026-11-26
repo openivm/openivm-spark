@@ -1025,19 +1025,56 @@ object OpenIvmExecutionSpan extends Logging {
     if (span != null) span.recordDeepCounter(counter, delta)
   }
 
-  private[telemetry] def withDeepBestEffort(payload: String, snapshot: Option[DeepSnapshot]): String =
+  private val deepAugmentationFailures = new java.util.concurrent.atomic.AtomicLong()
+  private val deepUnmarkedPayloads     = new java.util.concurrent.atomic.AtomicLong()
+
+  /** Deep-requested payload renderings whose deep fields could not be added, marked or not. */
+  def deepAugmentationFailureCount: Long = deepAugmentationFailures.get()
+
+  /** Deep-requested renderings left without the `deep_status` marker because the payload is not a JSON object. */
+  def deepUnmarkedPayloadCount: Long = deepUnmarkedPayloads.get()
+
+  private[telemetry] def withDeepBestEffort(
+      payload: String,
+      snapshot: Option[DeepSnapshot],
+      marker: String => String = markAugmentationFailed
+  ): String =
     snapshot.fold(payload) { deep =>
       try withDeep(payload, deep)
       catch {
         case NonFatal(error) =>
+          deepAugmentationFailures.incrementAndGet()
           logWarning(s"[openivm-telemetry-sink] deep augmentation failed (${error.getClass.getSimpleName})")
-          try {
-            val root = Json.readTree(payload).deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
-            root.put("deep_status", OpenIvmTelemetryContract.DeepStatusAugmentationFailed)
-            Json.writeValueAsString(root)
-          } catch { case NonFatal(_) => payload }
+          try marker(payload)
+          catch {
+            case NonFatal(markerError) =>
+              logWarning(
+                s"[openivm-telemetry-sink] deep augmentation marker failed (${markerError.getClass.getSimpleName})"
+              )
+              spliceAugmentationFailed(payload).getOrElse {
+                deepUnmarkedPayloads.incrementAndGet()
+                payload
+              }
+          }
       }
     }
+
+  private[telemetry] def markAugmentationFailed(payload: String): String = {
+    val root = Json.readTree(payload).deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
+    root.put("deep_status", OpenIvmTelemetryContract.DeepStatusAugmentationFailed)
+    Json.writeValueAsString(root)
+  }
+
+  /** Parser-free marker fallback; refuses only text that cannot be a JSON object. */
+  private def spliceAugmentationFailed(payload: String): Option[String] = {
+    val text = Option(payload).map(_.trim).getOrElse("")
+    if (text.length < 2 || text.head != '{' || text.last != '}') None
+    else {
+      val body      = text.substring(0, text.length - 1)
+      val separator = if (body.substring(1).trim.isEmpty) "" else ","
+      Some(s"""$body$separator"deep_status":"${OpenIvmTelemetryContract.DeepStatusAugmentationFailed}"}""")
+    }
+  }
 
   private[telemetry] def withDeep(payload: String, deep: DeepSnapshot): String = {
     val root = Json.readTree(payload).deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()

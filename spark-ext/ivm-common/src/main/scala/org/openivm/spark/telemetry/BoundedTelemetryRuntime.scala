@@ -60,11 +60,17 @@ object BoundedTelemetryRuntime {
     "registration_failures"   -> gauge(registrationFailureCount)
   )
 
+  private val deepMetrics: Seq[(String, Gauge[Long])] = Seq(
+    "augmentation_failures" -> gauge(OpenIvmExecutionSpan.deepAugmentationFailureCount),
+    "unmarked_payloads"     -> gauge(OpenIvmExecutionSpan.deepUnmarkedPayloadCount)
+  )
+
   /** Registers constant, label-free gauges even when ordinary OpenIVM metrics are disabled. */
   private[spark] def registerMetrics(registry: MetricRegistry): Boolean = {
     var success = true
-    metrics.foreach { case (suffix, metric) =>
-      val name = s"openivm.telemetry.queue.$suffix"
+    val named = metrics.map { case (suffix, metric) => s"openivm.telemetry.queue.$suffix" -> metric } ++
+      deepMetrics.map { case (suffix, metric) => s"openivm.telemetry.deep.$suffix" -> metric }
+    named.foreach { case (name, metric) =>
       try {
         val existing = registry.getMetrics.get(name)
         if (existing == null) registry.register(name, metric)

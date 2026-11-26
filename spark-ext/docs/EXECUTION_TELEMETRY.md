@@ -55,8 +55,8 @@ to builds without deep telemetry. A reader that predates these fields rejects
 deep-on exports, so enable deep telemetry only when every exporter and
 consumer in the campaign uses this build.
 
-Deep figures add no SQL, scans, per-row logs, profile rows or Dropwizard
-metrics. All `*_ns` values come from `System.nanoTime()` on the driver and
+Deep figures add no SQL, scans, per-row logs, profile rows or per-span
+Dropwizard metrics. All `*_ns` values come from `System.nanoTime()` on the driver and
 share the emitted `clock_domain_id`; never compare them across clock domains.
 Durations measured elsewhere in milliseconds are imported only as
 `phase_totals[].external_ms`; they never enter a `*_ns` field.
@@ -74,10 +74,22 @@ Top-level fields:
 | `owner_thread_coverage_reason` | `active_wrappers_at_freeze` or `wrapped_exceeds_span`, when not complete. |
 | `owner_thread_unattributed_ns` | `duration_ns - owner_thread_wrapped_ns`, only when status is `complete`. |
 | `owner_thread_overcoverage_ns` | Positive excess, only when status is `inconsistent`. |
-| `deep_status` | `augmentation_failed` when deep was requested but rendering failed; the deep fields above are then absent. |
+| `deep_status` | `augmentation_failed` when deep was requested but rendering failed; no other deep field is then present. |
 | `active_wrappers_at_freeze` | Wrappers on any thread still open at emission. |
 | `deep_observer_ns` | Recorder self-time; a lower bound, not total overhead. |
 | `*_dropped_count`, `deep_names_truncated_count` | Entries refused by the caps, names cut at 128 characters. |
+
+Two label-free driver gauges, registered by the metrics plugin even when
+ordinary metrics are off, count deep-requested payload renderings (the log
+line and the exported object separately): `openivm.telemetry.deep.augmentation_failures`
+counts every rendering whose deep fields could not be added. The `deep_status`
+marker is then added by the JSON writer or, if that also fails, by a
+parser-free splice, so every JSON-object payload carries it.
+`openivm.telemetry.deep.unmarked_payloads` counts only renderings whose input
+was not a JSON object and could not be marked, so the record looks deep-off.
+A consumer that requested deep telemetry must treat a span with neither
+coverage status nor `deep_status` as unavailable, never as deep-off or zero,
+and check these gauges.
 
 `phase_totals` (at most 64) has one entry per phase name: `wrapped_count`,
 `wrapped_failed_count`, `wrapped_ns`, `wrapped_max_ns`,
