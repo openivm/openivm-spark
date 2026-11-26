@@ -5934,9 +5934,10 @@ case class RefreshMaterializedViewCommand(
       // Resolve current source schemas and check for schema drift. Include
       // upstream MV identity hashes so a DROP + recreate-with-same-schema
       // upstream is also caught.
-      val (freshSchemas, freshMvIdentityBySource, freshFingerprint) =
+      val (freshSchemas, freshMvIdentityBySource, freshFingerprint, resolvedPublicProjections) =
         profile.timeStep("metadata_pre_sql", "phase=schema_resolve") {
           RefreshPerf.timePhase(refreshId, viewLabel, "schema_resolve") {
+            val projections = Map.newBuilder[String, Boolean]
             val schemas = meta.sourceTables.map { source =>
               val schema = preparedSourceAdvance
                 .flatMap(_.batchFor(source))
@@ -5944,7 +5945,13 @@ case class RefreshMaterializedViewCommand(
                   val expected = SourceVersionDelta.schemaAt(spark, source, batch.startVersionInclusive)
                   SourceVersionDelta.validate(spark, batch, expected)
                 }
-                .getOrElse(spark.table(source).schema)
+                .getOrElse {
+                  val table  = spark.table(source)
+                  val schema = table.schema
+                  if (propagation.requiresDmlInterception)
+                    projections += source -> MvProjectionSource.projection(table.queryExecution.analyzed).nonEmpty
+                  schema
+                }
               source -> schema
             }.toMap
             val identityMap: Map[String, String] = {
@@ -5956,7 +5963,7 @@ case class RefreshMaterializedViewCommand(
               }.toMap
             }
             val fp = MvCatalog.schemaFingerprint(schemas, identityMap)
-            (schemas, identityMap, fp)
+            (schemas, identityMap, fp, projections.result())
           }
         }
       if (freshFingerprint != meta.sourceSchemaFingerprint) {
@@ -6651,6 +6658,14 @@ case class RefreshMaterializedViewCommand(
                               cdf.registerSourceDeltaWithCoverage(spark, qualTable, schema, tableBatches)
                             coverage.foreach(view => registeredCdfDeltaViews(view.batch) = view)
                             sql
+                          case intercept: InterceptChangePropagation =>
+                            intercept.registerSourceDeltaView(
+                              spark,
+                              qualTable,
+                              schema,
+                              tableBatches,
+                              resolvedPublicProjections.get(qualTable)
+                            )
                           case _ => propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches)
                         }
                     }

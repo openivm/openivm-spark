@@ -6,7 +6,8 @@ import org.apache.spark.sql.types.StructType
 /**
  * [[ChangePropagation]] implementation that delegates to the existing
  * [[StagingCatalog]] / [[StagingDeltaView]] machinery written by the DML
- * interceptor.
+ * interceptor.  All semantics of the pre-trait code path are preserved
+ * verbatim — this class is a pure forwarding shim.
  */
 final class InterceptChangePropagation extends ChangePropagation {
 
@@ -62,17 +63,17 @@ final class InterceptChangePropagation extends ChangePropagation {
       sourceTable: String,
       sourceSchema: StructType,
       batches: Seq[ChangeBatch]
+  ): String = registerSourceDeltaView(spark, sourceTable, sourceSchema, batches, None)
+
+  private[spark] def registerSourceDeltaView(
+      spark: SparkSession,
+      sourceTable: String,
+      sourceSchema: StructType,
+      batches: Seq[ChangeBatch],
+      resolvedPublicProjection: Option[Boolean]
   ): String = {
-    val sql = batches match {
-      case Seq(StagingChangeBatch(_, Seq(delta), _)) if delta.opType == StagingDelta.OpTypes.Insert =>
-        val viewName = StagingDeltaView.deltaViewName(sourceTable)
-        spark
-          .sql(StagingDeltaView.insertSelect(sourceSchema, delta))
-          .createOrReplaceTempView(s"`${viewName.replace("`", "``")}`")
-        buildSourceDeltaViewSql(sourceTable, sourceSchema, batches)
-      case _ => super.registerSourceDeltaView(spark, sourceTable, sourceSchema, batches)
-    }
-    if (MvProjectionSource.isProjection(spark, sourceTable)) {
+    val sql = super.registerSourceDeltaView(spark, sourceTable, sourceSchema, batches)
+    if (resolvedPublicProjection.getOrElse(MvProjectionSource.isProjection(spark, sourceTable))) {
       val name = StagingDeltaView.deltaViewName(sourceTable)
       MvProjectionSource
         .project(spark.table(name), sourceSchema, Seq("openivm_multiplicity", "openivm_timestamp"))
