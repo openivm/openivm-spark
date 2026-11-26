@@ -4735,9 +4735,11 @@ case class RefreshMaterializedViewCommand(
       // and record_cascade trigger-key resolution).  A RocksDB prefix scan
       // each time costs 5-30 ms × 3 across heavy refresh programs.  Read once
       // and reuse.  Defensive try/catch matches the original call sites.
-      lazy val allMvsCached: Seq[MvMetadata] =
-        try MvCatalog.list(spark)
-        catch { case _: Throwable => Seq.empty[MvMetadata] }
+      // None when the catalog read failed, so callers that skip work can fail closed.
+      lazy val allMvsListing: Option[Seq[MvMetadata]] =
+        try Some(MvCatalog.list(spark))
+        catch { case _: Throwable => None }
+      lazy val allMvsCached: Seq[MvMetadata] = allMvsListing.getOrElse(Seq.empty[MvMetadata])
 
       val collectedChangeBatches = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
         RefreshPerf.timePhase(refreshId, viewLabel, "collect_staging") {
@@ -5552,9 +5554,10 @@ case class RefreshMaterializedViewCommand(
       val constraintFacts          = WorkloadFactsRegistry.forRefresh().discover(spark, meta.sourceTables)
       val runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark)
       // OpenIVM's aggregate cascade rows (retract companions, old/new group snapshots) exist
-      // only for downstream MVs. Without one, the refresh neither writes nor reads them.
+      // only for downstream MVs. Without one, the refresh neither writes nor reads them. If the
+      // catalog could not be read, keep the rows: a downstream view may still need them.
       val unconsumedCascade =
-        downstreamSourceKeysForThisMv.isEmpty &&
+        allMvsListing.isDefined && downstreamSourceKeysForThisMv.isEmpty &&
           (meta.refreshType == RefreshTypeCode.AggregateGroup || meta.refreshType == RefreshTypeCode.AggregateHaving)
       val compileFacts = WorkloadFacts(
         // Delta CDF supplies pre/post images to downstream consumers of these grouped aggregates.
