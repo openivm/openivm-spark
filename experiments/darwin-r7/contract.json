@@ -2,6 +2,10 @@
   "schema": "openivm.r7-contract/v1",
   "status": "proposed-for-d8-review",
   "round": "R7",
+  "qualified_images": [
+    "sha256:ea1442c0a9146334d4a237ccbe6b53b90ba685f7a4829126ec58c8735758727e",
+    "sha256:d548acd536dcb8f5c2e133357c8022c1164e0b58eaa7f845fe5ef478580c206f"
+  ],
   "purpose": "Local, relative code A/B of OpenIVM-Spark candidates against deployed v2 on the user's six-MV walkthrough. It shortlists candidates for Fabric; it never accepts a release.",
   "identities": {
     "deployed_v2": "50fa4ceb2bfbe2419eb682503cfe20be2083f388",
@@ -41,13 +45,20 @@
       "requires_ancestors": [],
       "note": "Captured walkthrough settings (including queue enabled) on both arms, with additional R7 driver/task detail off; not the all-telemetry-disabled product default."
     },
-    "task-metrics": {
+    "instrumented-default": {
+      "telemetry_conf": {},
+      "control_sha": "0e5e330ec360b01ddf9f38e75f53ee976d3a7355",
+      "requires_ancestors": ["bea054e868defaae17580bfeef454a1f1fded043", "7791d7953bbb77fbbcfb74cba18edd7cc8e02de3"],
+      "note": "The reviewed combined source on both arms, with the captured walkthrough queue and optional deep detail off."
+    },
+    "instrumented-deep": {
       "telemetry_conf": {
+        "spark.openivm.telemetry.deep.enabled": "true",
         "spark.openivm.telemetry.taskMetrics.enabled": "true"
       },
-      "control_sha": null,
-      "requires_ancestors": ["7791d7953bbb77fbbcfb74cba18edd7cc8e02de3"],
-      "note": "Frozen only when base-r2 exists; identical observer settings on both arms."
+      "control_sha": "0e5e330ec360b01ddf9f38e75f53ee976d3a7355",
+      "requires_ancestors": ["bea054e868defaae17580bfeef454a1f1fded043", "7791d7953bbb77fbbcfb74cba18edd7cc8e02de3"],
+      "note": "Diagnostic profile with both optional layers enabled on both arms. Never mix with default-profile timings."
     }
   },
   "expected": {

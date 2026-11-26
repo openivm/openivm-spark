@@ -11,13 +11,22 @@ Use a clean detached checkout of the **independently frozen contract commit**, n
 ```bash
 export NX_DAEMON=false PYTHONDONTWRITEBYTECODE=1
 python3 -m unittest discover -s experiments/darwin-r7
-python3 experiments/darwin-r7/paired.py run \
+python3 experiments/darwin-r7/paired.py plan \
   --control 50fa4ceb2bfbe2419eb682503cfe20be2083f388 \
   --candidate "$PRODUCT_ONLY_COMMIT" --profile default --workload primary \
   --target spark-4.1 --series-id "$SERIES_ID" --out "$FRESH_ABSOLUTE_DIRECTORY"
 ```
 
-The candidate must descend from the profile's control and modify only approved existing product sources. Keep supplementary tests on a different ref. The driver installs the identical trusted harness on both detached arms, checks native hashes, freezes the complete AB/BA/AB plan before running a command, and saves raw Nx output, reports, events and SHA-256 receipts outside the repository. Each invocation gets a fresh fork and warehouse; worktrees are reused only within the series. Do not reuse an output directory. `paired.py score DIRECTORY` recomputes the verdict from its original evidence. Preserve failed, cancelled and superseded attempts. Retest under a new ID, never by dropping a pair.
+`plan` starts **no arms**. Give the independent auditor the unique series ID, emitted plan SHA-256, full control/candidate, actual box and lease-backed wrapper image readback, and the original Privy plan job ID. Use the registration ID returned for that exact plan. Register every repeat before its first arm; the registry retains cancelled, failed, and superseded series as well as successes.
+
+```bash
+python3 experiments/darwin-r7/paired.py run "$FRESH_ABSOLUTE_DIRECTORY" \
+  --registered-plan-sha256 "$REGISTERED_PLAN_SHA256" --registration-id "$D8_REGISTRATION"
+python3 experiments/darwin-r7/paired.py score "$FRESH_ABSOLUTE_DIRECTORY" \
+  --anchors "$ORIGINAL_PRIVY_RUN_STDOUT"
+```
+
+The candidate must descend from the profile's control and modify only approved existing product sources. Keep supplementary tests on a different ref. The driver installs the identical trusted harness on both detached arms, checks native hashes, freezes the complete AB/BA/AB plan before running a command, and saves raw Nx output, reports, events and SHA-256 receipts outside the repository. Each invocation gets a fresh fork and warehouse; worktrees are reused only within the series. Do not reuse an output directory. Every `plan.json`, `registration.json` and `arm.json` digest is emitted to original job stdout; a locally regenerated transcript is not an independent receipt. The auditor reconciles it with the original job, its pre-run registration, and **every registered series** before admitting a shortlist. A repeat uses a new ID, never an omitted pair. No cross-host pooling.
 
 For an **unscored** one-arm diagnosis, set `OPENIVM_STATE_GUARD_SUITE=r7-primary` (or `r7-companion`), `OPENIVM_STATE_GUARD_HEAD_SHA` to the product SHA, `OPENIVM_STATE_GUARD_RUN_LABEL` to a unique label and `OPENIVM_STATE_GUARD_REPORT_DIR` to a fresh absolute directory. Run `npx --no-install nx run spark-ext:state-guard-perf --configuration=spark-4.1 --skip-nx-cache`. Either Spark target is supported. `OPENIVM_STATE_GUARD_LATENCY_SCALE=1` is required for a scored run. Treat optional driver/task detail as an observer-cost comparison until the corresponding control profile is frozen.
 

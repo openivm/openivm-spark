@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import math
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -62,7 +63,7 @@ def series(control, candidate, returns=None):
             "control": {"sha": c["profiles"]["default"]["control_sha"]}, "candidate": {"sha": CANDIDATE},
             "contract_digest": c["_digest"], "harness_digest": c["_harness_digest"],
             "native": dict(c["identities"]["native"]), "exclusions": dict(c["exclusions"]),
-            "contract_sha": "b" * 40, "host": {"node": "host", "cpus": 16, "image": "sha256:" + "1" * 64},
+            "contract_sha": "b" * 40, "host": {"node": "host", "cpus": 16, "image": c["qualified_images"][0]},
             "frozen_unix_s": 1}
     arms = []
     for sequence, (pair, arm) in enumerate(plan["order"], 1):
@@ -111,6 +112,7 @@ class ScorecardTest(unittest.TestCase):
             "cross control": (3, lambda p: p["control"].update(sha="2" * 40)),
             "other contract": (3, lambda p: p.update(contract_digest="d" * 64)),
             "native changed": (3, lambda p: p["native"].update(cli_sha256="0" * 64)),
+            "unknown image": (3, lambda p: p["host"].update(image="sha256:" + "1" * 64)),
             "excluded after freeze": (3, lambda p: p["exclusions"].update(post_hoc="drop slow arm")),
             "observer-cost class": (3, lambda p: p.update(comparison_class="observer-cost")),
             "primary under companion": (3, lambda p: p.update(workload="companion")),
@@ -189,6 +191,23 @@ class ScorecardTest(unittest.TestCase):
         self.assertTrue(result["shortlisted"])
         self.assertEqual(result["native_decision"], native)
         self.assertFalse(result["release_acceptance"])
+
+    def test_external_receipt_detects_consistently_rewritten_arm(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            (directory / "p01-control").mkdir()
+            arm = directory / "p01-control" / "arm.json"
+            arm.write_text('{"report":"old","digest":"old"}')
+            plan = {"series_id": "original"}
+            paired.write(directory / "plan.json", plan)
+            paired.write(directory / "registration.json", {"id": "d8-01", "series": "original",
+                                                          "plan_sha256": paired.sha256(directory / "plan.json")})
+            evidence = [directory / "plan.json", directory / "registration.json", arm]
+            raw = "\n".join(f"@R7_RECEIPT original {f.relative_to(directory)} {paired.sha256(f)}" for f in evidence)
+            self.assertEqual(scorecard.verify_anchors(directory, plan, raw, [arm]), [])
+            arm.write_text('{"report":"new","digest":"new"}')
+            self.assertIn("external SHA-256 mismatch: p01-control/arm.json",
+                          scorecard.verify_anchors(directory, plan, raw, [arm]))
 
     def test_missing_phase_is_unavailable_not_zero(self):
         c, p, a = series([100] * 3, [80] * 3)

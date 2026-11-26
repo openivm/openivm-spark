@@ -44,12 +44,12 @@
     ".devcontainer/src/interfaces/cli/composition-root.ts": "6fb8dfe4734b68e65111ddff6334838e25c0302f119dc13afd4174c2705fc4c9",
     ".devcontainer/src/interfaces/cli/main.ts": "af733759cf51b8bf8b4ec5b705f3bf35519bc52da33f74e397651143e3eb538b",
     ".devcontainer/toolchain.env": "4264367a8320ddabd8247c59606ecc4da8e79f65bf6c812853742c73b9107909",
-    "experiments/darwin-r7/README.md": "de3b0e6e3b7767d2e8871825424506f02e76c3929a1994dad524e806f6cb71dc",
-    "experiments/darwin-r7/contract.json": "8e729982b8323dfe860cfaa5d4b28d379501224db8b3445015f24d42925aff26",
+    "experiments/darwin-r7/README.md": "d692b3d588f0c5d074489700f367d6c80b61b2ae8299b369fd70a5f144fcd973",
+    "experiments/darwin-r7/contract.json": "f5779755c5a340259f90fa93e52bd47d09d4f3161461c20ad6bca698a2e5ff51",
     "experiments/darwin-r7/observer.py": "ecf096d3fb79aa9ccb244d64a0866a30b39390e25649b624a0476c42163a5842",
-    "experiments/darwin-r7/paired.py": "1dea70c182f99de3857c6601467822283e7b99e7b246f41eca0df32ebc0fb6c0",
-    "experiments/darwin-r7/scorecard.py": "1bcf8af398f83f99cf173c9317ea7e6319904e71a2e7147c3b24e8646f3141d9",
-    "experiments/darwin-r7/test_scorecard.py": "4148df848d3dbabdb006f5c618c8dc7b132455c7362906541b37bcc9c9d1d383",
+    "experiments/darwin-r7/paired.py": "c96e2f0f46f0241be851c7db6eefb7fd20033ddadbf5e74e63b8acbd1c901836",
+    "experiments/darwin-r7/scorecard.py": "6252d9e82fd2f02bfa4800a5bba35619e1328acd88c6ee5eadac6b6fb4a216e8",
+    "experiments/darwin-r7/test_scorecard.py": "eb03454604ffa83e65756343c5a97977dd66f8e6097f51a5f3ce7ab71e899029",
     "nx.json": "21123a65adff848b4434d66cfaf1e4e35cca86ef5a0bca2d7fdcd39285a2a755",
     "package-lock.json": "4bca7e1b9c37f606e935dad170f1f095f951a6008ce5134b997d2aff1e0d43da",
     "package.json": "486ed5abbda7a9cbb3556f45abe0aaae9b8934f96e093cc8aaa8568b69de94e0",
@@ -217,6 +217,6 @@
     "tools/openivm/ci/setup-openivm.sh": "767945d424bf6d7a403ba05ba56082c5d5a54a9c6e82ac996e580cb65bc2f81a",
     "tools/openivm_trace.py": "2bd7d33c50d2dbd0701e3612d6597249c8123b5a6243f8b022a243a08f68886f"
   },
-  "harness_digest": "8b7b668470b6e0ff8bc298ffe95adf298d162b65b85c5bf075ddfa416e31663d",
+  "harness_digest": "6aa287e72ec20478e2c5977088c7c8f891391951de30b1947224e65170d12ae4",
   "schema": "openivm.r7-contract-lock/v1"
 }

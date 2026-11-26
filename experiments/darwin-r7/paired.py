@@ -2,8 +2,9 @@
 """R7 paired-series driver; run only inside the pinned devcontainer.
 
   paired.py lock                      rewrite contract.lock.json from this tree's harness files
-  paired.py run  --control SHA --candidate SHA --workload primary --profile default --out DIR
-  paired.py score DIR                 rescore a finished series
+  paired.py plan --control SHA --candidate SHA --workload primary --profile default --out DIR
+  paired.py run DIR --registered-plan-sha256 HASH --registration-id D8_ID
+  paired.py score DIR --anchors ORIGINAL_PRIVY_STDOUT
 
 `run` must start from a clean worktree at the contract commit. Each arm runs in a detached worktree of its own
 commit, with every harness path overlaid byte-for-byte from the contract commit, so arms differ only in product code.
@@ -50,6 +51,16 @@ def write(path, value):
 def sha256(path):
     with open(path, "rb") as f:
         return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def host_identity():
+    return {"node": platform.node(), "cpus": os.cpu_count(), "image": os.environ.get("OPENIVM_R7_IMAGE_ID", "")}
+
+
+def anchor(series, relative, directory):
+    digest = sha256(directory / relative)
+    print(f"@R7_RECEIPT {series} {relative} {digest}", flush=True)
+    return digest
 
 
 def harness_files(root, paths):
@@ -139,7 +150,9 @@ def run_arm(contract, plan, pair, arm, wt, out, timeout):
     command = ["npx", "--no-install", "nx", "run", "spark-ext:state-guard-perf",
                f"--configuration={plan['target']}", "--skip-nx-cache"]
     record = {"pair": pair, "arm": arm, "sha": sha, "label": label, "harness_digest": digest,
-              "host": plan["host"], "native": native_identity(contract), "command": command, "started_unix_s": time.time()}
+              "host": host_identity(), "native": native_identity(contract), "command": command, "started_unix_s": time.time()}
+    need(record["host"] == plan["host"] and record["native"] == plan["native"] and digest == plan["harness_digest"],
+         "host, native or harness changed before arm")
     with (directory / "nx.log").open("w") as log:
         proc = subprocess.Popen(command, cwd=wt, env=env, stdout=log, stderr=subprocess.STDOUT,
                                 start_new_session=True)
@@ -151,53 +164,87 @@ def run_arm(contract, plan, pair, arm, wt, out, timeout):
             code, status = proc.wait(), "cancelled-timeout"
     record.update(exit_code=code, status=status, ended_unix_s=time.time())
     report = directory / workload["report"]
-    record["report"] = json.loads(report.read_text()) if report.is_file() else None
+    try:
+        record["report"] = json.loads(report.read_text()) if report.is_file() else None
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        record.update(report=None, status="invalid-report", error=str(exc))
+    if status == "completed" and not isinstance(record["report"], dict):
+        record["status"] = "invalid-report"
     log = re.sub(r"\x1b\[[0-9;]*m", "", (directory / "nx.log").read_text(errors="replace"))
     if status == "completed" and f"spark-ext:state-guard-perf:{plan['target']}" not in log:
         record["status"] = "failed-wrong-target"
     record["evidence_sha256"] = {p.name: sha256(p) for p in directory.iterdir() if p.is_file()}
     write(directory / "arm.json", record)
+    anchor(plan["series_id"], str(directory.relative_to(out) / "arm.json"), out)
     return record
 
 
-def cmd_run(args):
+def clean_contract():
     need(sys.platform == "linux" and Path("/.dockerenv").exists(), "run inside the pinned devcontainer")
-    import fcntl
     root = repo_root()
     contract = scorecard.load_contract(CONTRACT)
-    paths = contract["harness_paths"]
     need(not git(root, "status", "--porcelain"), "the contract worktree must be clean")
     contract_sha = git(root, "rev-parse", "HEAD")
-    digest, _ = harness_digest(root, paths)
+    digest, _ = harness_digest(root, contract["harness_paths"])
     need(digest == contract["_harness_digest"], "contract.lock.json does not match the harness files")
+    return root, contract, contract_sha
+
+
+def cmd_plan(args):
+    root, contract, contract_sha = clean_contract()
     profile = contract["profiles"][args.profile]
     need(profile["control_sha"] is not None, f"profile {args.profile} has no frozen control yet")
     control = git(root, "rev-parse", f"{args.control}^{{commit}}")
     candidate = git(root, "rev-parse", f"{args.candidate}^{{commit}}")
     need(control == profile["control_sha"], f"control must be {profile['control_sha']} for {args.profile}")
     changes = product_diff(root, contract, control, candidate)
-    image = os.environ.get("OPENIVM_R7_IMAGE_ID", "")
-    need(re.fullmatch(r"sha256:[0-9a-f]{64}", image), "export OPENIVM_R7_IMAGE_ID from docker inspect .Image")
+    host = host_identity()
+    need(host["image"] in contract["qualified_images"], "actual wrapper image must be admitted by D1/D8 before planning")
     for sha in (control, candidate):
         for ancestor in profile.get("requires_ancestors", []):
             need(subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", ancestor, sha]).returncode == 0,
                  f"{sha} lacks {ancestor} required by profile {args.profile}")
     out = args.out.resolve()
     need(not out.is_relative_to(root), "evidence must be outside the source worktree")
-    with open("/tmp/openivm-r7-series.lock", "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        out.mkdir(parents=True, exist_ok=False)
-        src = Path(f"{out}.src")
-        plan = {"schema": "openivm.r7-series/v1", "series_id": args.series_id or f"r7s-{uuid.uuid4().hex[:8]}",
+    series = args.series_id or f"r7s-{uuid.uuid4().hex}"
+    need(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,80}", series), "invalid series ID")
+    out.mkdir(parents=True, exist_ok=False)
+    plan = {"schema": "openivm.r7-series/v1", "series_id": series,
                 "comparison_class": "code-ab", "workload": args.workload, "profile": args.profile,
                 "target": args.target, "pairs": args.pairs, "order": scorecard.frozen_order(args.pairs),
                 "control": {"sha": control}, "candidate": {"sha": candidate}, "contract_sha": contract_sha,
                 "contract_digest": contract["_digest"], "harness_digest": contract["_harness_digest"],
                 "native": native_identity(contract), "native_decision": None,
-                "product_paths": changes, "host": {"node": platform.node(), "cpus": os.cpu_count(), "image": image},
+                "product_paths": changes, "host": host, "arm_timeout_s": args.arm_timeout,
                 "exclusions": contract["exclusions"], "frozen_unix_s": time.time()}
-        need(plan["native"] == contract["identities"]["native"], "native binaries differ from the contract")
-        write(out / "plan.json", plan)
+    need(plan["native"] == contract["identities"]["native"], "native binaries differ from the contract")
+    write(out / "plan.json", plan)
+    anchor(series, "plan.json", out)
+    print("No arms started. Register this ID, plan digest, host proof and original Privy job with D8.", flush=True)
+
+
+def cmd_run(args):
+    import fcntl
+    root, contract, contract_sha = clean_contract()
+    out = args.series.resolve()
+    need(sha256(out / "plan.json") == args.registered_plan_sha256, "registered plan digest mismatch")
+    plan = json.loads((out / "plan.json").read_text())
+    problems = []
+    scorecard.check_plan(contract, plan, problems)
+    need(not problems, "; ".join(problems))
+    need(plan["contract_sha"] == contract_sha and plan["host"] == host_identity(), "contract or host changed")
+    control, candidate = (plan[a]["sha"] for a in scorecard.ARMS)
+    need(product_diff(root, contract, control, candidate) == plan["product_paths"], "product diff changed")
+    need(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", args.registration_id), "invalid D8 registration ID")
+    with open("/tmp/openivm-r7-series.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        need({p.name for p in out.iterdir()} == {"plan.json"}, "series already started; register a new series for a retest")
+        with (out / "registration.json").open("x") as f:
+            json.dump({"id": args.registration_id, "series": plan["series_id"], "plan_sha256": args.registered_plan_sha256}, f)
+        anchor(plan["series_id"], "plan.json", out)
+        anchor(plan["series_id"], "registration.json", out)
+        src = Path(f"{out}.src")
+        paths = contract["harness_paths"]
         trees = {"control": src / "control", "candidate": src / "candidate"}
         for arm, sha in (("control", control), ("candidate", candidate)):
             prepare(root, contract_sha, sha, trees[arm], paths)
@@ -207,14 +254,16 @@ def cmd_run(args):
                 write(out / f"p{pair:02d}-{arm}.not-run.json", {"pair": pair, "arm": arm, "reason": failed})
                 continue
             print(f"p{pair:02d}-{arm}: {plan[arm]['sha']}", flush=True)
-            record = run_arm(contract, plan, pair, arm, trees[arm], out, args.arm_timeout)
+            record = run_arm(contract, plan, pair, arm, trees[arm], out, plan["arm_timeout_s"])
             if record["status"] != "completed":
                 failed = f"p{pair:02d}-{arm} {record['status']} (exit {record['exit_code']})"
-        cmd_score(argparse.Namespace(series=out))
+        if failed:
+            raise SystemExit(failed)
+        print("Arms finished. Score with the original Privy receipt stream; reconcile all registrations with D8.", flush=True)
 
 
 def cmd_score(args):
-    rc = scorecard.main(["scorecard.py", str(CONTRACT), str(args.series)])
+    rc = scorecard.main(["scorecard.py", str(CONTRACT), str(args.series), str(args.anchors)])
     if rc:
         raise SystemExit(rc)
 
@@ -223,7 +272,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("lock").set_defaults(fn=cmd_lock)
-    run = sub.add_parser("run")
+    run = sub.add_parser("plan")
     run.add_argument("--control", required=True)
     run.add_argument("--candidate", required=True)
     run.add_argument("--workload", choices=["primary", "companion"], default="primary")
@@ -233,13 +282,20 @@ def main():
     run.add_argument("--out", type=Path, required=True)
     run.add_argument("--series-id")
     run.add_argument("--arm-timeout", type=int, default=3600)
-    run.set_defaults(fn=cmd_run)
+    run.set_defaults(fn=cmd_plan)
+    execute = sub.add_parser("run")
+    execute.add_argument("series", type=Path)
+    execute.add_argument("--registered-plan-sha256", required=True)
+    execute.add_argument("--registration-id", required=True)
+    execute.set_defaults(fn=cmd_run)
     score = sub.add_parser("score")
     score.add_argument("series", type=Path)
+    score.add_argument("--anchors", required=True, type=Path)
     score.set_defaults(fn=cmd_score)
     args = parser.parse_args()
-    if args.cmd == "run":
+    if args.cmd == "plan":
         need(args.pairs >= 3, "at least three pairs")
+        need(args.arm_timeout > 0, "positive per-arm timeout required")
     with contextlib.suppress(BrokenPipeError):
         args.fn(args)
 

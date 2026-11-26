@@ -81,7 +81,7 @@ def check_plan(contract, plan, problems):
     need(plan.get("exclusions") == contract["exclusions"], "exclusion policy changed", problems)
     host = plan.get("host") or {}
     need(isinstance(host.get("node"), str) and host["node"] and type(host.get("cpus")) is int and host["cpus"] > 0
-         and re.fullmatch(r"sha256:[0-9a-f]{64}", str(host.get("image"))), "missing host/image identity", problems)
+         and host.get("image") in contract["qualified_images"], "missing or unqualified host/image identity", problems)
     need(SHA.fullmatch(str(plan.get("contract_sha"))) is not None, "missing contract commit", problems)
     return workload, profile
 
@@ -184,7 +184,7 @@ def phase_medians(report):
     rows = dig(report, "batches.parallel_refresh.requests") or []
     out = {}
     for key in PHASES:
-        measured = [r.get(key) for r in rows if isinstance(r.get(key), (int, float)) and math.isfinite(r.get(key))]
+        measured = [r[key] for r in rows if type(r.get(key)) in (int, float) and math.isfinite(r[key]) and r[key] >= 0]
         complete = bool(rows) and len(measured) == len(rows)
         out[key] = {"median": statistics.median(measured) if complete else None,
                     "coverage": "measured" if complete else ("partial" if measured else "unavailable")}
@@ -279,7 +279,7 @@ def score(contract, plan, arms, native_decision=None):
     if "return_reduction_percent" in pairs[0]:
         ret_median = statistics.median(e["return_reduction_percent"] for e in pairs)
         result["median_return_reduction_percent"] = ret_median
-        result["early_return_only"] = (not shortlisted) and ret_median >= threshold
+        result["early_return_only"] = median < threshold <= ret_median
     return result
 
 
@@ -290,21 +290,51 @@ def emit(result):
     print(f"@RESULT valid={valid} shortlisted={short} median_reduction_percent={median:.6f}")
     if not valid:
         print("@FEEDBACK invalid series, no speed credited: " + "; ".join(result["problems"][:10]))
+    elif result["min_reduction_percent"] <= 0:
+        print("@FEEDBACK at least one durable pair was nonpositive; no shortlist")
     elif result.get("early_return_only"):
-        print("@FEEDBACK command return improved but durable completion did not; early return earns no credit")
+        print("@FEEDBACK command return met the threshold but median durable improvement did not; no shortlist")
     else:
         print(f"@FEEDBACK per-pair reductions {[round(p['reduction_percent'], 3) for p in result['pairs']]}")
 
 
-def main(argv):
-    if len(argv) != 3:
-        print("usage: scorecard.py <contract.json> <series-dir>", file=sys.stderr)
+def verify_anchors(series, plan, transcript, arm_paths):
+    observed = {}
+    for line in transcript.splitlines():
+        match = re.search(r"@R7_RECEIPT ([\w.-]+) ([\w./-]+) ([a-f0-9]{64})\b", line)
+        if match and match[1] == plan["series_id"]:
+            name, digest = match[2], match[3]
+            if name in observed and observed[name] != digest:
+                return [f"conflicting external receipt for {name}"]
+            observed[name] = digest
+    names = {"plan.json", "registration.json"} | {p.relative_to(series).as_posix() for p in arm_paths}
+    problems = []
+    if set(observed) != names:
+        problems.append("missing or unexpected independently recorded plan/registration/arm receipts")
+    for name in sorted(names):
+        path = series / name
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != observed.get(name):
+            problems.append(f"external SHA-256 mismatch: {name}")
+    if not problems:
+        registration = json.loads((series / "registration.json").read_text())
+        if not registration.get("id") or registration.get("series") != plan["series_id"] or \
+                registration.get("plan_sha256") != observed["plan.json"]:
+            problems.append("registration does not bind this plan")
+    return problems
+
+
+def _main(argv):
+    if len(argv) not in (3, 4):
+        print("usage: scorecard.py <contract.json> <series-dir> <original-privy-stdout>", file=sys.stderr)
         return 2
     contract = load_contract(argv[1])
     series = Path(argv[2])
     plan = json.loads((series / "plan.json").read_text())
+    paths = sorted(series.glob("*/arm.json"))
+    external = verify_anchors(series, plan, Path(argv[3]).read_text(), paths) if len(argv) == 4 else \
+        ["independent Privy receipt stream is required; local hashes alone cannot qualify a series"]
     arms = []
-    for p in sorted(series.glob("*/arm.json")):
+    for p in paths:
         arm = json.loads(p.read_text())
         raw = arm.get("evidence_sha256") or {}
         role = plan.get("workload")
@@ -321,9 +351,24 @@ def main(argv):
                 arm["status"] = "invalid-original-evidence"
         arms.append(arm)
     result = score(contract, plan, arms, plan.get("native_decision"))
+    if external:
+        result = {k: v for k, v in result.items() if k not in ("pairs", "early_return_only") and not k.endswith("percent")}
+        result.update(valid=False, shortlisted=False, problems=external + result.get("problems", []))
     (series / "scorecard.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     emit(result)
     return 0 if result["valid"] else 1
+
+
+def main(argv):
+    try:
+        return _main(argv)
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError) as exc:
+        result = {"schema": "openivm.r7-scorecard/v1", "valid": False, "shortlisted": False,
+                  "release_acceptance": False, "problems": [f"invalid input: {type(exc).__name__}: {exc}"]}
+        emit(result)
+        if len(argv) >= 3 and Path(argv[2]).is_dir():
+            (Path(argv[2]) / "scorecard.json").write_text(json.dumps(result, indent=2) + "\n")
+        return 1
 
 
 if __name__ == "__main__":
