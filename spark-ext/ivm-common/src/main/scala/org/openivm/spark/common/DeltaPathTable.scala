@@ -27,8 +27,8 @@ private[common] object DeltaPathTable {
   * up to `2C` instead of `C`, so the leader waits at most `C * m / (k + m)`.
   *
   * Every caller returns only after the commit covering its request is durable. A batch of one runs the caller's own
-  * single-request path. If a multi-request batch fails, each caller re-runs its own single-request path, so batching
-  * never changes what is recorded, only how many Delta commits record it.
+  * single-request path. If a multi-request batch fails, each caller re-runs its own recovery path (by default its
+  * single-request path), so batching never changes what is recorded, only how many Delta commits record it.
   */
 private[common] final class DeltaGroupCommit[R] {
   private final class Slot(val request: R) {
@@ -42,7 +42,13 @@ private[common] final class DeltaGroupCommit[R] {
   private var leaderActive = false
   private var commitNanos  = DeltaGroupCommit.InitialCommitNanos
 
-  def submit(request: R)(single: R => Unit)(batch: Seq[R] => Unit): Unit = {
+  def submit(request: R)(single: R => Unit)(batch: Seq[R] => Unit): Unit =
+    submitRecovering(request)(single)(batch)(single)
+
+  /** Like `submit`, but after a failed multi-request batch, whose commit may or may not have landed, each caller runs
+    * `recover` instead of `single`.
+    */
+  def submitRecovering(request: R)(single: R => Unit)(batch: Seq[R] => Unit)(recover: R => Unit): Unit = {
     val mine        = new Slot(request)
     val refresh     = DeltaGroupCommit.currentRefresh()
     var interrupted = false
@@ -68,7 +74,7 @@ private[common] final class DeltaGroupCommit[R] {
     }
     if (led.nonEmpty) lead(mine, led, single, batch)
     if (interrupted) Thread.currentThread().interrupt()
-    if (mine.retrySingle) single(request)
+    if (mine.retrySingle) recover(request)
     else if (mine.failure != null) throw mine.failure
   }
 
