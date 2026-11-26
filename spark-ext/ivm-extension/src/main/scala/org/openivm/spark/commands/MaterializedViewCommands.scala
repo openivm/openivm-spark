@@ -8546,16 +8546,17 @@ case class RefreshMaterializedViewCommand(
             val dropSql       = StagingDeltaView.dropSourceDeltaViewSql(n)
             val t0            = System.nanoTime()
             var dropSucceeded = true
-            try
-              OpenIvmExecutionSpan.measureActivePhase("cleanup_delta_view_uncache")(
-                spark.catalog.uncacheTable(s"openivm_delta_$n")
-              )
-            catch { case _: Throwable => () }
             try {
+              // DROP uncaches SQL temp views and their dependents without re-analyzing the view body.
               OpenIvmExecutionSpan.measureActivePhase("cleanup_delta_view_drop")(spark.sql(dropSql))
             } catch {
               case _: Throwable =>
                 dropSucceeded = false
+                try
+                  OpenIvmExecutionSpan.measureActivePhase("cleanup_delta_view_uncache")(
+                    spark.catalog.uncacheTable(s"openivm_delta_$n")
+                  )
+                catch { case _: Throwable => () }
             } finally {
               val ms = (System.nanoTime() - t0) / 1000000L
               sqlLog.record(
