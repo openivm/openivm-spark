@@ -33,7 +33,7 @@ class WindowReplacementCdfSpec extends IvmParitySpecBase("window-replacement-cdf
     RefreshSqlLogCatalog.scanAll(spark).filter(row => row.mode == "refresh" && row.viewName.split('.').last == view)
   }
 
-  it("routes a global window SQL rewrite with grouped state disabled to a downstream replacement full writer") {
+  it("keeps a marked global window overwrite incremental but rebaselines an ordinary replacement") {
     val upstream   = "wrcdf_rank"
     val downstream = "wrcdf_consumer"
     val rankQuery = "SELECT region, total, DENSE_RANK() OVER (ORDER BY total DESC) AS region_rank " +
@@ -70,8 +70,31 @@ class WindowReplacementCdfSpec extends IvmParitySpecBase("window-replacement-cdf
     Seq("predicate", "replaceWhere", "partitionPredicate").flatMap(parameters.get).foreach { predicate =>
       Set("", "[]", "true") should contain(predicate)
     }
-    verdict shouldBe BatchVerdict.Replace
+    commit.getAs[String]("userMetadata") shouldBe DeltaCommitClassifier.WindowCdfCommit
+    verdict shouldBe BatchVerdict.Mutating
+    val changes = sql(
+      s"SELECT _change_type, region, total, region_rank FROM table_changes_by_path('$path', $version, $version)"
+    )
+    changes.collect().toSeq should contain theSameElementsAs Seq(
+      Row("delete", "east", 30L, 1),
+      Row("delete", "west", 15L, 2),
+      Row("insert", "west", 50L, 1),
+      Row("insert", "east", 30L, 2),
+      Row("insert", "north", 30L, 2)
+    )
 
+    refreshMv(downstream)
+    queryLog(downstream).exists(_.category == "full_refresh_stmt") shouldBe false
+    mvDataVersion(downstream) shouldBe downstreamBefore + 1L
+    refreshType(downstream) shouldBe RefreshTypeCode.SimpleProjection
+    assertMvCorrect(upstream, rankQuery)
+    assertMvCorrect(downstream, rankQuery)
+
+    val beforeReplacement = mvDataVersion(downstream)
+    sql("INSERT OVERWRITE TABLE wrcdf_sales SELECT 6, 'south', 7")
+    RefreshSqlLogCatalog.removeAll(spark)
+    refreshMv(upstream)
+    DeltaCommitClassifier.classify(spark, path, version) shouldBe BatchVerdict.Replace
     refreshMv(downstream)
     val downstreamLog = queryLog(downstream)
     val writes        = downstreamLog.filter(_.category == "full_refresh_stmt")
@@ -83,7 +106,7 @@ class WindowReplacementCdfSpec extends IvmParitySpecBase("window-replacement-cdf
       case row if row.refreshId == writes.head.refreshId && row.stepName == "full_refresh_decision" => row.detail
     }
     reasons shouldBe Seq("reason_code=replacement_or_unavailable_classifier;state_lag=false;cdf_rebaseline=false")
-    mvDataVersion(downstream) shouldBe downstreamBefore + 1L
+    mvDataVersion(downstream) shouldBe beforeReplacement + 1L
     refreshType(downstream) shouldBe RefreshTypeCode.SimpleProjection
 
     assertMvCorrect(upstream, rankQuery)

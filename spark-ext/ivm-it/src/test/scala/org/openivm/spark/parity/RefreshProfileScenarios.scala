@@ -299,7 +299,7 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       }
     }
 
-    it("separates incremental cleanup attempts from their retry wrapper") {
+    it("profiles the compiled empty-group delete without reporting a second cleanup") {
       sql("CREATE TABLE profile_cleanup_src (k INT, v INT) USING DELTA")
       sql("INSERT INTO profile_cleanup_src VALUES (1, 10), (2, 20)")
       sql("CREATE MATERIALIZED VIEW profile_cleanup_mv AS SELECT k, COUNT(*) AS n FROM profile_cleanup_src GROUP BY k")
@@ -307,6 +307,33 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       clearProfile()
       sql("REFRESH MATERIALIZED VIEW profile_cleanup_mv").collect()
       assertMvCorrect("profile_cleanup_mv", "SELECT k, COUNT(*) AS n FROM profile_cleanup_src GROUP BY k")
+      val rows      = showProfile()
+      val refreshId = rows.find(_.getString(4) == "query_span").get.getString(0)
+      RefreshSqlLogAsyncFlusher.awaitQuiescence(30000) shouldBe true
+      val logs    = RefreshSqlLogCatalog.scanAll(spark).filter(_.refreshId == refreshId)
+      val deletes = logs.filter(r => r.category == "rewritten_stmt" && r.stmtKind == "delete")
+      deletes should have size 1
+      val emptyGroupDelete = """(?i)delete from (?:\w+\.)*profile_cleanup_mv where COALESCE\(n, 0\) = 0;?"""
+      deletes.head.sqlText.replace("`", "").trim should fullyMatch regex emptyGroupDelete
+      logs.map(_.category) should not contain "count_monoid_cleanup"
+      val attempts = detailsForStep(rows, "execute_refresh_sql_attempt")
+      val compiled = attempts.filter(_.contains(s"query_log_order=${deletes.head.stmtOrder};"))
+      compiled should have size 1
+      compiled.head should include("work_class=incremental_sql;")
+      compiled.head should include("status=success")
+      attempts.filter(_.contains("work_class=incremental_cleanup;")) shouldBe empty
+      detailsForStep(rows, "execute_refresh_cleanup_retry") shouldBe empty
+    }
+
+    it("separates incremental cleanup attempts from their retry wrapper") {
+      sql("CREATE TABLE profile_having_cleanup_src (k INT, v INT) USING DELTA")
+      sql("INSERT INTO profile_having_cleanup_src VALUES (1, 10), (1, 11), (2, 20), (2, 21)")
+      val query = "SELECT k, COUNT(*) AS n FROM profile_having_cleanup_src GROUP BY k HAVING COUNT(*) > 1"
+      sql(s"CREATE MATERIALIZED VIEW profile_having_cleanup_mv AS $query")
+      sql("DELETE FROM profile_having_cleanup_src WHERE v = 10")
+      clearProfile()
+      sql("REFRESH MATERIALIZED VIEW profile_having_cleanup_mv").collect()
+      assertMvCorrect("profile_having_cleanup_mv", query)
       val rows = showProfile()
       val attempts = detailsForStep(rows, "execute_refresh_sql_attempt")
         .filter(_.contains("work_class=incremental_cleanup"))
