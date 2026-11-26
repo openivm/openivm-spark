@@ -7478,12 +7478,15 @@ case class RefreshMaterializedViewCommand(
                               actionLineage
                           ) {
                             GeneratedActionOwnership.withBoundary(spark, owner, "head") {
-                              spark.table(s"global_temp.$scratchView").agg(
-                                count(lit(1)),
-                                count(when(weight.isNull || weight < lit(0), lit(1))),
-                                count(when(weight === lit(0), lit(1))),
-                                count(when(weight =!= lit(1), lit(1)))
-                              ).head()
+                              spark
+                                .table(s"global_temp.$scratchView")
+                                .agg(
+                                  count(lit(1)),
+                                  count(when(weight.isNull || weight < lit(0), lit(1))),
+                                  count(when(weight === lit(0), lit(1))),
+                                  count(when(weight =!= lit(1), lit(1)))
+                                )
+                                .head()
                             }
                           }
                           val rows        = stats.getLong(0)
