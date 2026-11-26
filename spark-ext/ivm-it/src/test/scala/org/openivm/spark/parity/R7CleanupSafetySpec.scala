@@ -104,7 +104,16 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
 
   private val output    = Paths.get(sys.env.getOrElse("R7_CLEANUP_OUT", "target/r7-cleanup-safety.tsv"))
   private val candidate = sys.env.getOrElse("R7_CLEANUP_ARM", "control") == "candidate"
-  private case class CachedAlias(name: String, dependent: String, data: DataFrame, dependentData: DataFrame)
+  private case class CachedAlias(
+      session: SparkSession,
+      name: String,
+      dependent: String,
+      data: DataFrame,
+      dependentData: DataFrame
+  )
+
+  private def commandSession: SparkSession =
+    SparkSession.getActiveSession.getOrElse(fail("REFRESH hook has no active session"))
 
   private def emit(line: String): Unit = {
     Files.createDirectories(output.toAbsolutePath.getParent)
@@ -136,26 +145,27 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
   }
 
   private def cacheAlias(table: String): CachedAlias = {
+    val session   = commandSession
     val alias     = s"openivm_delta_$table"
     val dependent = s"${alias}_dependent"
-    spark.sessionState.catalog.getTempView(alias).isDefined shouldBe true
-    spark.catalog.cacheTable(alias, StorageLevel.DISK_ONLY)
-    spark.sql(s"CREATE OR REPLACE TEMP VIEW $dependent AS SELECT k, v FROM $alias WHERE k = 1")
-    spark.catalog.cacheTable(dependent, StorageLevel.DISK_ONLY)
-    spark.table(alias).count()
-    spark.table(dependent).count()
-    val data          = spark.table(alias)
-    val dependentData = spark.table(dependent)
+    session.sessionState.catalog.getTempView(alias).isDefined shouldBe true
+    session.catalog.cacheTable(alias, StorageLevel.DISK_ONLY)
+    session.sql(s"CREATE OR REPLACE TEMP VIEW $dependent AS SELECT k, v FROM $alias WHERE k = 1")
+    session.catalog.cacheTable(dependent, StorageLevel.DISK_ONLY)
+    session.table(alias).count()
+    session.table(dependent).count()
+    val data          = session.table(alias)
+    val dependentData = session.table(dependent)
     data.storageLevel shouldBe StorageLevel.DISK_ONLY
     dependentData.storageLevel shouldBe StorageLevel.DISK_ONLY
-    CachedAlias(alias, dependent, data, dependentData)
+    CachedAlias(session, alias, dependent, data, dependentData)
   }
 
   private def assertUncached(cache: CachedAlias): Unit = {
     // Check saved plans before dropping the dependent; that extra DROP could hide a leak.
     cache.data.storageLevel shouldBe StorageLevel.NONE
     cache.dependentData.storageLevel shouldBe StorageLevel.NONE
-    spark.sessionState.catalog.getTempView(cache.dependent).isDefined shouldBe true
+    cache.session.sessionState.catalog.getTempView(cache.dependent).isDefined shouldBe true
   }
 
   private def assertLogged(mv: String, aliases: Set[String]): Unit = {
@@ -173,28 +183,29 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
   private def finish(caches: Seq[CachedAlias]): Unit = {
     R7CleanupProbe.reset()
     caches.foreach { cache =>
-      spark.sql(s"DROP VIEW IF EXISTS `${cache.dependent}`")
-      spark.sql(s"DROP VIEW IF EXISTS `${cache.name}`")
+      cache.session.sql(s"DROP VIEW IF EXISTS `${cache.dependent}`")
+      cache.session.sql(s"DROP VIEW IF EXISTS `${cache.name}`")
     }
   }
 
   describe("actual source-delta cleanup") {
     it("drops the actual registered alias and flushes its query-log row") {
       val (table, mv, body) = fixture("uncached")
-      var seen              = false
+      var executionSession  = Option.empty[SparkSession]
       try {
         CommandConcurrencyInjection.withBeforeRefreshFinalize {
-          val view = spark.sessionState.catalog.getTempView(s"openivm_delta_$table").get
-          seen = true
+          val session = commandSession
+          val view    = session.sessionState.catalog.getTempView(s"openivm_delta_$table").get
+          executionSession = Some(session)
           emit(s"view\t$modeLabel\t${view.desc.viewText.isDefined}\t${view.child.nodeName}")
           R7CleanupProbe.armed = true
         } {
           refreshMv(mv)
         }
         R7CleanupProbe.armed = false
-        seen shouldBe true
+        executionSession.isDefined shouldBe true
         R7CleanupProbe.drops.toSet should contain(s"openivm_delta_$table")
-        spark.sessionState.catalog.getTempView(s"openivm_delta_$table").isEmpty shouldBe true
+        executionSession.get.sessionState.catalog.getTempView(s"openivm_delta_$table").isEmpty shouldBe true
         assertLogged(mv, Set(s"openivm_delta_$table"))
         assertMvCorrect(mv, body)
       } finally R7CleanupProbe.reset()
@@ -213,7 +224,7 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
         R7CleanupProbe.armed = false
         caches.size shouldBe 1
         caches.foreach(assertUncached)
-        spark.sessionState.catalog.getTempView(caches.head.name).isEmpty shouldBe true
+        caches.head.session.sessionState.catalog.getTempView(caches.head.name).isEmpty shouldBe true
         assertLogged(mv, caches.map(_.name).toSet)
         assertMvCorrect(mv, body)
       } finally finish(caches)
@@ -233,7 +244,7 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
         R7CleanupProbe.armed = false
         R7CleanupProbe.drops.toSet shouldBe caches.map(_.name).toSet
         caches.foreach(assertUncached)
-        spark.sessionState.catalog.getTempView(caches.head.name).isDefined shouldBe true
+        caches.head.session.sessionState.catalog.getTempView(caches.head.name).isDefined shouldBe true
         assertLogged(mv, caches.map(_.name).toSet)
         assertMvCorrect(mv, body)
       } finally finish(caches)
@@ -253,7 +264,7 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
         R7CleanupProbe.armed = false
         R7CleanupProbe.uncacheFailures shouldBe (if (candidate) 0 else 1)
         caches.foreach(assertUncached)
-        spark.sessionState.catalog.getTempView(caches.head.name).isEmpty shouldBe true
+        caches.head.session.sessionState.catalog.getTempView(caches.head.name).isEmpty shouldBe true
         assertLogged(mv, caches.map(_.name).toSet)
         assertMvCorrect(mv, body)
       } finally finish(caches)
@@ -274,7 +285,7 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
         if (candidate) R7CleanupProbe.analysisFailures shouldBe 0
         else R7CleanupProbe.analysisFailures should be > 0
         caches.foreach(assertUncached)
-        spark.sessionState.catalog.getTempView(caches.head.name).isEmpty shouldBe true
+        caches.head.session.sessionState.catalog.getTempView(caches.head.name).isEmpty shouldBe true
         assertLogged(mv, caches.map(_.name).toSet)
         assertMvCorrect(mv, body)
       } finally finish(caches)
