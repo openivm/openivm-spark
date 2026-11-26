@@ -4,11 +4,13 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.util.Properties
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 import com.codahale.metrics.MetricRegistry
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.{ExecutorLostFailure, Resubmitted, SparkConf, SparkContext, Success, TaskEndReason, TaskKilled}
 import org.apache.spark.scheduler.{
+  SparkListener,
   SparkListenerJobStart,
   SparkListenerStageSubmitted,
   SparkListenerTaskEnd,
@@ -127,6 +129,11 @@ class TelemetryJobListenerSpec extends AnyFunSpec with Matchers {
     listener.onStageSubmitted(SparkListenerStageSubmitted(b))
     listener.onTaskEnd(task(1L, 11, 0, Success))
     listener.recordJobEnd(1, 10L, "failed")
+    val beforeLate = lines.toVector
+    listener.onTaskEnd(task(2L, 10, 0, TaskKilled("cancelled")))
+    listener.recordStageCompleted(10, 0, None, None, successful = false)
+    lines.toVector shouldBe beforeLate
+    gauge(registry, "untracked_task_ends") shouldBe 1L
     listener.recordStageCompleted(11, 0, None, None, successful = false)
     val skipped = new ObjectMapper().readTree(lines.last)
     skipped.get("task_summary_status").asText() shouldBe "submission_not_tracked"
@@ -195,7 +202,13 @@ class TelemetryJobListenerSpec extends AnyFunSpec with Matchers {
       .set(BoundedTelemetryQueue.EnabledKey, "true")
       .set(TelemetryJobListener.TaskMetricsKey, "true")
       .set(BoundedTelemetryQueue.LocalUriKey, root.toUri.toString)
-    val sc = new SparkContext(conf)
+    val sc            = new SparkContext(conf)
+    val shuffleReader = new AtomicReference[SparkListenerTaskEnd]()
+    sc.addSparkListener(new SparkListener {
+      override def onTaskEnd(event: SparkListenerTaskEnd): Unit =
+        if (event.taskMetrics != null && event.taskMetrics.shuffleReadMetrics.recordsRead > 0L)
+          shuffleReader.set(event)
+    })
     try {
       sc.setLocalProperty(TelemetryJobListener.ActionProperty, "refresh-1/action-1")
       sc.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, "op-1")
@@ -222,6 +235,15 @@ class TelemetryJobListenerSpec extends AnyFunSpec with Matchers {
     summaries.map(_.get("shuffle_read_records").asLong()).sum shouldBe 2L
     summaries.map(_.get("shuffle_read_bytes").asLong()).sum should be > 0L
     summaries.foreach(s => s.has("executor_cpu_ns") shouldBe true)
+    val carrier = shuffleReader.get()
+    val mixed   = new StageTaskSummary
+    mixed.observe(carrier)
+    mixed.observe(carrier.copy(taskMetrics = null, reason = TaskKilled("cancelled")))
+    val partial = mixed.fields(None)
+    partial("attempts_without_metrics") shouldBe 1L
+    partial("shuffle_read_records") shouldBe 2L
+    val partialJson = mapper.readTree(org.openivm.spark.insights.OpenIvmInsightJson.obj("summary" -> partial))
+    partialJson.at("/summary/partial_metric_counts/shuffle_read_records").asLong() shouldBe 1L
     val stage = events.find(_.get("event_type").asText() == "spark_stage_completed").get
     start.get("stage_ids").elements().asScala.map(_.asInt()).toSeq should contain(stage.get("stage_id").asInt())
     events.exists(e =>
