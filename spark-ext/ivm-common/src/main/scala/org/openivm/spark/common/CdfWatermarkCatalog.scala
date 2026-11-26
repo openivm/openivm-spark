@@ -1,6 +1,7 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.delta.DeltaLog
 import org.openivm.spark.common.rocksdb.{
   OpenIvmRocksDB,
   OpenIvmRocksDBBatchOps,
@@ -11,6 +12,7 @@ import org.openivm.spark.common.rocksdb.{
 import org.slf4j.LoggerFactory
 
 import java.nio.file.Files
+import java.util.concurrent.ConcurrentHashMap
 import scala.util.control.NonFatal
 
 /**
@@ -199,13 +201,68 @@ private[common] object RocksDbCdfWatermarkBackend extends CdfWatermarkBackend {
 object CdfWatermarkCatalog {
   private def backend(spark: SparkSession): CdfWatermarkBackend = CdfWatermarkBackend.forSession(spark)
 
+  /** The watermark rows of one committed Delta version. A Delta version is immutable, so the rows stay exact for the
+    * (table id, version) they were read at; readers revalidate that key against a listing of their own Delta log that
+    * began after the read.
+    */
+  private final class CommittedWatermarks(val tableId: String, val version: Long, rows: Array[(String, String, Long)]) {
+    def versions(viewName: String, sources: Seq[String]): Map[String, Long] = {
+      val wanted = sources.toSet
+      rows.iterator.collect {
+        case (view, source, version) if view == viewName && wanted.contains(source) => source -> version
+      }.toMap
+    }
+  }
+
+  private val committedVersions = new ConcurrentHashMap[String, CommittedWatermarks]()
+  private val committedLoads    = new ConcurrentHashMap[String, Object]()
+
+  /** The shared Delta watermark table at its latest committed version. Every call observes a listing of its own Delta
+    * log that began after the call, so a commit by any driver is visible to the next read; concurrent reads of one log
+    * share that listing, and the row scan is shared between reads of the same physical log, table id and version.
+    * `None` sends the caller down the backend path, which also creates a missing watermark table.
+    */
+  private def committed(spark: SparkSession): Option[CommittedWatermarks] =
+    if (!FeatureGate.deltaCatalogEnabled(spark)) None
+    else
+      try {
+        val path                             = FeatureGate.catalogPath(spark).stripSuffix("/") + "/cdf_watermarks"
+        val log                              = DeltaLog.forTable(spark, new org.apache.hadoop.fs.Path(path))
+        val logPath                          = log.logPath.toString
+        def latest(): Option[(String, Long)] = DeltaLogRefreshes.refreshedVersion(path, log)
+        def cached(key: (String, Long)): Option[CommittedWatermarks] =
+          Option(committedVersions.get(logPath)).filter(entry => entry.tableId == key._1 && entry.version == key._2)
+        latest().flatMap { key =>
+          cached(key).orElse {
+            committedLoads.computeIfAbsent(logPath, _ => new Object).synchronized {
+              cached(key).orElse(latest().map { current =>
+                cached(current).getOrElse {
+                  val rows = spark.read
+                    .format("delta")
+                    .load(path)
+                    .select("view_name", "source", "version")
+                    .collect()
+                    .map(row => (row.getString(0), row.getString(1), row.getLong(2)))
+                  val entry = new CommittedWatermarks(current._1, current._2, rows)
+                  if (latest().contains(current)) committedVersions.put(logPath, entry)
+                  entry
+                }
+              })
+            }
+          }
+        }
+      } catch {
+        case NonFatal(_) => None
+      }
+
   def ensureTables(spark: SparkSession): Unit = backend(spark).ensureTables(spark)
 
   def get(spark: SparkSession, viewName: String, source: String): Option[Long] =
-    backend(spark).get(spark, viewName, source)
+    committed(spark).fold(backend(spark).get(spark, viewName, source))(_.versions(viewName, Seq(source)).get(source))
 
   def getAll(spark: SparkSession, viewName: String, sources: Seq[String]): Map[String, Long] =
-    backend(spark).getAll(spark, viewName, sources)
+    if (sources.isEmpty) Map.empty
+    else committed(spark).fold(backend(spark).getAll(spark, viewName, sources))(_.versions(viewName, sources))
 
   def put(spark: SparkSession, viewName: String, source: String, version: Long): Unit =
     backend(spark).put(spark, viewName, source, version)
