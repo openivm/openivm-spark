@@ -2,6 +2,7 @@ package org.openivm.spark.common
 
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.plans.logical.View
+import org.apache.spark.sql.functions.{col, when}
 import org.apache.spark.sql.types.StructType
 import org.slf4j.LoggerFactory
 
@@ -142,25 +143,25 @@ final class CdfChangePropagation extends ChangePropagation {
           Map("readChangeFeed" -> "true", "startingVersion" -> from.toString, "endingVersion" -> to.toString)
         )
 
-        val userCols         = sourceSchema.fieldNames.map(n => s"`${n.replace("`", "``")}`").mkString(", ")
-        val transformedAlias = s"_openivm_cdf_raw_$short"
-        raw.createOrReplaceTempView(transformedAlias)
-        val sql = s"""CREATE OR REPLACE TEMP VIEW `$viewName` AS
-                     |SELECT $userCols,
-                     |       CAST(`_commit_timestamp` AS TIMESTAMP) AS ${CdfChangePropagation.TimestampColumn},
-                     |       CASE
-                     |         WHEN `_change_type` IN ('insert', 'update_postimage') THEN CAST(1 AS INT)
-                     |         WHEN `_change_type` IN ('delete', 'update_preimage')  THEN CAST(-1 AS INT)
-                     |       END AS ${CdfChangePropagation.SignColumn}
-                     |FROM `$transformedAlias`
-                     |WHERE `_change_type` IN ('insert', 'delete', 'update_preimage', 'update_postimage')""".stripMargin
-        spark.sql(sql)
+        val userCols = sourceSchema.fieldNames.toSeq.map(name => col(s"`${name.replace("`", "``")}`"))
+        val change   = col("_change_type")
+        val positive = change.isin("insert", "update_postimage")
+        val negative = change.isin("delete", "update_preimage")
+        val projected = userCols ++ Seq(
+          col("_commit_timestamp").cast("timestamp").as(CdfChangePropagation.TimestampColumn),
+          when(positive, 1).when(negative, -1).as(CdfChangePropagation.SignColumn)
+        )
+        raw
+          .where(positive || negative)
+          .select(projected: _*)
+          .createOrReplaceTempView(viewName)
+
         // The existing registration reads only the first CDF range. Do not certify broader coverage.
         val coverage =
           if (batches.size == 1 && b.baseTable == sourceTable && b.hasBaseline)
             Some(RegisteredDeltaView(b, viewName, sourceSchema))
           else None
-        (sql, coverage)
+        (buildSourceDeltaViewSql(sourceTable, sourceSchema, batches), coverage)
 
       case None =>
         (registerEmptyDeltaView(spark, sourceTable, sourceSchema), None)
