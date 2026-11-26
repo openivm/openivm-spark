@@ -1,6 +1,6 @@
 package org.openivm.spark.telemetry
 
-import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.{DeserializationFeature, JsonNode, ObjectMapper}
 import org.apache.spark.internal.Logging
 import org.openivm.spark.common.rocksdb.OpenIvmStateBarrier
 import org.apache.spark.sql.SparkSession
@@ -1027,11 +1027,13 @@ object OpenIvmExecutionSpan extends Logging {
 
   private val deepAugmentationFailures = new java.util.concurrent.atomic.AtomicLong()
   private val deepUnmarkedPayloads     = new java.util.concurrent.atomic.AtomicLong()
+  private val DeepAugmentationFailureRecord =
+    s"""{"deep_status":"${OpenIvmTelemetryContract.DeepStatusAugmentationFailed}"}"""
 
   /** Deep-requested payload renderings whose deep fields could not be added, marked or not. */
   def deepAugmentationFailureCount: Long = deepAugmentationFailures.get()
 
-  /** Deep-requested renderings left without the `deep_status` marker because the payload is not a JSON object. */
+  /** Legacy health counter for payloads replaced by a minimal marked record because their fields cannot be preserved. */
   def deepUnmarkedPayloadCount: Long = deepUnmarkedPayloads.get()
 
   private[telemetry] def withDeepBestEffort(
@@ -1053,7 +1055,7 @@ object OpenIvmExecutionSpan extends Logging {
               )
               spliceAugmentationFailed(payload).getOrElse {
                 deepUnmarkedPayloads.incrementAndGet()
-                payload
+                DeepAugmentationFailureRecord
               }
           }
       }
@@ -1065,16 +1067,18 @@ object OpenIvmExecutionSpan extends Logging {
     Json.writeValueAsString(root)
   }
 
-  /** Parser-free marker fallback; refuses only text that cannot be a JSON object. */
-  private def spliceAugmentationFailed(payload: String): Option[String] = {
-    val text = Option(payload).map(_.trim).getOrElse("")
-    if (text.length < 2 || text.head != '{' || text.last != '}') None
-    else {
-      val body      = text.substring(0, text.length - 1)
-      val separator = if (body.substring(1).trim.isEmpty) "" else ","
-      Some(s"""$body$separator"deep_status":"${OpenIvmTelemetryContract.DeepStatusAugmentationFailed}"}""")
-    }
-  }
+  /** Avoid the failed writer, but never splice malformed or mixed deep fields into a diagnostic record. */
+  private def spliceAugmentationFailed(payload: String): Option[String] =
+    try {
+      val text           = Option(payload).map(_.trim).getOrElse("")
+      val root: JsonNode = Json.reader().`with`(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readTree(text)
+      if (root == null || !root.isObject || OpenIvmTelemetryContract.DeepRenderedFields.exists(root.has)) None
+      else {
+        val body      = text.substring(0, text.length - 1)
+        val separator = if (body.substring(1).trim.isEmpty) "" else ","
+        Some(s"""$body$separator"deep_status":"${OpenIvmTelemetryContract.DeepStatusAugmentationFailed}"}""")
+      }
+    } catch { case NonFatal(_) => None }
 
   private[telemetry] def withDeep(payload: String, deep: DeepSnapshot): String = {
     val root = Json.readTree(payload).deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()

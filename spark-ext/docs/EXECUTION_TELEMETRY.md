@@ -84,9 +84,13 @@ ordinary metrics are off, count deep-requested payload renderings (the log
 line and the exported object separately): `openivm.telemetry.deep.augmentation_failures`
 counts every rendering whose deep fields could not be added. The `deep_status`
 marker is then added by the JSON writer or, if that also fails, by a
-parser-free splice, so every JSON-object payload carries it.
-`openivm.telemetry.deep.unmarked_payloads` counts only renderings whose input
-was not a JSON object and could not be marked, so the record looks deep-off.
+serialization-free splice of a validated JSON object. If the input cannot
+be preserved, the last resort is the constant diagnostic
+`{"deep_status":"augmentation_failed"}`, never the unmarked input.
+This minimal record carries no invented identity, outcome or measurements
+and cannot be reused as a completed success span.
+The legacy gauge `openivm.telemetry.deep.unmarked_payloads` counts these
+minimal replacements; despite its name, every replacement is now marked.
 A consumer that requested deep telemetry must treat a span with neither
 coverage status nor `deep_status` as unavailable, never as deep-off or zero,
 and check these gauges.

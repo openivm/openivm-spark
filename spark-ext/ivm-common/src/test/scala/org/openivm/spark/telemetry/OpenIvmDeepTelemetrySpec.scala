@@ -390,9 +390,36 @@ class OpenIvmDeepTelemetrySpec extends AnyFunSpec with Matchers with BeforeAndAf
       gauge("augmentation_failures") shouldBe failuresBefore + 2L
       gauge("unmarked_payloads") shouldBe unmarkedBefore
 
-      OpenIvmExecutionSpan.withDeepBestEffort("unrenderable", Some(broken)) shouldBe "unrenderable"
+      val minimal = Json.readTree(OpenIvmExecutionSpan.withDeepBestEffort("unrenderable", Some(broken)))
+      minimal.path("deep_status").asText() shouldBe OpenIvmTelemetryContract.DeepStatusAugmentationFailed
+      fieldNames(minimal) shouldBe Set("deep_status")
+      an[OpenIvmTelemetryExportException] should be thrownBy reusable(accepted, minimal)
       gauge("augmentation_failures") shouldBe failuresBefore + 3L
       gauge("unmarked_payloads") shouldBe unmarkedBefore + 1L
+    }
+
+    it("emits a marked last-resort diagnostic for invalid inputs while deep-off stays byte-identical") {
+      val state          = new OpenIvmExecutionSpan.DeepState(1000L, Thread.currentThread())
+      val broken         = state.freeze(1400L).copy(phases = null)
+      val inputs         = Seq(null, "", " \t", "[]", "null", "{broken}", "{} {}", """{"clock_domain_id":"clock"}""")
+      val failuresBefore = OpenIvmExecutionSpan.deepAugmentationFailureCount
+      val unmarkedBefore = OpenIvmExecutionSpan.deepUnmarkedPayloadCount
+
+      inputs.foreach { input =>
+        val raw = OpenIvmExecutionSpan.withDeepBestEffort(
+          input,
+          Some(broken),
+          _ => throw new IllegalStateException("marker")
+        )
+        val payload = Json.readTree(raw)
+        payload.isObject shouldBe true
+        fieldNames(payload) shouldBe Set("deep_status")
+        payload.path("deep_status").asText() shouldBe OpenIvmTelemetryContract.DeepStatusAugmentationFailed
+
+        OpenIvmExecutionSpan.withDeepBestEffort(input, None, _ => fail("deep-off called marker")) shouldBe input
+      }
+      OpenIvmExecutionSpan.deepAugmentationFailureCount shouldBe failuresBefore + inputs.size
+      OpenIvmExecutionSpan.deepUnmarkedPayloadCount shouldBe unmarkedBefore + inputs.size
     }
   }
 }
