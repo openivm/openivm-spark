@@ -4,8 +4,16 @@
   "round": "R7",
   "qualified_images": [
     "sha256:ea1442c0a9146334d4a237ccbe6b53b90ba685f7a4829126ec58c8735758727e",
-    "sha256:d548acd536dcb8f5c2e133357c8022c1164e0b58eaa7f845fe5ef478580c206f"
+    "sha256:7cd486e121a94c629d80fa6666fe7a7d836c35d7fedcc7877944a6aa0c66dde2",
+    "sha256:8824ab12aa3ca1063cb551283d7db088ca759b0d37f2440af0b5d35282204cf6",
+    "sha256:32a9e212f17be40d1c3f62cdeead03e3eb6f671b1ce1fffb70d6b86990719c28",
+    "sha256:efad6dc94030489c10e82e343ee57c737ee7e10ae41c914fab588f22a4ee2bba",
+    "sha256:d7a93979608310cc311f14f111b669339cc5a6b066a347d9d2a8587850389e4d",
+    "sha256:5820465b1eb5fa7e90efd119c3d4f0599fa80d7e7a13603300919b8e55940633"
   ],
+  "external_image_bindings": {
+    "sha256:8824ab12aa3ca1063cb551283d7db088ca759b0d37f2440af0b5d35282204cf6": ["67ffa9c93c7d3e6862fd73ed5b44e7aaec8ded6fabf3a0eb64761bd206426482"]
+  },
   "purpose": "Local, relative code A/B of OpenIVM-Spark candidates against deployed v2 on the user's six-MV walkthrough. It shortlists candidates for Fabric; it never accepts a release.",
   "identities": {
     "deployed_v2": "50fa4ceb2bfbe2419eb682503cfe20be2083f388",
@@ -116,6 +124,7 @@
       "unique_request_ids"
     ]
   },
+  "shortlist_profiles": ["default"],
   "shortlist": {
     "min_pairs": 3,
     "order": "alternating AB, BA, AB, ...; the control runs first in odd pairs",
@@ -140,7 +149,7 @@
   "exclusions": {
     "post_hoc": "None. Every planned arm is scored or the series is invalid.",
     "failed_arm": "Any failed, cancelled, wrong-target or gate-failing arm invalidates the whole series; later arms are recorded as not-run.",
-    "retest": "A retest is a new series with a new series id; the original series and its verdict are kept."
+    "retest": "A retest is a new registered series. Group every registration by hypothesis family (lane and hypothesis label), profile, workload and target. Admit the family only with at least one valid series, every valid series shortlisted, and an independent D8 classification unrelated to performance for every invalid or cancelled series. An unclassified failure, timeout or performance-dependent failure prevents admission."
   },
   "coverage_limits": [
     "Phase spans are nested and non-additive; a phase missing on any request is unavailable, never zero.",

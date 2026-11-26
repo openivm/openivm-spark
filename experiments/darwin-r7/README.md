@@ -6,7 +6,7 @@ The primary clock starts before six requests are submitted and ends after the la
 
 ## Run a series
 
-Use a clean detached checkout of the **independently frozen contract commit**, not a candidate branch. In the attached pinned devcontainer, use the repository's existing locked Nx installation. Record `docker inspect --format '{{.Image}}'` for that container on its leased WSL host, then set `OPENIVM_R7_IMAGE_ID` to the returned full `sha256:...` identity. Allocate the whole box to one timed series. Do not start a build, second series or crash chain there.
+Use a clean detached checkout of the **independently frozen contract commit**, not a candidate branch. In the attached pinned devcontainer, use the repository's existing locked Nx installation. On its leased WSL host run `docker inspect --type container --format '{{.Id}} {{.Image}}' "$CONTAINER_ID"` and set `OPENIVM_R7_IMAGE_ID` to the returned full `sha256:...` image identity. At plan and arm start, the runner inspects its actual container. For a container without a Docker socket, the contract must instead pin the SHA-256 of `hostname + " " + image` from the independent WSL receipt; a recreated container needs new admission. A failed inspect never selects this mode automatically. Do not add a socket or privilege for measurement. Allocate the whole box to one timed series; do not start a build, second series or crash chain there.
 
 ```bash
 export NX_DAEMON=false PYTHONDONTWRITEBYTECODE=1
@@ -17,7 +17,7 @@ python3 experiments/darwin-r7/paired.py plan \
   --target spark-4.1 --series-id "$SERIES_ID" --out "$FRESH_ABSOLUTE_DIRECTORY"
 ```
 
-`plan` starts **no arms**. Give the independent auditor the unique series ID, emitted plan SHA-256, full control/candidate, actual box and lease-backed wrapper image readback, and the original Privy plan job ID. Use the registration ID returned for that exact plan. Register every repeat before its first arm; the registry retains cancelled, failed, and superseded series as well as successes.
+`plan` starts **no arms**. Give D8 the series ID, plan SHA-256, full control/candidate, hypothesis family (lane and hypothesis label), profile, workload, target, lease/box, original Privy plan job ID, and the WSL job that read back the running container ID, hostname and image. Use the registration ID returned for that exact plan. Submit `run` as **one Privy job per registration** and give D8 its job ID at start, before retention can discard its stdout. An interrupted submission is not grounds to submit a second run.
 
 ```bash
 python3 experiments/darwin-r7/paired.py run "$FRESH_ABSOLUTE_DIRECTORY" \
@@ -34,6 +34,10 @@ For an **unscored** one-arm diagnosis, set `OPENIVM_STATE_GUARD_SUITE=r7-primary
 
 ## Interpret the result
 
-The shortlist requires three or more complete, same-host paired runs, every pair improving and median unrounded durable reduction at least 3%. The report is **not a release approval**. The unchanged historical evaluator in `experiments/darwin` retains its 10% end-to-end / 80% targeted-wait rule and crash gates. Keep its actual decision, including `accepted=false`. The known `cdf/mv_version_and_cdf_watermark_gap` is a disclosed gap, not a passing recovery point. Original witness/Part B, regression and assembled-JAR gates, exact-tip CI and a fresh Fabric control are separate requirements.
+Only a primary series in `shortlist_profiles` can shortlist. It requires three or more complete, same-host pairs, every pair improving and median unrounded durable reduction at least 3%. Deep instrumentation and the intercept companion are diagnostic even if all pairs improve.
+
+**Every registered series counts.** D8 groups registrations by hypothesis family (lane and hypothesis label), profile, workload and target. A family needs at least one valid series, **every** valid series must shortlist, and every invalid or cancelled series needs a D8-accepted classification independent of performance. Timeouts and performance-dependent failures count as non-shortlisting; an unclassified failure cannot be discarded. A new series ID, candidate revision or box does not erase the earlier evidence. Do not pool pairs across hosts.
+
+The report is **not a release approval**. The unchanged historical evaluator in `experiments/darwin` retains its 10% end-to-end / 80% targeted-wait rule and crash gates. Keep its actual decision, including `accepted=false`. The known `cdf/mv_version_and_cdf_watermark_gap` is a disclosed gap, not a passing recovery point. Original witness/Part B, regression and assembled-JAR gates, exact-tip CI and a fresh Fabric control are separate requirements.
 
 Only the integrator revises the measurement contract. After reviewable edits, stage every new harness file, run `python3 experiments/darwin-r7/paired.py lock`, run the discriminator tests and obtain independent review of the new source and lock. A changed harness, profile, workload or policy invalidates reuse of earlier comparisons.

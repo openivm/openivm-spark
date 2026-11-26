@@ -55,12 +55,12 @@ def primary_report(c, sha, label, durable, ret, tag):
                                             "request_ids": ids[:], "durable_ms": durable, "return_ms": ret}}, "failures": []}
 
 
-def series(control, candidate, returns=None):
+def series(control, candidate, returns=None, profile="default"):
     c = contract()
     pairs = len(control)
     plan = {"schema": "openivm.r7-series/v1", "series_id": "t", "comparison_class": "code-ab", "workload": "primary",
-            "profile": "default", "target": "spark-4.1", "pairs": pairs, "order": scorecard.frozen_order(pairs),
-            "control": {"sha": c["profiles"]["default"]["control_sha"]}, "candidate": {"sha": CANDIDATE},
+            "profile": profile, "target": "spark-4.1", "pairs": pairs, "order": scorecard.frozen_order(pairs),
+            "control": {"sha": c["profiles"][profile]["control_sha"]}, "candidate": {"sha": CANDIDATE},
             "contract_digest": c["_digest"], "harness_digest": c["_harness_digest"],
             "native": dict(c["identities"]["native"]), "exclusions": dict(c["exclusions"]),
             "contract_sha": "b" * 40, "host": {"node": "host", "cpus": 16, "image": c["qualified_images"][0]},
@@ -70,10 +70,12 @@ def series(control, candidate, returns=None):
         durable = (control if arm == "control" else candidate)[pair - 1]
         ret = returns[arm][pair - 1] if returns else durable * 0.75
         sha, label = plan[arm]["sha"], f"t-p{pair:02d}-{arm}"
+        report = primary_report(c, sha, label, durable, ret, f"{pair}{arm}")
+        report["telemetry_conf"] = c["profiles"][profile]["telemetry_conf"].copy()
         arms.append({"pair": pair, "arm": arm, "sha": sha, "label": label, "status": "completed", "exit_code": 0,
                      "host": plan["host"].copy(), "started_unix_s": sequence * 10, "ended_unix_s": sequence * 10 + 1,
                      "harness_digest": plan["harness_digest"], "native": dict(plan["native"]),
-                     "report": primary_report(c, sha, label, durable, ret, f"{pair}{arm}")})
+                     "report": report})
     return c, plan, arms
 
 
@@ -99,6 +101,11 @@ class ScorecardTest(unittest.TestCase):
         below = scorecard.score(*series([100000] * 3, [97001] * 3))
         self.assertTrue(below["valid"])
         self.assertFalse(below["shortlisted"])
+
+    def test_deep_profile_remains_diagnostic_even_with_three_wins(self):
+        result = scorecard.score(*series([100] * 3, [80] * 3, profile="instrumented-deep"))
+        self.assertTrue(result["valid"])
+        self.assertFalse(result["shortlisted"])
 
     def test_every_pair_must_improve(self):
         result = scorecard.score(*series([100, 100, 100], [80, 80, 100]))

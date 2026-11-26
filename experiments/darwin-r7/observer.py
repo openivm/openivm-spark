@@ -4,9 +4,6 @@
 import argparse
 import collections
 import fcntl
-import os
-import platform
-import re
 import statistics
 import time
 from pathlib import Path
@@ -82,8 +79,8 @@ def main():
     sha = paired.git(root, "rev-parse", "HEAD")
     digest, _ = paired.harness_digest(root, c["harness_paths"])
     paired.need(digest == c["_harness_digest"] and not paired.git(root, "status", "--porcelain"), "unclean contract")
-    image = os.environ.get("OPENIVM_R7_IMAGE_ID", "")
-    paired.need(Path("/.dockerenv").exists() and re.fullmatch(r"sha256:[a-f0-9]{64}", image), "missing container identity")
+    paired.need(Path("/.dockerenv").exists(), "run inside the pinned devcontainer")
+    host = paired.host_identity(c)
     native = paired.native_identity(c)
     paired.need(native == c["identities"]["native"], "native identity mismatch")
     out = args.out.resolve()
@@ -92,7 +89,7 @@ def main():
     plan = {"series_id": out.name, "comparison_class": "observer-cost", "source": SOURCE, "contract_sha": sha,
             "harness_digest": digest, "contract_digest": c["_digest"], "order": order, "target": "spark-4.1",
             "workload": "primary", "native": native, "profiles": {"legacy": {}, "deep": DETAIL},
-            "host": {"node": platform.node(), "cpus": os.cpu_count(), "image": image},
+            "host": host,
             "frozen_unix_s": time.time(), "exclusions": c["exclusions"]}
     with open("/tmp/openivm-r7-series.lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

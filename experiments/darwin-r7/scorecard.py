@@ -195,6 +195,17 @@ def reduction(control, candidate):
     return 100.0 * (control - candidate) / control
 
 
+def evidence_digests(directory):
+    files = {}
+    for path in directory.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(f"symlink in arm evidence: {path.relative_to(directory)}")
+        if path.is_file() and path != directory / "arm.json":
+            with path.open("rb") as stream:
+                files[path.relative_to(directory).as_posix()] = hashlib.file_digest(stream, "sha256").hexdigest()
+    return files
+
+
 def score(contract, plan, arms, native_decision=None):
     problems = []
     workload, profile = check_plan(contract, plan, problems)
@@ -273,8 +284,9 @@ def score(contract, plan, arms, native_decision=None):
     threshold = contract["shortlist"]["min_median_reduction_percent"]
     reductions = [e["reduction_percent"] for e in pairs]
     median = statistics.median(reductions)
-    shortlisted = plan["workload"] == "primary" and min(reductions) > 0 and median >= threshold
-    result.update(valid=True, shortlisted=shortlisted, pairs=pairs, median_reduction_percent=median,
+    eligible = plan["workload"] == "primary" and plan["profile"] in contract["shortlist_profiles"]
+    shortlisted = eligible and min(reductions) > 0 and median >= threshold
+    result.update(valid=True, shortlist_eligible=eligible, shortlisted=shortlisted, pairs=pairs, median_reduction_percent=median,
                   min_reduction_percent=min(reductions), max_reduction_percent=max(reductions))
     if "return_reduction_percent" in pairs[0]:
         ret_median = statistics.median(e["return_reduction_percent"] for e in pairs)
@@ -290,6 +302,8 @@ def emit(result):
     print(f"@RESULT valid={valid} shortlisted={short} median_reduction_percent={median:.6f}")
     if not valid:
         print("@FEEDBACK invalid series, no speed credited: " + "; ".join(result["problems"][:10]))
+    elif not result["shortlist_eligible"]:
+        print("@FEEDBACK diagnostic profile or companion workload; this series cannot shortlist a product")
     elif result["min_reduction_percent"] <= 0:
         print("@FEEDBACK at least one durable pair was nonpositive; no shortlist")
     elif result.get("early_return_only"):
@@ -343,10 +357,7 @@ def _main(argv):
                      "r7-walkthrough-receipts.jsonl"} if role == "primary" else
                     {"nx.log", report_name, "r7-matched-intercept-events.jsonl", "r7-matched-intercept-receipts.jsonl"})
         if arm.get("status") == "completed":
-            def matches(name):
-                return isinstance(name, str) and Path(name).name == name and (p.parent / name).is_file() and \
-                    hashlib.sha256((p.parent / name).read_bytes()).hexdigest() == raw[name]
-            if not required.issubset(raw) or not all(matches(name) for name in raw) or \
+            if not required.issubset(raw) or evidence_digests(p.parent) != raw or \
                     arm.get("report") != json.loads((p.parent / report_name).read_text()):
                 arm["status"] = "invalid-original-evidence"
         arms.append(arm)

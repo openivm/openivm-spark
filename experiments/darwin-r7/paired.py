@@ -53,8 +53,21 @@ def sha256(path):
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
-def host_identity():
-    return {"node": platform.node(), "cpus": os.cpu_count(), "image": os.environ.get("OPENIVM_R7_IMAGE_ID", "")}
+def host_identity(contract):
+    node = platform.node()
+    image = os.environ.get("OPENIVM_R7_IMAGE_ID", "")
+    need(re.fullmatch(r"[a-f0-9]{12,64}", node), "cannot identify the running container by its hostname")
+    bindings = contract["external_image_bindings"]
+    if image in bindings:
+        fingerprint = hashlib.sha256(f"{node} {image}".encode("ascii")).hexdigest()
+        need(fingerprint in bindings[image], "container does not match the independently witnessed host-side readback")
+    else:
+        receipt = subprocess.check_output(
+            ["docker", "inspect", "--type", "container", "--format", "{{.Id}} {{.Image}}", node], text=True).split()
+        need(len(receipt) == 2 and re.fullmatch(r"[a-f0-9]{64}", receipt[0]) and receipt[0].startswith(node)
+             and re.fullmatch(r"sha256:[a-f0-9]{64}", receipt[1]), "invalid running-container identity readback")
+        need(receipt[1] == image, "running wrapper differs from the leased WSL readback")
+    return {"node": node, "cpus": os.cpu_count(), "image": image}
 
 
 def anchor(series, relative, directory):
@@ -150,7 +163,7 @@ def run_arm(contract, plan, pair, arm, wt, out, timeout):
     command = ["npx", "--no-install", "nx", "run", "spark-ext:state-guard-perf",
                f"--configuration={plan['target']}", "--skip-nx-cache"]
     record = {"pair": pair, "arm": arm, "sha": sha, "label": label, "harness_digest": digest,
-              "host": host_identity(), "native": native_identity(contract), "command": command, "started_unix_s": time.time()}
+              "host": host_identity(contract), "native": native_identity(contract), "command": command, "started_unix_s": time.time()}
     need(record["host"] == plan["host"] and record["native"] == plan["native"] and digest == plan["harness_digest"],
          "host, native or harness changed before arm")
     with (directory / "nx.log").open("w") as log:
@@ -173,7 +186,7 @@ def run_arm(contract, plan, pair, arm, wt, out, timeout):
     log = re.sub(r"\x1b\[[0-9;]*m", "", (directory / "nx.log").read_text(errors="replace"))
     if status == "completed" and f"spark-ext:state-guard-perf:{plan['target']}" not in log:
         record["status"] = "failed-wrong-target"
-    record["evidence_sha256"] = {p.name: sha256(p) for p in directory.iterdir() if p.is_file()}
+    record["evidence_sha256"] = scorecard.evidence_digests(directory)
     write(directory / "arm.json", record)
     anchor(plan["series_id"], str(directory.relative_to(out) / "arm.json"), out)
     return record
@@ -198,7 +211,7 @@ def cmd_plan(args):
     candidate = git(root, "rev-parse", f"{args.candidate}^{{commit}}")
     need(control == profile["control_sha"], f"control must be {profile['control_sha']} for {args.profile}")
     changes = product_diff(root, contract, control, candidate)
-    host = host_identity()
+    host = host_identity(contract)
     need(host["image"] in contract["qualified_images"], "actual wrapper image must be admitted by D1/D8 before planning")
     for sha in (control, candidate):
         for ancestor in profile.get("requires_ancestors", []):
@@ -232,7 +245,7 @@ def cmd_run(args):
     problems = []
     scorecard.check_plan(contract, plan, problems)
     need(not problems, "; ".join(problems))
-    need(plan["contract_sha"] == contract_sha and plan["host"] == host_identity(), "contract or host changed")
+    need(plan["contract_sha"] == contract_sha and plan["host"] == host_identity(contract), "contract or host changed")
     control, candidate = (plan[a]["sha"] for a in scorecard.ARMS)
     need(product_diff(root, contract, control, candidate) == plan["product_paths"], "product diff changed")
     need(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", args.registration_id), "invalid D8 registration ID")
