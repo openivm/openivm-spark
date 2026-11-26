@@ -1892,6 +1892,22 @@ private[commands] object MvCommandHelper {
       case Left(_)     => false
     }
 
+  /** Whether a successfully read catalog proves that no other MV consumes the MV
+    * named by `selfKeys` / `shortName`, either lexically through its source
+    * tables or through its persisted direct dependency map. A failed catalog read
+    * or an unreadable dependency map proves nothing. */
+  private[commands] def provenTerminalMv(
+      catalog: Option[Seq[MvMetadata]],
+      selfKeys: Set[String],
+      shortName: String
+  ): Boolean =
+    catalog.exists { all =>
+      all.filterNot(other => selfKeys.contains(metaName(other.name))).forall { other =>
+        !other.sourceTables.exists(_.split("\\.").last == shortName) &&
+        readMvDependencyMap(other.properties).exists(_.forall(dep => !selfKeys.contains(dep.key)))
+      }
+    }
+
   /** Resolve each ADVANCE request identifier by physical Delta identity and map
     * it to the RESOLVED operational alias of the persisted pinned source with the
     * exact same dataPath + metadata.id. External input is never suffix-matched:
@@ -5525,9 +5541,10 @@ case class RefreshMaterializedViewCommand(
       // and record_cascade trigger-key resolution).  A RocksDB prefix scan
       // each time costs 5-30 ms × 3 across heavy refresh programs.  Read once
       // and reuse.  Defensive try/catch matches the original call sites.
-      lazy val allMvsCached: Seq[MvMetadata] =
-        try MvCatalog.list(spark)
-        catch { case _: Throwable => Seq.empty[MvMetadata] }
+      lazy val allMvsSnapshot: Option[Seq[MvMetadata]] =
+        try Some(MvCatalog.list(spark))
+        catch { case _: Throwable => None }
+      lazy val allMvsCached: Seq[MvMetadata] = allMvsSnapshot.getOrElse(Seq.empty[MvMetadata])
 
       val collectedChangeBatches = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
         RefreshPerf.timePhase(refreshId, viewLabel, "collect_staging") {
@@ -6046,10 +6063,17 @@ case class RefreshMaterializedViewCommand(
           .toSet
       }
 
+      // Eliding an intercept cascade delta requires a successful catalog read
+      // that proves this MV has no consumer.
+      lazy val provenInterceptTerminal: Boolean =
+        provenTerminalMv(allMvsSnapshot, Set(metaName(name), metaName(meta.name)), name.identifier)
+
       // Restrict insert-only aggregation to a single source without joins.
       // Appends to one side of an outer join can retract NULL-padded input rows.
+      // Intercept-mode consumers read the view delta from staging, so only a
+      // proven terminal MV qualifies there.
       lazy val insertOnlyAggregateShapeCandidate: Boolean =
-        !propagation.requiresDmlInterception &&
+        (!propagation.requiresDmlInterception || provenInterceptTerminal) &&
           meta.refreshType == RefreshTypeCode.AggregateGroup &&
           meta.sourceTables.size == 1 &&
           !meta.queryHasJoin
@@ -6082,6 +6106,7 @@ case class RefreshMaterializedViewCommand(
           s"insert_only_aggregate_shape_candidate=$insertOnlyAggregateShapeCandidate;" +
           s"insert_only_aggregate=$insertOnlyAggregate;" +
           s"requires_dml_interception=${propagation.requiresDmlInterception};" +
+          s"proven_intercept_terminal=${propagation.requiresDmlInterception && provenInterceptTerminal};" +
           s"source_delta_shape=${sourceDeltaShape.toSeq.sortBy(_._1).mkString("|")};" +
           s"downstream_sources=${downstreamSourceKeysForThisMv.toSeq.sorted.mkString("|")}",
         0L
@@ -8312,10 +8337,14 @@ case class RefreshMaterializedViewCommand(
                 RefreshPerf.timePhase(refreshId, viewLabel, "record_cascade") {
                   val triggerKeys: Set[String] = downstreamSourceKeysForThisMv
                   val keysToRecord =
-                    if (triggerKeys.isEmpty && meta.refreshType == RefreshTypeCode.SimpleAggregate) {
+                    if (
+                      triggerKeys.isEmpty &&
+                      (meta.refreshType == RefreshTypeCode.SimpleAggregate || directAggregateMerge.isDefined)
+                    ) {
                       // A scalar snapshot delta is only needed for concrete current
                       // consumers. A downstream created later absorbs the current
                       // scalar in its initial CTAS and starts from a fresh watermark.
+                      // A direct aggregate MERGE never materializes its view delta.
                       Set.empty[String]
                     } else if (triggerKeys.isEmpty && fusedScratchView.isEmpty) {
                       // Keep the legacy on-disk breadcrumb for non-fused refreshes.
