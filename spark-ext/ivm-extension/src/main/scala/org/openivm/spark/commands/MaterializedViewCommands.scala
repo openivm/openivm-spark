@@ -837,7 +837,7 @@ private[commands] object RefreshPerf extends org.apache.spark.internal.Logging {
       body: => A
   ): A = {
     val t0 = System.nanoTime()
-    try body
+    try OpenIvmExecutionSpan.measureActivePhase(s"perf_$phase")(body)
     finally {
       val elapsedMs = (System.nanoTime() - t0) / 1000000L
       if (enabled) {
@@ -6666,19 +6666,38 @@ case class RefreshMaterializedViewCommand(
                   .map(SourceVersionDelta.buildBagDiffSql(_, schema))
                   .getOrElse(propagation.buildSourceDeltaViewSql(qualTable, schema, tableBatches))
                 var registrationSucceeded = false
+                if (OpenIvmExecutionSpan.deepActive) {
+                  val batchKind =
+                    if (sourceVersionBatch.isDefined) "source_version"
+                    else if (tableBatches.isEmpty) "empty"
+                    else if (tableBatches.exists(_.isInstanceOf[CdfChangeBatch])) "cdf_window"
+                    else "staging"
+                  OpenIvmExecutionSpan.recordActiveWork(s"register.batch_kind.$batchKind")
+                  OpenIvmExecutionSpan.recordActiveWork("register.sources")
+                  tableBatches.foreach {
+                    case StagingChangeBatch(_, deltas, _) =>
+                      OpenIvmExecutionSpan.recordActiveWork("register.stage_parts", deltas.size.toLong)
+                      deltas.groupBy(_.opType.toLowerCase(java.util.Locale.ROOT)).foreach { case (op, parts) =>
+                        OpenIvmExecutionSpan.recordActiveWork(s"register.op_type.$op", parts.size.toLong)
+                      }
+                    case _ => ()
+                  }
+                }
                 val viewSql =
                   try {
-                    val registered = sourceVersionBatch match {
-                      case Some(batch) => SourceVersionDelta.registerSourceDeltaView(spark, batch, schema)
-                      case None =>
-                        propagation match {
-                          case cdf: CdfChangePropagation if meta.refreshType == RefreshTypeCode.WindowPartition =>
-                            val (sql, coverage) =
-                              cdf.registerSourceDeltaWithCoverage(spark, qualTable, schema, tableBatches)
-                            coverage.foreach(view => registeredCdfDeltaViews(view.batch) = view)
-                            sql
-                          case _ => propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches)
-                        }
+                    val registered = OpenIvmExecutionSpan.measureActivePhase("register_source_delta") {
+                      sourceVersionBatch match {
+                        case Some(batch) => SourceVersionDelta.registerSourceDeltaView(spark, batch, schema)
+                        case None =>
+                          propagation match {
+                            case cdf: CdfChangePropagation if meta.refreshType == RefreshTypeCode.WindowPartition =>
+                              val (sql, coverage) =
+                                cdf.registerSourceDeltaWithCoverage(spark, qualTable, schema, tableBatches)
+                              coverage.foreach(view => registeredCdfDeltaViews(view.batch) = view)
+                              sql
+                            case _ => propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches)
+                          }
+                      }
                     }
                     registrationSucceeded = true
                     registered
@@ -6992,12 +7011,16 @@ case class RefreshMaterializedViewCommand(
               val snapshotRelations = snapshotVersions.flatMap { case (source, version) =>
                 if (
                   !executionSnapshotPinsByQualified.keys.exists(_.equalsIgnoreCase(source)) &&
-                  MvProjectionSource.isProjection(spark, source)
+                  OpenIvmExecutionSpan.measureActivePhase("rewrite_projection_probe")(
+                    MvProjectionSource.isProjection(spark, source)
+                  )
                 ) {
                   val tempName = s"openivm_source_snapshot_${source.split("\\.").last}"
-                  MvProjectionSource
-                    .read(spark, source, Map("versionAsOf" -> version.toString))
-                    .createOrReplaceTempView(tempName)
+                  OpenIvmExecutionSpan.measureActivePhase("rewrite_source_snapshot_view") {
+                    MvProjectionSource
+                      .read(spark, source, Map("versionAsOf" -> version.toString))
+                      .createOrReplaceTempView(tempName)
+                  }
                   sourceSnapshotTempViews += tempName
                   Some(source -> s"`${tempName.replace("`", "``")}`")
                 } else None
@@ -8512,17 +8535,24 @@ case class RefreshMaterializedViewCommand(
           )
         } finally {
           sourceSnapshotTempViews.foreach { tempName =>
-            try spark.catalog.dropTempView(tempName)
+            try
+              OpenIvmExecutionSpan.measureActivePhase("cleanup_source_snapshot_view_drop")(
+                spark.catalog.dropTempView(tempName)
+              )
             catch { case _: Throwable => () }
           }
+          OpenIvmExecutionSpan.recordActiveWork("cleanup.delta_views", tempViewShortNames.size.toLong)
           tempViewShortNames.foreach { n =>
             val dropSql       = StagingDeltaView.dropSourceDeltaViewSql(n)
             val t0            = System.nanoTime()
             var dropSucceeded = true
-            try spark.catalog.uncacheTable(s"openivm_delta_$n")
+            try
+              OpenIvmExecutionSpan.measureActivePhase("cleanup_delta_view_uncache")(
+                spark.catalog.uncacheTable(s"openivm_delta_$n")
+              )
             catch { case _: Throwable => () }
             try {
-              spark.sql(dropSql)
+              OpenIvmExecutionSpan.measureActivePhase("cleanup_delta_view_drop")(spark.sql(dropSql))
             } catch {
               case _: Throwable =>
                 dropSucceeded = false
@@ -8547,16 +8577,27 @@ case class RefreshMaterializedViewCommand(
                 // memory immediately rather than waiting for GC. When a downstream
                 // cascade staging row references it, StagingCatalog.pruneConsumed
                 // owns this cleanup after every downstream MV has consumed the row.
-                spark.catalog.uncacheTable(s"global_temp.$view")
+                OpenIvmExecutionSpan.measureActivePhase("cleanup_fused_scratch_uncache")(
+                  spark.catalog.uncacheTable(s"global_temp.$view")
+                )
               } catch { case _: Throwable => () }
-              try spark.catalog.dropGlobalTempView(view)
+              try
+                OpenIvmExecutionSpan.measureActivePhase("cleanup_fused_scratch_drop")(
+                  spark.catalog.dropGlobalTempView(view)
+                )
               catch { case _: Throwable => () }
             }
           }
           materializedWindowAffectedView.foreach { affectedView =>
-            try spark.catalog.uncacheTable(affectedView)
+            try
+              OpenIvmExecutionSpan.measureActivePhase("cleanup_window_affected_uncache")(
+                spark.catalog.uncacheTable(affectedView)
+              )
             catch { case _: Throwable => () }
-            try spark.catalog.dropTempView(affectedView)
+            try
+              OpenIvmExecutionSpan.measureActivePhase("cleanup_window_affected_drop")(
+                spark.catalog.dropTempView(affectedView)
+              )
             catch { case _: Throwable => () }
           }
           // emitEnd() above already flushed sqlLog, but drop_cleanup rows

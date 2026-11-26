@@ -127,8 +127,77 @@ object OpenIvmTelemetryContract {
     "rocksdb_backup_ms"
   )
 
+  /** Opt-in deep driver telemetry. Read once when a CREATE / REFRESH span starts. */
+  val DeepEnabledKey: String = "spark.openivm.telemetry.deep.enabled"
+
+  val DeepNameMaxLength: Int     = 128
+  val DeepPhaseTotalsCap: Int    = 64
+  val DeepTimerTotalsCap: Int    = 128
+  val DeepWorkCountersCap: Int   = 128
+  val DeepCoverageComplete       = "complete"
+  val DeepCoverageIncomplete     = "incomplete"
+  val DeepCoverageInconsistent   = "inconsistent"
+  val DeepActiveWrappersAtFreeze = "active_wrappers_at_freeze"
+  val DeepWrappedExceedsSpan     = "wrapped_exceeds_span"
+
+  /** Emitted instead of the deep fields when a deep-requested span could not be augmented. */
+  val DeepStatusAugmentationFailed = "augmentation_failed"
+
+  private[telemetry] val DeepCoverageStatuses: Set[String] =
+    Set(DeepCoverageComplete, DeepCoverageIncomplete, DeepCoverageInconsistent)
+
+  private[telemetry] val DeepTextFields: Set[String] = Set(
+    "clock_domain_id",
+    "owner_thread_coverage_status",
+    "owner_thread_coverage_reason",
+    "deep_status"
+  )
+
+  private[telemetry] val DeepIntegralFields: Set[String] = Set(
+    "duration_ns",
+    "post_completion_ns",
+    "owner_thread_wrapped_ns",
+    "owner_thread_post_completion_wrapped_ns",
+    "owner_thread_unattributed_ns",
+    "owner_thread_overcoverage_ns",
+    "active_wrappers_at_freeze",
+    "phase_totals_dropped_count",
+    "timer_totals_dropped_count",
+    "work_counters_dropped_count",
+    "deep_names_truncated_count",
+    "deep_observer_ns"
+  )
+
+  /** Nested deep arrays: name key, non-negative integral keys, signed integral keys. */
+  private[telemetry] val DeepArrayFields: Map[String, (String, Set[String], Set[String])] = Map(
+    "phase_totals" -> (
+      (
+        "phase",
+        Set(
+          "wrapped_count",
+          "wrapped_failed_count",
+          "wrapped_ns",
+          "wrapped_max_ns",
+          "owner_top_level_count",
+          "off_thread_count",
+          "external_count",
+          "external_ms",
+          "skipped_count"
+        ),
+        Set.empty[String]
+      )
+    ),
+    "timer_totals"  -> (("timer", Set("count", "total_ns", "max_ns"), Set.empty[String])),
+    "work_counters" -> (("counter", Set.empty[String], Set("value")))
+  )
+
+  /** Deep fields that `deep_status` replaces; none may accompany it. */
+  private[telemetry] val DeepRenderedFields: Set[String] =
+    (DeepTextFields - "deep_status") ++ DeepIntegralFields ++ DeepArrayFields.keySet
+
   private[telemetry] val AllowedFields: Set[String] =
-    TextFields ++ IntegralFields + "source_versions" + "lock_acquisitions"
+    TextFields ++ IntegralFields ++ DeepTextFields ++ DeepIntegralFields ++ DeepArrayFields.keySet +
+      "source_versions" + "lock_acquisitions"
 
   final case class ExecutionIdentity(
       campaignId: String,

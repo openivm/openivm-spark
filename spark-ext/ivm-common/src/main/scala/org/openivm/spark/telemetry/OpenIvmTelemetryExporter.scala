@@ -266,6 +266,7 @@ private[telemetry] final class OpenIvmTelemetryExporter(
       )
         throw invalidReusable(path)
     }
+    validateDeepFields(payload, path)
     requireText(payload, "schema_id", OpenIvmTelemetryContract.SchemaId, path)
     if (
       !payload.path("schema_version").isIntegralNumber ||
@@ -301,6 +302,51 @@ private[telemetry] final class OpenIvmTelemetryExporter(
     val durationMs     = payload.path("duration_ms").longValue()
     if (math.abs(wallDurationMs - durationMs) > OpenIvmTelemetryContract.DurationTimestampToleranceMs)
       throw invalidReusable(path)
+  }
+
+  private def validateDeepFields(payload: JsonNode, path: Path): Unit = {
+    def integral(node: JsonNode, nonNegative: Boolean): Boolean =
+      node.isIntegralNumber && node.canConvertToLong && (!nonNegative || node.longValue() >= 0L)
+    OpenIvmTelemetryContract.DeepTextFields.foreach { field =>
+      if (payload.has(field) && (!payload.path(field).isTextual || payload.path(field).asText().isEmpty))
+        throw invalidReusable(path)
+    }
+    OpenIvmTelemetryContract.DeepIntegralFields.foreach { field =>
+      if (payload.has(field) && !integral(payload.path(field), nonNegative = true)) throw invalidReusable(path)
+    }
+    val status   = Option(payload.get("owner_thread_coverage_status")).map(_.asText())
+    val complete = status.contains(OpenIvmTelemetryContract.DeepCoverageComplete)
+    val failed   = Option(payload.get("deep_status")).map(_.asText())
+    if (
+      status.exists(value => !OpenIvmTelemetryContract.DeepCoverageStatuses.contains(value)) ||
+      failed.exists(value =>
+        value != OpenIvmTelemetryContract.DeepStatusAugmentationFailed ||
+          OpenIvmTelemetryContract.DeepRenderedFields.exists(payload.has)
+      ) ||
+      payload.has("owner_thread_unattributed_ns") != complete ||
+      payload
+        .has("owner_thread_overcoverage_ns") != status.contains(OpenIvmTelemetryContract.DeepCoverageInconsistent) ||
+      payload.has("owner_thread_coverage_reason") != (status.isDefined && !complete)
+    )
+      throw invalidReusable(path)
+    OpenIvmTelemetryContract.DeepArrayFields.foreach { case (field, (nameKey, nonNegativeKeys, signedKeys)) =>
+      if (payload.has(field)) {
+        val items = payload.path(field)
+        if (!items.isArray) throw invalidReusable(path)
+        val expectedKeys = nonNegativeKeys ++ signedKeys + nameKey
+        items.elements().asScala.foreach { item =>
+          if (!item.isObject || item.fieldNames().asScala.toSet != expectedKeys) throw invalidReusable(path)
+          val name = item.path(nameKey)
+          if (
+            !name.isTextual || name.asText().isEmpty ||
+            name.asText().length > OpenIvmTelemetryContract.DeepNameMaxLength
+          )
+            throw invalidReusable(path)
+          nonNegativeKeys.foreach(key => if (!integral(item.path(key), nonNegative = true)) throw invalidReusable(path))
+          signedKeys.foreach(key => if (!integral(item.path(key), nonNegative = false)) throw invalidReusable(path))
+        }
+      }
+    }
   }
 
   private def sourceEndVersions(payload: JsonNode, path: Path): Map[String, Long] = {

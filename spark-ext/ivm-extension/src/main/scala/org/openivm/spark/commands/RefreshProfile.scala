@@ -109,11 +109,11 @@ final class RefreshProfile private (
     val needsTiming =
       active || OpenIvmMetrics.enabled || OpenIvmExecutionSpan.needsProfileStepTiming(stepName) ||
         OpenIvmInsightsBroker.hasActiveCapture(spark)
-    if (!needsTiming && phaseTimeline.isEmpty) return body
+    if (!needsTiming && phaseTimeline.isEmpty) return executionSpan.measureDeepPhase(stepName)(body)
     val t0        = System.nanoTime()
     var succeeded = false
     try {
-      val result = phaseTimeline.fold(body)(_.time(stepName, detail)(body))
+      val result = executionSpan.measureDeepPhase(stepName)(phaseTimeline.fold(body)(_.time(stepName, detail)(body)))
       succeeded = true
       result
     } finally {
@@ -136,12 +136,12 @@ final class RefreshProfile private (
   def timeObservedStep[A](stepName: String, detail: String = "")(body: => A): A = {
     val needsTiming =
       active || OpenIvmMetrics.enabled || OpenIvmInsightsBroker.hasActiveCapture(spark)
-    if (!needsTiming && phaseTimeline.isEmpty) return body
+    if (!needsTiming && phaseTimeline.isEmpty) return executionSpan.measureDeepPhase(stepName)(body)
     val startedEpochMs = System.currentTimeMillis()
     val startedNanos   = System.nanoTime()
     var succeeded      = false
     try {
-      val result = phaseTimeline.fold(body)(_.time(stepName, detail)(body))
+      val result = executionSpan.measureDeepPhase(stepName)(phaseTimeline.fold(body)(_.time(stepName, detail)(body)))
       succeeded = true
       result
     } finally {
@@ -155,6 +155,7 @@ final class RefreshProfile private (
   }
 
   def appendObservedSkip(stepName: String, detail: String): Unit = {
+    executionSpan.recordDeepSkippedPhase(stepName)
     val needsTiming = active || OpenIvmMetrics.enabled || OpenIvmInsightsBroker.hasActiveCapture(spark)
     if (needsTiming) {
       val epochMs = System.currentTimeMillis()
@@ -175,6 +176,7 @@ final class RefreshProfile private (
     * outside the lock body).
     */
   def appendStep(stepName: String, detail: String, durationMs: Long): Unit = {
+    executionSpan.recordDeepExternalPhase(stepName, durationMs)
     appendStepInternal(stepName, detail, durationMs, succeeded = true)
   }
 
@@ -285,7 +287,7 @@ final class RefreshProfile private (
         (endNanos - executionSpan.startedAtNanos) / 1000000L
       )
     }
-    try persist()
+    try executionSpan.measureDeepPhase("profile_flush_persist")(persist())
     finally {
       executionSpan.complete(outcome, threadName)
       if (deferExecutionSpanEmission) RefreshProfile.clearActive(this, clearExecutionSpan = false)
