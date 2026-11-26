@@ -151,13 +151,7 @@ private[commands] object OpenIvmCompilers {
       contextRuntimes.get(cliLibraryPath) match {
         case Some(compiler) => compiler
         case None =>
-          val compiler = buildForSession(spark, cliLibraryPath)
-          try compiler.verifyRuntime()
-          catch {
-            case NonFatal(e) =>
-              compiler.close()
-              throw e
-          }
+          val compiler = buildForSession(spark, cliLibraryPath).deferRuntimeVerification()
           runtimes.put(context, contextRuntimes + (cliLibraryPath -> compiler))
           Runtime.getRuntime.addShutdownHook(new Thread(() => compiler.close()))
           compiler

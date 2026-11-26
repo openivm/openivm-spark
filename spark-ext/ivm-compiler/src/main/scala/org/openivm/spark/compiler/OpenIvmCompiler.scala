@@ -105,6 +105,10 @@ class OpenIvmCompiler private (
 
   @volatile private var closed: Boolean = false
 
+  @volatile private var runtimeVerificationDeferred: Boolean = false
+  @volatile private var runtimeVerified: Boolean             = false
+  private val runtimeVerificationLock                        = new Object
+
   val cacheGeneration: String = UUID.randomUUID().toString
 
   /** Cache the raw native program, never rewritten executable statements. The
@@ -134,15 +138,17 @@ class OpenIvmCompiler private (
     */
   def verifyRuntime(): Unit = {
     try {
-      val result = compile(
+      val result = compileWithTrace(
         CompileRequest(
           viewName = "openivm_runtime_probe",
           viewSql = "SELECT id FROM openivm_runtime_source",
           sources = Map("openivm_runtime_source" -> StructType(Seq(StructField("id", IntegerType))))
-        )
+        ),
+        new CompilerTrace(None)
       )
-      if (result.refreshTypeName == "FULL_REFRESH" || result.sql.trim.isEmpty)
+      if (isFallback(result))
         throw new IllegalStateException("Native compiler probe did not produce an incremental projection")
+      runtimeVerified = true
     } catch {
       case e: OpenIvmCompileException =>
         throw new IllegalStateException(
@@ -167,7 +173,38 @@ class OpenIvmCompiler private (
   def compile(req: CompileRequest): CompiledRefresh = compile(req, None)
 
   def compile(req: CompileRequest, trace: Option[CompileTraceContext]): CompiledRefresh =
-    compileWithTrace(req, new CompilerTrace(trace))
+    if (!runtimeVerificationDeferred || runtimeVerified) compileWithTrace(req, new CompilerTrace(trace))
+    else {
+      val compiled =
+        try compileWithTrace(req, new CompilerTrace(trace))
+        catch {
+          case scala.util.control.NonFatal(failure) =>
+            try requireVerifiedRuntime()
+            catch {
+              case scala.util.control.NonFatal(probeFailure) =>
+                probeFailure.addSuppressed(failure)
+                throw probeFailure
+            }
+            throw failure
+        }
+      if (isFallback(compiled)) requireVerifiedRuntime() else runtimeVerified = true
+      compiled
+    }
+
+  /** Run [[verifyRuntime]] only before the first compile that would deliver a fallback. An incremental compile
+    * proves the native runtime as well as the probe does, so a healthy runtime skips the probe entirely; a broken one
+    * still refuses the full-refresh fallback before any caller can observe it.
+    */
+  private[spark] def deferRuntimeVerification(): this.type = {
+    runtimeVerificationDeferred = true
+    this
+  }
+
+  private def requireVerifiedRuntime(): Unit =
+    if (!runtimeVerified) runtimeVerificationLock.synchronized(if (!runtimeVerified) verifyRuntime())
+
+  private def isFallback(compiled: CompiledRefresh): Boolean =
+    compiled.refreshTypeName == "FULL_REFRESH" || compiled.sql.trim.isEmpty
 
   private[compiler] def compileWithTrace(req: CompileRequest, trace: CompilerTrace): CompiledRefresh =
     trace.time("compile_total", 0) { compileImpl(req, trace) }
