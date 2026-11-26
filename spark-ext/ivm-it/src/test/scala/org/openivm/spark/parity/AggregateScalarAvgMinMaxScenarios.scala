@@ -217,11 +217,13 @@ abstract class AggregateScalarAvgMinMaxScenarios extends IvmParitySpecBase("aggr
         .toSeq
         .filter(_.getString(1).split("\\.").last == "aggsmm_mv_watch_events")
       val rewrittenInsertOnly = insertOnlyRows.filter(_.getString(6) == "rewritten_stmt")
-      rewrittenInsertOnly should have size 1
-      rewrittenInsertOnly.head.getString(7) shouldBe "merge"
-      rewrittenInsertOnly.head.getString(9).toUpperCase should include("MERGE INTO")
-      rewrittenInsertOnly.head.getString(9).toUpperCase should not include "CREATE OR REPLACE TABLE"
-      insertOnlyRows.map(_.getString(6)) should not contain "count_monoid_cleanup"
+      if (modeLabel == "cdf") {
+        rewrittenInsertOnly should have size 1
+        rewrittenInsertOnly.head.getString(7) shouldBe "merge"
+        rewrittenInsertOnly.head.getString(9).toUpperCase should include("MERGE INTO")
+        rewrittenInsertOnly.head.getString(9).toUpperCase should not include "CREATE OR REPLACE TABLE"
+        insertOnlyRows.map(_.getString(6)) should not contain "count_monoid_cleanup"
+      }
 
       RefreshSqlLogCatalog.removeAll(spark)
 

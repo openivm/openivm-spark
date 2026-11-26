@@ -1880,6 +1880,22 @@ private[commands] object MvCommandHelper {
       case Left(_)     => false
     }
 
+  /** Whether a successfully read catalog proves that no other MV consumes the MV
+    * named by `selfKeys` / `shortName`, either lexically through its source
+    * tables or through its persisted direct dependency map. A failed catalog read
+    * or an unreadable dependency map proves nothing. */
+  private[commands] def provenTerminalMv(
+      catalog: Option[Seq[MvMetadata]],
+      selfKeys: Set[String],
+      shortName: String
+  ): Boolean =
+    catalog.exists { all =>
+      all.filterNot(other => selfKeys.contains(metaName(other.name))).forall { other =>
+        !other.sourceTables.exists(_.split("\\.").last == shortName) &&
+        readMvDependencyMap(other.properties).exists(_.forall(dep => !selfKeys.contains(dep.key)))
+      }
+    }
+
   /** Resolve each ADVANCE request identifier by physical Delta identity and map
     * it to the RESOLVED operational alias of the persisted pinned source with the
     * exact same dataPath + metadata.id. External input is never suffix-matched:
@@ -5513,9 +5529,10 @@ case class RefreshMaterializedViewCommand(
       // and record_cascade trigger-key resolution).  A RocksDB prefix scan
       // each time costs 5-30 ms × 3 across heavy refresh programs.  Read once
       // and reuse.  Defensive try/catch matches the original call sites.
-      lazy val allMvsCached: Seq[MvMetadata] =
-        try MvCatalog.list(spark)
-        catch { case _: Throwable => Seq.empty[MvMetadata] }
+      lazy val allMvsSnapshot: Option[Seq[MvMetadata]] =
+        try Some(MvCatalog.list(spark))
+        catch { case _: Throwable => None }
+      lazy val allMvsCached: Seq[MvMetadata] = allMvsSnapshot.getOrElse(Seq.empty[MvMetadata])
 
       val collectedChangeBatches = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
         RefreshPerf.timePhase(refreshId, viewLabel, "collect_staging") {
@@ -6034,6 +6051,11 @@ case class RefreshMaterializedViewCommand(
           .toSet
       }
 
+      // Eliding an intercept cascade delta requires a successful catalog read
+      // that proves this MV has no consumer.
+      lazy val provenInterceptTerminal: Boolean =
+        provenTerminalMv(allMvsSnapshot, Set(metaName(name), metaName(meta.name)), name.identifier)
+
       // Base-table inserts are not sufficient to prove a view delta monotone:
       // an outer join can retract a NULL-padded row, and multi-source joins can
       // generate cross terms. Restrict insert-only aggregate compilation to the
@@ -6042,7 +6064,7 @@ case class RefreshMaterializedViewCommand(
       // whether the cascade delta must remain materialized. Intercept-mode
       // consumers read that delta from staging, so only a terminal MV qualifies.
       lazy val insertOnlyAggregateShapeCandidate: Boolean =
-        (!propagation.requiresDmlInterception || downstreamSourceKeysForThisMv.isEmpty) &&
+        (!propagation.requiresDmlInterception || provenInterceptTerminal) &&
           meta.refreshType == RefreshTypeCode.AggregateGroup &&
           meta.sourceTables.size == 1 &&
           !meta.queryHasJoin
@@ -6083,6 +6105,7 @@ case class RefreshMaterializedViewCommand(
           s"insert_only_aggregate=$insertOnlyAggregate;" +
           s"terminal_insert_only_aggregate=$terminalInsertOnlyAggregate;" +
           s"requires_dml_interception=${propagation.requiresDmlInterception};" +
+          s"proven_intercept_terminal=${propagation.requiresDmlInterception && provenInterceptTerminal};" +
           s"source_delta_shape=${sourceDeltaShape.toSeq.sortBy(_._1).mkString("|")};" +
           s"downstream_sources=${downstreamSourceKeysForThisMv.toSeq.sorted.mkString("|")}",
         0L
