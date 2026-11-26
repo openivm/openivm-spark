@@ -5159,14 +5159,14 @@ case class RefreshMaterializedViewCommand(
       // are already at their current version.
       lazy val sourceSnapshotWatermarks: Map[String, ChangeWatermark] =
         if (cdfChangeBatches.nonEmpty) {
-          val current = propagation.currentWatermarks(spark, changeFeedSources) ++
-            sourceWatermarks.filter { case (source, _) => frozenSources.contains(source.toLowerCase) }
           val changed = cdfChangeBatches
             .groupBy(_.baseTable)
             .map { case (source, batches) =>
               source -> ChangeWatermark.DeltaVersion(batches.map(_.startVersionExclusive).min)
             }
-          current ++ changed
+          val unchanged = changeFeedSources.filterNot(changed.contains)
+          propagation.currentWatermarks(spark, unchanged) ++
+            sourceWatermarks.filter { case (source, _) => frozenSources.contains(source.toLowerCase) } ++ changed
         } else {
           sourceWatermarks
         }
