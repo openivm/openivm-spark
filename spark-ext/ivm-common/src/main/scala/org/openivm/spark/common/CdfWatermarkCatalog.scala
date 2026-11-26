@@ -12,7 +12,6 @@ import org.openivm.spark.common.rocksdb.{
 import org.slf4j.LoggerFactory
 
 import java.nio.file.Files
-import java.util.concurrent.ConcurrentHashMap
 import scala.util.control.NonFatal
 
 /**
@@ -214,13 +213,21 @@ object CdfWatermarkCatalog {
     }
   }
 
-  private val committedVersions = new ConcurrentHashMap[String, CommittedWatermarks]()
-  private val committedLoads    = new ConcurrentHashMap[String, Object]()
+  /** Largest watermark table whose rows are shared between readers; a larger table is read per view, filtered by the
+    * backend, exactly as without sharing.
+    */
+  private val MaxSharedRows = 64
+  private val SharedRoots   = 32
+
+  private val committedVersions = new BoundedLruMap[String, CommittedWatermarks](SharedRoots)
+  private val committedLoads    = new BoundedLruMap[String, Object](SharedRoots)
+  private val largeRoots        = new BoundedLruMap[String, java.lang.Boolean](1024)
 
   /** The shared Delta watermark table at its latest committed version. Every call observes a listing of its own Delta
     * log that began after the call, so a commit by any driver is visible to the next read; concurrent reads of one log
     * share that listing, and the row scan is shared between reads of the same physical log, table id and version.
-    * `None` sends the caller down the backend path, which also creates a missing watermark table.
+    * `None` sends the caller down the backend path, which also creates a missing watermark table, and serves every
+    * table found to hold more than `MaxSharedRows` rows.
     */
   private def committed(spark: SparkSession): Option[CommittedWatermarks] =
     if (!FeatureGate.deltaCatalogEnabled(spark)) None
@@ -231,26 +238,35 @@ object CdfWatermarkCatalog {
         val logPath                          = log.logPath.toString
         def latest(): Option[(String, Long)] = DeltaLogRefreshes.refreshedVersion(path, log)
         def cached(key: (String, Long)): Option[CommittedWatermarks] =
-          Option(committedVersions.get(logPath)).filter(entry => entry.tableId == key._1 && entry.version == key._2)
-        latest().flatMap { key =>
-          cached(key).orElse {
-            committedLoads.computeIfAbsent(logPath, _ => new Object).synchronized {
-              cached(key).orElse(latest().map { current =>
-                cached(current).getOrElse {
-                  val rows = spark.read
-                    .format("delta")
-                    .load(path)
-                    .select("view_name", "source", "version")
-                    .collect()
-                    .map(row => (row.getString(0), row.getString(1), row.getLong(2)))
-                  val entry = new CommittedWatermarks(current._1, current._2, rows)
-                  if (latest().contains(current)) committedVersions.put(logPath, entry)
-                  entry
-                }
-              })
-            }
+          committedVersions.get(logPath).filter(entry => entry.tableId == key._1 && entry.version == key._2)
+        def load(current: (String, Long)): Option[CommittedWatermarks] = {
+          val rows = spark.read
+            .format("delta")
+            .load(path)
+            .select("view_name", "source", "version")
+            .limit(MaxSharedRows + 1)
+            .collect()
+            .map(row => (row.getString(0), row.getString(1), row.getLong(2)))
+          if (rows.length > MaxSharedRows) {
+            largeRoots.put(logPath, java.lang.Boolean.TRUE)
+            committedVersions.remove(logPath)
+            None
+          } else {
+            val entry = new CommittedWatermarks(current._1, current._2, rows)
+            if (latest().contains(current)) committedVersions.put(logPath, entry)
+            Some(entry)
           }
         }
+        if (largeRoots.get(logPath).isDefined) None
+        else
+          latest().flatMap { key =>
+            cached(key).orElse {
+              committedLoads.getOrCreate(logPath)(new Object).synchronized {
+                if (largeRoots.get(logPath).isDefined) None
+                else cached(key).orElse(latest().flatMap(current => cached(current).orElse(load(current))))
+              }
+            }
+          }
       } catch {
         case NonFatal(_) => None
       }

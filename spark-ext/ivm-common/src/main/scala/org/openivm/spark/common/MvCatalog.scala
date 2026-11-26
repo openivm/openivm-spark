@@ -1123,7 +1123,9 @@ object MvCatalog {
   def mvIdentity(meta: MvMetadata): String = RocksDbMvCatalogBackend.mvIdentity(meta)
 }
 
-/** Shares `DeltaLog.update()` listings of small Delta catalog tables between concurrent readers in this JVM. */
+/** Shares `DeltaLog.update()` listings of small Delta catalog tables between concurrent readers in this JVM. Records
+  * are kept for a bounded number of paths; a forgotten record or gate costs a listing and never changes a result.
+  */
 private[common] object DeltaLogRefreshes {
 
   /** The last listing of one resolved Delta log. It keeps only the table identity and version, and holds the log
@@ -1135,8 +1137,9 @@ private[common] object DeltaLogRefreshes {
       val key: Option[(String, Long)]
   )
 
-  private val gates     = new java.util.concurrent.ConcurrentHashMap[String, Object]()
-  private val refreshes = new java.util.concurrent.ConcurrentHashMap[String, LogRefresh]()
+  private val TrackedPaths = 64
+  private val gates        = new BoundedLruMap[String, Object](TrackedPaths)
+  private val refreshes    = new BoundedLruMap[String, LogRefresh](TrackedPaths)
 
   /** The table identity and version as listed by a `log.update()` of this same `DeltaLog` instance that began after
     * this request, or `None` when the table has no commit. Such a listing already includes every commit, by any
@@ -1146,8 +1149,9 @@ private[common] object DeltaLogRefreshes {
     */
   def refreshedVersion(path: String, log: DeltaLog): Option[(String, Long)] = {
     val requestedNs = System.nanoTime()
-    gates.computeIfAbsent(path, _ => new Object).synchronized {
-      Option(refreshes.get(path))
+    gates.getOrCreate(path)(new Object).synchronized {
+      refreshes
+        .get(path)
         .filter(refresh => (refresh.log.get() eq log) && refresh.startedNs - requestedNs > 0L)
         .map(_.key)
         .getOrElse {
@@ -1157,6 +1161,29 @@ private[common] object DeltaLogRefreshes {
           refreshes.put(path, new LogRefresh(new java.lang.ref.WeakReference(log), startedNs, key))
           key
         }
+    }
+  }
+}
+
+/** A map of at most `capacity` entries that forgets the least recently used entry first. It holds only sharing hints:
+  * a forgotten entry costs a repeated read and never changes a result.
+  */
+private[common] final class BoundedLruMap[K, V <: AnyRef](capacity: Int) {
+  private val entries = new java.util.LinkedHashMap[K, V](16, 0.75f, true) {
+    override def removeEldestEntry(eldest: java.util.Map.Entry[K, V]): Boolean = this.size() > capacity
+  }
+
+  def get(key: K): Option[V] = entries.synchronized(Option(entries.get(key)))
+
+  def put(key: K, value: V): Unit = entries.synchronized { entries.put(key, value); () }
+
+  def remove(key: K): Unit = entries.synchronized { entries.remove(key); () }
+
+  def getOrCreate(key: K)(create: => V): V = entries.synchronized {
+    Option(entries.get(key)).getOrElse {
+      val value = create
+      entries.put(key, value)
+      value
     }
   }
 }
