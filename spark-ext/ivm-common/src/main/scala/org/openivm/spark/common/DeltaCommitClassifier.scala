@@ -2,7 +2,7 @@ package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.delta.DeltaLog
-import org.apache.spark.sql.delta.actions.{Action, AddFile, CommitInfo, RemoveFile}
+import org.apache.spark.sql.delta.actions.{Action, AddCDCFile, AddFile, CommitInfo, Metadata, Protocol, RemoveFile}
 
 sealed trait BatchVerdict
 object BatchVerdict {
@@ -30,6 +30,9 @@ object DeltaShape {
 object DeltaCommitClassifier {
 
   import BatchVerdict._
+
+  private[spark] val CommitUserMetadataKey = "spark.databricks.delta.commitInfo.userMetadata"
+  private[spark] val WindowCdfCommit       = "openivm.window.refresh.cdf.v1"
 
   def latestVersion(spark: SparkSession, tableNameOrPath: String): Long = {
     val version = DeltaTableVersion.latest(spark, tableNameOrPath)
@@ -113,10 +116,19 @@ object DeltaCommitClassifier {
     val parameters = commitInfo.map(_.operationParameters).getOrElse(Map.empty[String, String])
 
     if (isReplace(operation, parameters)) {
-      // Full-target replaces invalidate incremental semantics across the full target.
-      // Predicate-scoped Delta replaceWhere commits still expose row-level CDF
-      // deletes/inserts for the affected predicate and are handled as mutating.
-      Replace
+      // A window refresh can be stored as a plain WRITE Overwrite even when
+      // Delta carries the row changes. Only admit our CDF writer's data-only
+      // transactions; the consumer separately checks CDF file availability.
+      val signedWindowWrite =
+        operation == "WRITE" &&
+          commitInfo.exists(_.userMetadata.contains(WindowCdfCommit)) &&
+          !actions.exists {
+            case _: Metadata | _: Protocol => true
+            case _                         => false
+          }
+      if (!signedWindowWrite) Replace
+      else if (hasNoDataChange(actions) && !actions.exists(_.isInstanceOf[AddCDCFile])) Noop
+      else Mutating
     } else if (isProvenInsertOnlyMerge(commitInfo, operation)) {
       // Delta MERGE rewrites can remove and re-add target files even when the
       // logical row effect is insert-only. Commit metrics capture that stronger

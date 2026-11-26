@@ -5533,12 +5533,14 @@ case class RefreshMaterializedViewCommand(
                   RetryPolicy.DeltaConflicts.executeWithAttempt { attempt =>
                     val t0 = System.nanoTime()
                     try {
-                      val df = spark.sql(fullRefreshSql)
-                      df.write
-                        .format("delta")
-                        .mode("overwrite")
-                        .option("replaceWhere", "true")
-                        .save(meta.location)
+                      withPlanTimeBroadcastDisabled {
+                        val df = spark.sql(fullRefreshSql)
+                        df.write
+                          .format("delta")
+                          .mode("overwrite")
+                          .option("replaceWhere", "true")
+                          .save(meta.location)
+                      }
                       OpenIvmMetrics.recordWriterMetricsUnavailable(kind)
                       val ms = (System.nanoTime() - t0) / 1000000L
                       sqlLog.record("full_refresh_stmt", qOrder, attempt - 1, kind, writerLog, ms)
@@ -5709,9 +5711,13 @@ case class RefreshMaterializedViewCommand(
         .forRefresh()
         .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
       val runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark)
+      // Terminal grouped aggregates need neither retract companions nor group snapshots.
+      val unconsumedCascade =
+        downstreamSourceKeysForThisMv.isEmpty &&
+          (meta.refreshType == RefreshTypeCode.AggregateGroup || meta.refreshType == RefreshTypeCode.AggregateHaving)
       val compileFacts = WorkloadFacts(
         // Delta CDF supplies pre/post images to downstream consumers of these grouped aggregates.
-        forceViewDeltaCascade = !insertOnlyAggregate,
+        forceViewDeltaCascade = !insertOnlyAggregate && !unconsumedCascade,
         assumeInsertOnly = insertOnlyAggregate ||
           (runningWindowIncremental && meta.refreshType == RefreshTypeCode.WindowPartition && batchInsertOnly),
         runningWindowIncremental = runningWindowIncremental,
@@ -5785,32 +5791,35 @@ case class RefreshMaterializedViewCommand(
           "compile",
           s"compile_cache_hit=$compileCacheHit compile_cache_tier=$compileCacheTier"
         ) {
-          cached.getOrElse {
+          val program = cached.getOrElse {
             val fresh = sessionCompiler.compiler.compile(compileRequest)
             if (reuseInSession) sessionCompiler.rememberRefresh(compileRequest, fresh)
-            if (compileCacheEnabled && fresh.sql.nonEmpty) {
-              val backfilled = refreshProperties ++
-                MvMetadata.compiledProperties(
-                  meta.sourceSchemaFingerprint,
-                  compileCacheTier,
-                  fresh.sql,
-                  fresh.initialLoadSql,
-                  fresh.refreshType,
-                  fresh.refreshTypeName
-                )
-              try {
-                MvCatalog.updateProperties(spark, name, backfilled)
-                refreshProperties = backfilled
-              } catch {
-                case NonFatal(t) =>
-                  logWarning(
-                    s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
-                      s"${t.getClass.getName}: ${t.getMessage}"
-                  )
-              }
-            }
             fresh
           }
+          // The in-memory cache can satisfy this refresh while the persisted
+          // generation is stale. Backfill from either source of valid SQL.
+          if (compileCacheEnabled && persisted.isEmpty && program.sql.nonEmpty) {
+            val backfilled = refreshProperties ++
+              MvMetadata.compiledProperties(
+                meta.sourceSchemaFingerprint,
+                compileCacheTier,
+                program.sql,
+                program.initialLoadSql,
+                program.refreshType,
+                program.refreshTypeName
+              )
+            try {
+              MvCatalog.updateProperties(spark, name, backfilled)
+              refreshProperties = backfilled
+            } catch {
+              case NonFatal(t) =>
+                logWarning(
+                  s"[openivm-mv] refresh view='${sqlIdent(name)}' compile_cache_backfill_failed: " +
+                    s"${t.getClass.getName}: ${t.getMessage}"
+                )
+            }
+          }
+          program
         }
       }
       if (
@@ -6365,6 +6374,17 @@ case class RefreshMaterializedViewCommand(
               val idx = stmtCounter.getAndIncrement()
               executeSqlAt(sql, idx)
             }
+            def executeCdfWindowWrite(sql: String, idx: Int): Unit = {
+              val key      = DeltaCommitClassifier.CommitUserMetadataKey
+              val previous = spark.conf.getOption(key)
+              spark.conf.set(key, DeltaCommitClassifier.WindowCdfCommit)
+              try executeSqlAt(sql, idx)
+              finally
+                previous match {
+                  case Some(value) => spark.conf.set(key, value)
+                  case None        => spark.conf.unset(key)
+                }
+            }
             def logSkippedStmt(stmtIdx: Int, kind: String): Unit = {
               advanceStmtCounterPast(stmtIdx)
               RefreshPerf.logStmt(refreshId, viewLabel, stmtIdx, kind, 0L)
@@ -6393,7 +6413,7 @@ case class RefreshMaterializedViewCommand(
             if (groupedWindowRefresh.nonEmpty) {
               val update = groupedWindowRefresh.get
               val select = update.register(); sourceSnapshotTempViews += update.temporaryView
-              executeSqlAt(
+              executeCdfWindowWrite(
                 s"INSERT INTO TABLE delta.`${meta.location.replace("`", "``")}` REPLACE WHERE true $select",
                 0
               )
@@ -7029,7 +7049,8 @@ case class RefreshMaterializedViewCommand(
                           "outcome='window_single_pass_replace'"
                       )
                       withPlanTimeBroadcastDisabled {
-                        executeSqlAt(plan.directSql, idx)
+                        if (propagation.requiresMvCdf) executeCdfWindowWrite(plan.directSql, idx)
+                        else executeSqlAt(plan.directSql, idx)
                       }
                   }
                 } else if (skipRedundantCdfWindowCascade) {
@@ -7178,7 +7199,10 @@ case class RefreshMaterializedViewCommand(
             // (added by openivm when the user query has no COUNT(*)) or the
             // user's COUNT(*) alias (extracted at CREATE time).
             if (isCountMonoid(meta.refreshType) && !insertOnlyAggregate) {
-              countMonoidColumn(spark, mergeTargetId, meta).foreach { col =>
+              // Keep the cleanup when the compiled program has no equivalent delete.
+              val programDeleted = (col: String) =>
+                EmptyGroupDelete.programDeletesEmptyGroups(rewritten.statements, mergeTargetId.table, col)
+              countMonoidColumn(spark, mergeTargetId, meta).filterNot(programDeleted).foreach { col =>
                 val q         = col.replace("`", "``")
                 val deleteSql = s"DELETE FROM ${sqlIdent(mergeTargetId)} WHERE `$q` = 0"
                 val idx       = stmtCounter.getAndIncrement()
