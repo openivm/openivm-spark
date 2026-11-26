@@ -1,0 +1,43 @@
+private[perf] final class R7WorkerOrderTasks extends org.apache.spark.scheduler.SparkListener {
+  import org.apache.spark.scheduler._
+
+  private val jobs = new ConcurrentLinkedQueue[Map[String, Any]]()
+  private val tasks = new ConcurrentLinkedQueue[Map[String, Any]]()
+  private val marker = "openivm.r7.workerOrder.listenerBarrier"
+  private val barrierJob = new java.util.concurrent.atomic.AtomicInteger(-1)
+  private val barrier = new CountDownLatch(1)
+
+  override def onJobStart(e: SparkListenerJobStart): Unit = {
+    val props = Option(e.properties)
+    if (props.exists(_.getProperty(marker) == "true")) barrierJob.set(e.jobId)
+    else {
+      jobs.add(Map("job" -> e.jobId, "stage_ids" -> e.stageIds.toList, "start_epoch_ms" -> e.time,
+        "request_id" -> props.flatMap(p => Option(p.getProperty("spark.jobGroup.id")))
+          .flatMap(s => "req_[a-f0-9]{32}".r.findFirstIn(s))))
+    }
+    ()
+  }
+
+  override def onJobEnd(e: SparkListenerJobEnd): Unit =
+    if (barrierJob.get() == e.jobId) barrier.countDown()
+
+  override def onTaskEnd(e: SparkListenerTaskEnd): Unit = {
+    val t = e.taskInfo
+    require(t != null, "Missing Spark task timing")
+    val m = Option(e.taskMetrics)
+    tasks.add(Map("task" -> t.taskId, "stage" -> e.stageId, "stage_attempt" -> e.stageAttemptId,
+      "start_epoch_ms" -> t.launchTime, "finish_epoch_ms" -> t.finishTime, "failed" -> t.failed, "killed" -> t.killed,
+      "run_ms" -> m.map(_.executorRunTime), "cpu_ns" -> m.map(_.executorCpuTime)))
+    ()
+  }
+
+  def drain(sc: org.apache.spark.SparkContext): Unit = {
+    val prev = sc.getLocalProperty(marker)
+    sc.setLocalProperty(marker, "true")
+    try sc.parallelize(Seq(0), 1).count()
+    finally sc.setLocalProperty(marker, prev)
+    require(barrier.await(60L, TimeUnit.SECONDS), "Listener marker did not complete")
+  }
+
+  def trace: Map[String, Any] = Map("jobs" -> jobs.asScala.toVector, "tasks" -> tasks.asScala.toVector)
+}
