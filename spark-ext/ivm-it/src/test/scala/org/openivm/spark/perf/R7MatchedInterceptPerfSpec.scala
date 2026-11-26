@@ -274,6 +274,7 @@ class R7MatchedInterceptPerfSpec extends IvmParitySpecBase("r7-matched-intercept
         "label"                        -> label,
         "head"                         -> StateGuardReport.headSha,
         "spark_version"                -> spark.version,
+        "runtime"                      -> R7WalkthroughCdfPerfSpec.runtimeIdentity,
         "target"                       -> StateGuardReport.sparkTarget,
         "master"                       -> spark.sparkContext.master,
         "store_analyzed_plan_for_view" -> spark.conf.get("spark.sql.legacy.storeAnalyzedPlanForView"),

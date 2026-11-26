@@ -88,6 +88,16 @@ private[perf] object R7WalkthroughCdfPerfSpec {
       key != FeatureGate.TelemetryCorrelationIdKey && key != FeatureGate.TelemetryPhaseKey
 
   def telemetryPins(all: Map[String, String]): Map[String, String] = all.filter { case (k, _) => isTelemetryPin(k) }
+
+  def runtimeIdentity: Map[String, String] = {
+    def jar(c: Class[_]): String = new File(c.getProtectionDomain.getCodeSource.getLocation.toURI).getName
+    Map(
+      "spark_core_jar" -> jar(classOf[org.apache.spark.SparkContext]),
+      "delta_jar"      -> jar(classOf[io.delta.tables.DeltaTable]),
+      "scala_jar"      -> jar(classOf[scala.Option[_]]),
+      "java_major"     -> System.getProperty("java.specification.version")
+    )
+  }
 }
 
 /** Primary R7 workload: the six-MV CDF parallel REFRESH from live walkthrough capture `b1d22ce2`.
@@ -538,13 +548,16 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
     views.foreach(v => spark.sql(s"DROP MATERIALIZED VIEW ${name(v)}").collect())
     val parallelCreate = create("parallel_events", "Concurrent CREATE — identical twin baseline")
 
-    val source         = name("parallel_events")
-    val confMode       = spark.conf.getOption(FeatureGate.ChangeFeedModeKey).getOrElse("<unset>")
-    val gateMode       = FeatureGate.changeFeedMode(spark).value
-    val sourceCdf      = cdfProperty(source)
-    val versionBefore  = deltaVersion(source)
-    val parallelInsert = insert("Equivalent parallel-arm insert", "parallel_events")
-    val versionAfter   = deltaVersion(source)
+    val source           = name("parallel_events")
+    val confMode         = spark.conf.getOption(FeatureGate.ChangeFeedModeKey).getOrElse("<unset>")
+    val gateMode         = FeatureGate.changeFeedMode(spark).value
+    val sourceCdf        = cdfProperty(source)
+    def sourceId: String = spark.sql(s"DESCRIBE DETAIL $source").head().getAs[String]("id")
+    val idBefore         = sourceId
+    val versionBefore    = deltaVersion(source)
+    val parallelInsert   = insert("Equivalent parallel-arm insert", "parallel_events")
+    val versionAfter     = deltaVersion(source)
+    val idAfter          = sourceId
     val (primary, fsOps, primaryQ, generationBefore, generationAfter) = refresh("Parallel REFRESH — six MVs", 6)
     val primaryVerify                                                 = verify("parallel_events")
 
@@ -558,7 +571,7 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
     }.toMap
     val watermarkProof = watermarks.values.forall(m => m.nonEmpty && m.values.forall(_ == versionAfter))
     val modeProof = confMode == "cdf" && gateMode == "cdf" && sourceCdf == "true" &&
-      versionAfter == versionBefore + 1L && watermarkProof
+      versionAfter == versionBefore + 1L && idBefore.nonEmpty && idBefore == idAfter && watermarkProof
 
     val ids       = primary.requests.map(_.requestId)
     val outcomes  = primary.requests.map(_.span.map(_.path("outcome").asText("")).getOrElse(""))
@@ -570,9 +583,17 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
     val requestErrors =
       (creates.toSeq :+ serial :+ primary).flatMap(_.requests.flatMap(_.errors)) ++
         serialInsert.errors ++ parallelInsert.errors
-    val drops = Seq("dropped_full", "dropped_oversized", "dropped_closed", "dropped_contended")
-      .map(k => primaryQ.getOrElse(k, 0L))
-      .sum
+    val queueHealthy = Seq(
+      "dropped_full",
+      "dropped_oversized",
+      "dropped_closed",
+      "dropped_contended",
+      "worker_failures",
+      "manifest_failures",
+      "export_failures",
+      "queued"
+    ).forall(k => primaryQ.get(k).contains(0L)) &&
+      primaryQ.get("accepted").exists(n => n > 0L && primaryQ.get("published").contains(n))
     val boundary = primary.requests.forall(r =>
       r.errors.isEmpty && r.drained && r.captureStatus == "complete" && r.span.nonEmpty && r.queryLog.nonEmpty
     )
@@ -586,13 +607,14 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
       "mode_proof"             -> modeProof,
       "durable_boundary"       -> boundary,
       "no_request_errors"      -> requestErrors.isEmpty,
-      "queue_no_drops"         -> (drops == 0L && primaryQ.getOrElse("export_failures", 0L) == 0L),
+      "queue_no_drops"         -> queueHealthy,
       "six_concurrent"         -> (concurrency(primary) == 6),
       "unique_request_ids"     -> (ids.distinct.size == 6),
       "modeled_latency_active" -> modeledActive,
       "state_sync_committed"   -> generationAfter.exists(a => generationBefore.forall(_ < a) && committedSnapshot(a))
     )
-    val events = queueEvents((serial.requests ++ primary.requests).map(_.requestId).toSet)
+    val captured = (creates.toSeq :+ serial :+ primary).flatMap(_.requests)
+    val events   = queueEvents(captured.map(_.requestId).toSet)
     val confKeys = Seq(
       FeatureGate.ChangeFeedModeKey,
       FeatureGate.CatalogBackendKey,
@@ -618,6 +640,7 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
         "head_sha"         -> StateGuardReport.headSha,
         "spark_target"     -> StateGuardReport.sparkTarget,
         "spark_version"    -> spark.version,
+        "runtime"          -> runtimeIdentity,
         "master"           -> spark.sparkContext.master,
         "capture_pins"     -> CapturePins,
         "insights_poll_ms" -> pollMs,
@@ -639,6 +662,8 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
           "feature_gate_mode"     -> gateMode,
           "source"                -> source,
           "source_cdf_property"   -> sourceCdf,
+          "source_id_before"      -> idBefore,
+          "source_id_after"       -> idAfter,
           "source_version_before" -> versionBefore,
           "source_version_after"  -> versionAfter,
           "cdf_watermarks"        -> watermarks
@@ -659,9 +684,9 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
           "state_sync_generation_after"  -> generationAfter
         ),
         "batches" -> Map(
-          "serial_create"    -> batchReport(creates.head, Vector.empty),
+          "serial_create"    -> batchReport(creates.head, events),
           "serial_refresh"   -> (batchReport(serial, events) ++ Map("fs_ops" -> serialFs, "queue_delta" -> serialQ)),
-          "parallel_create"  -> batchReport(creates(1), Vector.empty),
+          "parallel_create"  -> batchReport(creates(1), events),
           "parallel_refresh" -> batchReport(primary, events)
         ),
         "gates" -> gates,
@@ -684,6 +709,10 @@ class R7WalkthroughCdfPerfSpec extends IvmParitySpecBase("r7-walkthrough-cdf") w
       )
     )
     StateGuardReport.writeLines("r7-walkthrough-events.jsonl", events.map(n => mapper.writeValueAsString(n)))
+    StateGuardReport.writeLines(
+      "r7-walkthrough-spans.jsonl",
+      captured.flatMap(_.span).map(n => mapper.writeValueAsString(n))
+    )
 
     withClue(failures.take(10).mkString("; ")) {
       gates.filterNot(_._2).keys.toSeq.sorted shouldBe empty

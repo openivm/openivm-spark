@@ -1,0 +1,172 @@
+{
+  "schema": "openivm.r7-contract/v1",
+  "status": "proposed-for-d8-review",
+  "round": "R7",
+  "purpose": "Local, relative code A/B of OpenIVM-Spark candidates against deployed v2 on the user's six-MV walkthrough. It shortlists candidates for Fabric; it never accepts a release.",
+  "identities": {
+    "deployed_v2": "50fa4ceb2bfbe2419eb682503cfe20be2083f388",
+    "deployed_spark41_jar_sha256": "1c761fc6b818cb8510096cef7cfc23356aee9503d78905bac9df7d987cb7ae26",
+    "deployed_spark35_jar_sha256": "eefc78681e76e30efa069a8d1c4ec143ae598251769431dd2f2c48e91637205b",
+    "historical_evaluator": "742eac691301dae7ea285afcb881913ed917dd29",
+    "historical_lock_sha256": "ed4618eeedd1461f503958b1c31c6e935e14916e6328c993634cca2aa38770b1",
+    "historical_manifest_sha256": "65e5d847b7675eb1332c561d87f0e5914b32f9a224159d43cd86323eae268b0d",
+    "native": {
+      "source": "57b21876b866b2fa7176a3ad35246f4daf90287e",
+      "cli_sha256": "c41f957db5645d545a9caef430994cf262d24fad9297fef70c691395aadb43fb",
+      "extension_sha256": "55aa106dcc3904831a74edba91531e1cb579e62aceeee6c7afe63c88ceb1b05e"
+    }
+  },
+  "workloads": {
+    "primary": {
+      "workload_id": "primary:cdf-walkthrough-six-mv-insert",
+      "label": "PRIMARY - live six-MV CDF walkthrough",
+      "selector": "r7-primary",
+      "report": "r7-walkthrough-cdf.json",
+      "scored_metric": "primary.durable_ms",
+      "definition": "Captured notebook (capture b1d22ce2, definition e31177a9): parallel_events seeded, one INSERT, then six concurrent REFRESH MATERIALIZED VIEW concurrent_1..6 (SELECT symbol, COUNT(*), SUM(amount * k) GROUP BY symbol) in effective CDF mode. Durable completion = every request's INSIGHTS row and drained telemetry are visible."
+    },
+    "companion": {
+      "workload_id": "companion:matched-intercept-six-mv-insert",
+      "label": "COMPANION - matched intercept six-MV INSERT (never pooled with the primary)",
+      "selector": "r7-companion",
+      "report": "r7-matched-intercept.json",
+      "scored_metric": "makespan_ms",
+      "definition": "R6 matched-intercept shape: three seed rows, one three-row INSERT, six concurrent refreshes in intercept mode. Regression signal only; it can never qualify a CDF win."
+    }
+  },
+  "profiles": {
+    "default": {
+      "telemetry_conf": {},
+      "control_sha": "50fa4ceb2bfbe2419eb682503cfe20be2083f388",
+      "requires_ancestors": [],
+      "note": "Captured walkthrough settings (including queue enabled) on both arms, with additional R7 driver/task detail off; not the all-telemetry-disabled product default."
+    },
+    "task-metrics": {
+      "telemetry_conf": {
+        "spark.openivm.telemetry.taskMetrics.enabled": "true"
+      },
+      "control_sha": null,
+      "requires_ancestors": ["7791d7953bbb77fbbcfb74cba18edd7cc8e02de3"],
+      "note": "Frozen only when base-r2 exists; identical observer settings on both arms."
+    }
+  },
+  "expected": {
+    "capture_pins": {
+      "capture_helper_sha256": "db89d3990b13054090bda5a63837ea23f6340c9f9897a08f5779c60d540f0ae0",
+      "live_workload_capture_sha256": "b1d22ce297f33f63a04cb1fe505e8365eb1e524e1089db9acd38e58a8c5549b2",
+      "live_workload_definition_sha256": "e31177a9a13aba537f167d9bec6cb3ccbd81f0a0561fc96c58476bf50a9dafdb"
+    },
+    "primary_conf": {
+      "spark.openivm.catalog.backend": "delta",
+      "spark.openivm.changeFeed.mode": "cdf",
+      "spark.openivm.profile.refresh": "true",
+      "spark.openivm.queryLog.enabled": "true",
+      "spark.openivm.refresh.windowRunningIncremental.enabled": "true",
+      "spark.openivm.stateSync.async.enabled": "false",
+      "spark.openivm.telemetry.queue.capacity": "<unset>",
+      "spark.openivm.telemetry.queue.enabled": "true",
+      "spark.plugins": "org.openivm.spark.plugin.metrics.OpenIvmMetricsPlugin",
+      "spark.sql.session.timeZone": "UTC",
+      "spark.sql.shuffle.partitions": "4"
+    },
+    "latency_profile": {
+      "catalog_read_ms": 25,
+      "catalog_write_ms": 60,
+      "name": "object-store-modeled-v1",
+      "scale": 1.0,
+      "state_read_ms": 25,
+      "state_rename_ms": 80,
+      "state_write_ms": 60
+    },
+    "companion_latency": {
+      "catalog_read_ms": 25,
+      "catalog_write_ms": 60,
+      "name": "object-store-modeled-v1",
+      "scale": 1.0,
+      "state_read_ms": 25,
+      "state_rename_ms": 80,
+      "state_write_ms": 60
+    },
+    "insights_poll_ms": 1000,
+    "runtime": {
+      "spark-3.5": {"spark_core_jar":"spark-core_2.12-3.5.1.jar","delta_jar":"delta-spark_2.12-3.2.0.jar","scala_jar":"scala-library-2.12.17.jar","java_major":"17"},
+      "spark-4.1": {"spark_core_jar":"spark-core_2.13-4.1.0.jar","delta_jar":"delta-spark_4.1_2.13-4.2.0.jar","scala_jar":"scala-library-2.13.17.jar","java_major":"21"}
+    },
+    "required_gates": [
+      "durable_boundary",
+      "incremental_only",
+      "mode_proof",
+      "modeled_latency_active",
+      "no_request_errors",
+      "parity",
+      "queue_no_drops",
+      "six_concurrent",
+      "state_sync_committed",
+      "unique_request_ids"
+    ]
+  },
+  "shortlist": {
+    "min_pairs": 3,
+    "order": "alternating AB, BA, AB, ...; the control runs first in odd pairs",
+    "every_pair_positive": true,
+    "min_median_reduction_percent": 3.0,
+    "boundary": "inclusive, no rounding",
+    "metric": "per-pair 100 * (control - candidate) / control of the workload's scored_metric"
+  },
+  "native_rule": {
+    "evaluator": "experiments/darwin at 742eac69 (unchanged)",
+    "min_wait_reduction": 0.8,
+    "min_e2e": 0.1,
+    "min_pairs": 3,
+    "relation": "Separate and stricter. The R7 scorecard only passes a native decision through; it never overwrites accepted=false and never sets release acceptance."
+  },
+  "comparison_classes": {
+    "code-ab": "The only class this scorecard scores: different product commits, identical harness bytes, native binaries, observer settings and six workers on both arms.",
+    "observer-cost": "Same product commit, observer settings toggled. Reported separately; never subtracted from or added to a code-ab result.",
+    "config-sweep": "Same commit, product settings changed. Reported separately.",
+    "serial-vs-parallel": "Same-binary concurrency comparison inside one report. Never a code gain."
+  },
+  "exclusions": {
+    "post_hoc": "None. Every planned arm is scored or the series is invalid.",
+    "failed_arm": "Any failed, cancelled, wrong-target or gate-failing arm invalidates the whole series; later arms are recorded as not-run.",
+    "retest": "A retest is a new series with a new series id; the original series and its verdict are kept."
+  },
+  "coverage_limits": [
+    "Phase spans are nested and non-additive; a phase missing on any request is unavailable, never zero.",
+    "Command return is not durable completion; a candidate that only moves work after the return earns no credit.",
+    "awaitDrain return is not physical persistence; polling is never relabelled or subtracted as commit time.",
+    "Task telemetry does not observe callbacks that arrive after the last owner JobEnd; observer time excludes prefilters and identity checks and is not total overhead.",
+    "Local file:// storage with modeled catalog and state-sync latency is relative evidence only; it bounds neither OneLake/ABFSS I/O nor telemetry export cost."
+  ],
+  "permitted_product_names": [
+    "DeltaMvCatalogBackend.scala", "DeltaPathTable.scala", "MvCatalog.scala", "MvCatalogBackend.scala",
+    "MaterializedViewCommands.scala", "SparkRefreshRewriter.scala", "ChangePropagation.scala",
+    "InterceptChangePropagation.scala", "CdfChangePropagation.scala", "MvProjectionSource.scala",
+    "StagingDeltaView.scala", "StagingCatalog.scala", "CdfWatermarkCatalog.scala", "OpenIvmStateSync.scala",
+    "OpenIvmCompiler.scala", "OpenIvmCliLifecycle.java", "OpenIvmCliWorker.java"
+  ],
+  "historical_context": {
+    "cw_6333eb94": {
+      "reduction_percent": 35.535824,
+      "mode": "intercept (30/30 R6 config dumps)",
+      "use": "Historical intercept context only. Never a CDF control, never compounded with an R7 result."
+    }
+  },
+  "harness_paths": [
+    ".devcontainer",
+    "experiments/darwin-r7",
+    "nx.json",
+    "package-lock.json",
+    "package.json",
+    "spark-ext/.sbtopts",
+    "spark-ext/build.sbt",
+    "spark-ext/dev",
+    "spark-ext/ivm-extension/src/test/scala/org/openivm/spark/testkit",
+    "spark-ext/ivm-it/src/test/resources",
+    "spark-ext/ivm-it/src/test/scala/org/openivm/spark/parity/base",
+    "spark-ext/ivm-it/src/test/scala/org/openivm/spark/perf",
+    "spark-ext/project",
+    "spark-ext/project.json",
+    "tools"
+  ]
+}
