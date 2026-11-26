@@ -7,7 +7,7 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.storage.StorageLevel
 import org.openivm.spark.commands.CommandConcurrencyInjection
-import org.openivm.spark.common.RefreshSqlLogCatalog
+import org.openivm.spark.common.{RefreshSqlLogAsyncFlusher, RefreshSqlLogCatalog}
 import org.openivm.spark.parity.base.{CdfMode, InterceptMode, IvmParityMode, IvmParitySpecBase}
 import org.openivm.spark.parser.IvmParser
 
@@ -25,20 +25,47 @@ object R7CleanupProbe {
   val drops: mutable.ArrayBuffer[String]                    = mutable.ArrayBuffer.empty
   val trackers: mutable.LinkedHashSet[QueryPlanningTracker] = mutable.LinkedHashSet.empty
   var track: Boolean                                        = false
+  var trackExplicitUncache: Boolean                         = false
+  var observedAlias: Option[String]                         = None
+  var observedIdentifiers: Int                              = 0
   private val dropPattern = """(?is)^\s*DROP\s+VIEW\s+IF\s+EXISTS\s+`?(openivm_delta_\w+)`?\s*;?\s*$""".r
 
   def inUncache: Boolean =
     Thread.currentThread().getStackTrace.exists(_.getMethodName == "uncacheTable")
 
-  def checkIdentifier(name: String): Unit =
+  def analysisCoverage: (Int, Option[Long]) = {
+    val intervals = trackers.toVector
+      .flatMap(_.phases.get(QueryPlanningTracker.ANALYSIS))
+      .map(p => (p.startTimeMs, p.endTimeMs))
+      .sortBy(_._1)
+    var coveredUntil = Long.MinValue
+    var unionMs      = 0L
+    intervals.foreach { case (from, to) =>
+      unionMs += math.max(0L, to - math.max(from, coveredUntil))
+      coveredUntil = math.max(coveredUntil, to)
+    }
+    (intervals.size, if (intervals.nonEmpty) Some(unionMs) else None)
+  }
+
+  def checkIdentifier(name: String): Unit = {
+    if (armed && observedAlias.contains(name) && inUncache) {
+      observedIdentifiers += 1
+      trackExplicitUncache = true
+      R7CleanupFs.active = true
+    }
     if (armed && failUncache && name.startsWith("openivm_delta_") && inUncache) {
       uncacheFailures += 1
       throw new IllegalStateException("r7 injected explicit uncache failure")
     }
+  }
 
   def checkDrop(sql: String): Unit = if (armed) {
     sql match {
       case dropPattern(name) =>
+        if (observedAlias.contains(name)) {
+          trackExplicitUncache = false
+          R7CleanupFs.active = false
+        }
         drops += name
         if (failDrop(name)) throw new IllegalStateException(s"r7 injected DROP failure: $name")
       case _ => ()
@@ -55,6 +82,9 @@ object R7CleanupProbe {
     drops.clear()
     trackers.clear()
     track = false
+    trackExplicitUncache = false
+    observedAlias = None
+    observedIdentifiers = 0
   }
 }
 
@@ -79,7 +109,7 @@ class R7CleanupProbeExtensions extends (SparkSessionExtensions => Unit) {
     extensions.injectResolutionRule(_ =>
       new Rule[LogicalPlan] {
         override def apply(plan: LogicalPlan): LogicalPlan = {
-          if (R7CleanupProbe.track)
+          if (R7CleanupProbe.track || (R7CleanupProbe.trackExplicitUncache && R7CleanupProbe.inUncache))
             QueryPlanningTracker.get.foreach(R7CleanupProbe.trackers.add)
           if (R7CleanupProbe.armed && R7CleanupProbe.failAnalysis && R7CleanupProbe.inUncache) {
             R7CleanupProbe.analysisFailures += 1
@@ -96,7 +126,9 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
   self: IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] = Map(
-    "spark.openivm.queryLog.enabled" -> "true",
+    "spark.openivm.queryLog.enabled"          -> "true",
+    "spark.hadoop.fs.file.impl"               -> classOf[R7CleanupFs].getName,
+    "spark.hadoop.fs.file.impl.disable.cache" -> "true",
     "spark.sql.extensions" ->
       ("io.delta.sql.DeltaSparkSessionExtension,org.openivm.spark.OpenIvmSparkExtensions," +
         "org.openivm.spark.parity.R7CleanupProbeExtensions")
@@ -186,10 +218,18 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
   }
 
   private def assertLogged(mv: String, aliases: Set[String]): Unit = {
+    val immediate = RefreshSqlLogCatalog
+      .scanAll(spark)
+      .filter(r => r.viewName.split("\\.").last == mv && r.category == "drop_cleanup")
+    val missing = aliases.filterNot(alias => immediate.exists(_.sqlText.contains(alias)))
+    RefreshSqlLogAsyncFlusher.awaitQuiescence(30000L) shouldBe true
     val rows       = RefreshSqlLogCatalog.scanAll(spark).filter(_.viewName.split("\\.").last == mv)
     val registered = rows.filter(_.category == "register_source_delta")
     registered.nonEmpty shouldBe true
     val cleanup = rows.filter(_.category == "drop_cleanup")
+    emit(
+      s"log-drain\t$modeLabel\t$mv\tmissing_immediate=${missing.toSeq.sorted.mkString(",")}\tpost_drain_rows=${cleanup.size}"
+    )
     aliases.foreach(alias => cleanup.exists(_.sqlText.contains(alias)) shouldBe true)
     rows.exists(_.category == "full_refresh_stmt") shouldBe false
     cleanup.foreach(r =>
@@ -215,17 +255,32 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
           val view    = session.sessionState.catalog.getTempView(s"openivm_delta_$table").get
           executionSession = Some(session)
           emit(s"view\t$modeLabel\t${view.desc.viewText.isDefined}\t${view.child.nodeName}")
+          R7CleanupFs.deltaLogCalls = 0
+          R7CleanupFs.uncacheStackCalls = 0
+          R7CleanupProbe.observedAlias = Some(s"openivm_delta_$table")
           R7CleanupProbe.armed = true
         } {
           refreshMv(mv)
         }
         R7CleanupProbe.armed = false
+        R7CleanupProbe.trackExplicitUncache = false
+        R7CleanupFs.active = false
+        val (phases, unionMs) = R7CleanupProbe.analysisCoverage
+        val identifiers       = R7CleanupProbe.observedIdentifiers
+        emit(
+          s"actual-uncache-analysis\t$modeLabel\t$mv\tidentifier_entries=$identifiers\tphase_count=$phases\tanalysis_union_ms=${unionMs
+              .fold("unavailable")(_.toString)}\tuncache_stack_delta_log_api_calls=${R7CleanupFs.uncacheStackCalls}"
+        )
+        if (candidate) identifiers shouldBe 0 else identifiers should be > 0
         executionSession.isDefined shouldBe true
         R7CleanupProbe.drops.toSet should contain(s"openivm_delta_$table")
         executionSession.get.sessionState.catalog.getTempView(s"openivm_delta_$table").isEmpty shouldBe true
         assertLogged(mv, Set(s"openivm_delta_$table"))
         assertMvCorrect(mv, body)
-      } finally R7CleanupProbe.reset()
+      } finally {
+        R7CleanupFs.active = false
+        R7CleanupProbe.reset()
+      }
     }
 
     it("removes the cached actual alias and its still-live dependent cache") {
@@ -391,6 +446,37 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
         finish(caches)
         sibling.sql(s"DROP VIEW IF EXISTS $alias")
         sibling.sql(s"DROP VIEW IF EXISTS $sentinel")
+      }
+    }
+
+    it("preserves cached data behind an independently defined same-name view in another session") {
+      val (table, mv, body) = fixture("same_name_cache")
+      val sibling           = spark.newSession()
+      val alias             = s"openivm_delta_$table"
+      sibling.sql(s"CREATE TEMP VIEW $alias AS SELECT 771 AS k, 19 AS v")
+      sibling.catalog.cacheTable(alias, StorageLevel.DISK_ONLY)
+      val siblingData = sibling.table(alias)
+      siblingData.count()
+      siblingData.storageLevel shouldBe StorageLevel.DISK_ONLY
+      var caches = Seq.empty[CachedAlias]
+      try {
+        CommandConcurrencyInjection.withBeforeRefreshFinalize {
+          caches = Seq(cacheAlias(table))
+          R7CleanupProbe.armed = true
+        } {
+          refreshMv(mv)
+        }
+        R7CleanupProbe.armed = false
+        caches.size shouldBe 1
+        caches.foreach(assertUncached)
+        sibling.table(alias).collect().map(row => (row.getInt(0), row.getInt(1))).toSeq shouldBe Seq(771 -> 19)
+        emit(s"sibling-cache\t$modeLabel\t$mv\t${siblingData.storageLevel}")
+        siblingData.storageLevel shouldBe StorageLevel.DISK_ONLY
+        assertLogged(mv, caches.map(_.name).toSet)
+        assertMvCorrect(mv, body)
+      } finally {
+        finish(caches)
+        sibling.sql(s"DROP VIEW IF EXISTS $alias")
       }
     }
   }
