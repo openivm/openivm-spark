@@ -126,6 +126,7 @@ abstract class R7CleanupSafetyScenarios extends IvmParitySpecBase("r7-cleanup-sa
   self: IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] = Map(
+    "spark.openivm.telemetry.deep.enabled"    -> "true",
     "spark.openivm.queryLog.enabled"          -> "true",
     "spark.hadoop.fs.file.impl"               -> classOf[R7CleanupFs].getName,
     "spark.hadoop.fs.file.impl.disable.cache" -> "true",
