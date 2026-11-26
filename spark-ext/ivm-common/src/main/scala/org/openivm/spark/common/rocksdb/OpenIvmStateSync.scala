@@ -3,7 +3,7 @@ package org.openivm.spark.common.rocksdb
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.FeatureGate
+import org.openivm.spark.common.{DeltaGroupCommit, FeatureGate}
 import org.openivm.spark.telemetry.{BoundedTelemetryRuntime, OpenIvmExecutionSpan}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 import org.slf4j.LoggerFactory
@@ -31,7 +31,9 @@ import scala.util.control.NonFatal
  *     and downloads the remote tree if the local tree is absent/empty.
  *   - [[backupNow]] synchronously publishes a complete immutable generation.
  *     Concurrent requests share a pass only if they arrived before its request
- *     barrier. Failed or interrupted uploads never overwrite earlier snapshots.
+ *     barrier; a refresh leading a legacy pass may hold that barrier open for a
+ *     bounded time while other ready refreshes are still on their way to it.
+ *     Failed or interrupted uploads never overwrite earlier snapshots.
  *   - [[backupAsync]] coalesces background requests through the same serialized
  *     generation publisher. Legacy flat-layout snapshots remain readable.
  */
@@ -44,6 +46,10 @@ private[rocksdb] final case class StateSyncPhaseStart(
 
 object OpenIvmStateSync {
   private val log = LoggerFactory.getLogger(getClass)
+
+  private val InitialSynchronousPassNanos  = 1000000000L
+  private val MaxSynchronousCollectNanos   = 5000000000L
+  private val SynchronousCollectPollMillis = 5L
 
   private[rocksdb] final case class BackupStateSnapshot(running: Boolean, requested: Boolean)
 
@@ -134,8 +140,31 @@ object OpenIvmStateSync {
     private var candidateRunning    = false
     private var submittedRequests   = 0L
     private var publishedCoverage   = Option.empty[PublishedCoverage]
+    private val arrivedRefreshes    = new java.util.HashSet[AnyRef]()
+    private var passNanos           = InitialSynchronousPassNanos
 
     def synchronousRequestCount: Long = synchronousMonitor.synchronized(submittedRequests)
+
+    /** Holding the monitor as the next pass's leader, waits for ready refreshes that have not reached this state yet.
+      * With `k` requests queued, `m` refreshes awaited and a typical pass taking `C`, a refresh that misses the pass
+      * waits up to `2C` instead of `C`, so the leader waits at most `C * m / (k + m)`. False if interrupted.
+      */
+    private def collectReadyRefreshes(): Boolean = {
+      val start = System.nanoTime()
+      var open  = true
+      while (open) {
+        val awaited = DeltaGroupCommit.unseenReadyRefreshes(arrivedRefreshes)
+        val budget =
+          if (awaited <= 0) 0L
+          else math.min(passNanos, MaxSynchronousCollectNanos) * awaited / (synchronousRequests.size + awaited)
+        val remaining = start + budget - System.nanoTime()
+        if (remaining <= 0) open = false
+        else
+          try synchronousMonitor.wait(math.max(1L, math.min(remaining / 1000000L, SynchronousCollectPollMillis)))
+          catch { case _: InterruptedException => return false }
+      }
+      true
+    }
 
     def candidateIdle: Boolean = synchronousMonitor.synchronized(candidateRequests.isEmpty && !candidateRunning)
 
@@ -149,11 +178,15 @@ object OpenIvmStateSync {
     }
 
     def backupSynchronous(request: BackupRequest)(pass: Seq[BackupRequest] => Unit): Unit = {
-      val completion = new CompletableFuture[Unit]()
-      val submitted  = SynchronousRequest(request, completion)
+      val completion         = new CompletableFuture[Unit]()
+      val submitted          = SynchronousRequest(request, completion)
+      val refresh            = DeltaGroupCommit.currentRefresh()
+      var collectInterrupted = false
       synchronousMonitor.synchronized {
         submittedRequests += 1L
         synchronousRequests += submitted
+        refresh.foreach(arrivedRefreshes.add)
+        synchronousMonitor.notifyAll()
       }
       try {
         while (!completion.isDone) {
@@ -161,6 +194,7 @@ object OpenIvmStateSync {
             if (completion.isDone) Vector.empty[SynchronousRequest]
             else if (!synchronousRunning) {
               synchronousRunning = true
+              if (refresh.isDefined && !collectReadyRefreshes()) collectInterrupted = true
               val captured = synchronousRequests.toVector
               synchronousRequests.clear()
               captured
@@ -171,10 +205,12 @@ object OpenIvmStateSync {
           }
           if (batch.nonEmpty) {
             var failure: Throwable = null
+            val started            = System.nanoTime()
             try pass(batch.map(_.request))
             catch { case error: Throwable => failure = error }
             finally
               synchronousMonitor.synchronized {
+                if (failure == null) passNanos = (3 * passNanos + (System.nanoTime() - started)) / 4
                 batch.foreach { waiting =>
                   if (failure == null) waiting.completion.complete(())
                   else waiting.completion.completeExceptionally(failure)
@@ -184,6 +220,7 @@ object OpenIvmStateSync {
               }
           }
         }
+        if (collectInterrupted) Thread.currentThread().interrupt()
         try completion.get()
         catch { case error: java.util.concurrent.ExecutionException => throw error.getCause }
       } catch {
