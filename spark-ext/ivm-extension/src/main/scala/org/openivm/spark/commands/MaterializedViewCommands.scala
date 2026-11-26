@@ -4877,14 +4877,11 @@ case class RefreshMaterializedViewCommand(
           SourceChangeLedger.reconcile(spark, changeFeedSources)
         }
 
-      // Phase D: memoize MvCatalog.list within this refresh.  The catalog is
-      // read in three places (schema_resolve, hasNoDownstreamConsumer probe,
-      // and record_cascade trigger-key resolution).  A RocksDB prefix scan
-      // each time costs 5-30 ms × 3 across heavy refresh programs.  Read once
-      // and reuse.  Defensive try/catch matches the original call sites.
-      lazy val allMvsCached: Seq[MvMetadata] =
-        try MvCatalog.list(spark)
-        catch { case _: Throwable => Seq.empty[MvMetadata] }
+      // Reuse one catalog listing for schema resolution and cascade decisions.
+      lazy val allMvsListing: Option[Seq[MvMetadata]] =
+        try Some(MvCatalog.list(spark))
+        catch { case NonFatal(_) => None }
+      lazy val allMvsCached: Seq[MvMetadata] = allMvsListing.getOrElse(Seq.empty)
 
       val collectedChangeBatches = profile.timeStep("metadata_pre_sql", "phase=collect_staging") {
         RefreshPerf.timePhase(refreshId, viewLabel, "collect_staging") {
@@ -5718,9 +5715,9 @@ case class RefreshMaterializedViewCommand(
         .forRefresh()
         .discover(spark, meta.sourceTables, resolvedSourceSchemas = currentSourceSchemas)
       val runningWindowIncremental = FeatureGate.windowRunningIncrementalEnabled(spark)
-      // Terminal grouped aggregates need neither retract companions nor group snapshots.
+      // Skip cascade rows only when the catalog confirms there are no consumers.
       val unconsumedCascade =
-        downstreamSourceKeysForThisMv.isEmpty &&
+        allMvsListing.isDefined && downstreamSourceKeysForThisMv.isEmpty &&
           (meta.refreshType == RefreshTypeCode.AggregateGroup || meta.refreshType == RefreshTypeCode.AggregateHaving)
       val compileFacts = WorkloadFacts(
         // Delta CDF supplies pre/post images to downstream consumers of these grouped aggregates.
