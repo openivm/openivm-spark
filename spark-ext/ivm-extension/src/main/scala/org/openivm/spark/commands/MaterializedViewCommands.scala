@@ -7668,19 +7668,23 @@ case class RefreshMaterializedViewCommand(
     if (predicate.length > WindowReplaceMaxPredicateBytes) None else Some(predicate)
   }
 
+  private def cdfRows(spark: SparkSession, source: String, batches: Seq[CdfChangeBatch]): DataFrame =
+    MvProjectionSource.read(
+      spark,
+      source,
+      Map(
+        "readChangeFeed"  -> "true",
+        "startingVersion" -> (batches.map(_.startVersionExclusive).min + 1L).toString,
+        "endingVersion"   -> batches.map(_.endVersionInclusive).max.toString
+      )
+    )
+
   private def cdfBatchesContainOnlyInserts(spark: SparkSession, batches: Seq[CdfChangeBatch]): Boolean =
     try {
       batches
         .groupBy(_.baseTable)
         .forall { case (source, sourceBatches) =>
-          val startVersion = sourceBatches.map(_.startVersionExclusive).min + 1L
-          val endVersion   = sourceBatches.map(_.endVersionInclusive).max
-          spark.read
-            .format("delta")
-            .option("readChangeFeed", "true")
-            .option("startingVersion", startVersion)
-            .option("endingVersion", endVersion)
-            .table(source)
+          cdfRows(spark, source, sourceBatches)
             .filter("_change_type IS NULL OR _change_type <> 'insert'")
             .head(1)
             .isEmpty
@@ -7699,15 +7703,8 @@ case class RefreshMaterializedViewCommand(
           val sourceSchema = spark.table(source).schema
           if (sourceSchema.isEmpty || !sourceSchema.forall(field => RowOrdering.isOrderable(field.dataType))) true
           else {
-            val startVersion  = sourceBatches.map(_.startVersionExclusive).min + 1L
-            val endVersion    = sourceBatches.map(_.endVersionInclusive).max
             val sourceColumns = sourceSchema.fieldNames.toSeq.map(col)
-            val signed = spark.read
-              .format("delta")
-              .option("readChangeFeed", "true")
-              .option("startingVersion", startVersion)
-              .option("endingVersion", endVersion)
-              .table(source)
+            val signed = cdfRows(spark, source, sourceBatches)
               .filter(col("_change_type").isin("insert", "delete", "update_preimage", "update_postimage"))
               .select(
                 sourceColumns :+ when(col("_change_type").isin("insert", "update_postimage"), lit(1L))
