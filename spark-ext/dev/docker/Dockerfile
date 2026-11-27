@@ -34,7 +34,7 @@ FROM ubuntu:22.04@sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f76
 
 ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
 ARG OPENIVM_REPO
-ARG OPENIVM_BRANCH=mdrakiburrahman/late-append-key-trim-main
+ARG OPENIVM_BRANCH=main
 ARG OPENIVM_COMMIT
 ARG LPTS_REPO
 ARG LPTS_BRANCH=main
