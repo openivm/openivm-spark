@@ -1304,7 +1304,7 @@ object SparkRefreshRewriter {
   }
 
   /** Reuse the parsed join sites after collecting their bounded delta keys. */
-  def planRegularNtermPruning(sql: String): RegularNtermPruning = {
+  private[spark] def planRegularNtermPruning(sql: String): RegularNtermPruning = {
     val ctes =
       if ("(?is)\\bVERSION\\s+AS\\s+OF\\b".r.findFirstIn(sql).isDefined) parseLeadingCtes(sql)
       else Seq.empty
@@ -1314,10 +1314,13 @@ object SparkRefreshRewriter {
   def regularNtermKeyRequests(sql: String): Seq[RegularNtermKeyRequest] =
     planRegularNtermPruning(sql).requests
 
-  def pruneRegularNtermWithLiteralKeys(sql: String, literals: Map[RegularNtermKeyRequest, Seq[String]]): String =
-    if (literals.isEmpty) sql else planRegularNtermPruning(sql).withLiteralKeys(literals)
+  def pruneRegularNtermWithLiteralKeys(
+      sql: String,
+      literalsByRequest: Map[RegularNtermKeyRequest, Seq[String]]
+  ): String =
+    if (literalsByRequest.isEmpty) sql else planRegularNtermPruning(sql).withLiteralKeys(literalsByRequest)
 
-  final class RegularNtermPruning private[SparkRefreshRewriter] (
+  private[spark] final class RegularNtermPruning private[SparkRefreshRewriter] (
       sql: String,
       ctes: Seq[ParsedCte],
       sites: Seq[RegularNtermPruneSite]
