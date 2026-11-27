@@ -1,0 +1,26 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "openivm-telemetry-html",
+  "projectType": "library",
+  "root": "tools/openivm-telemetry-html",
+  "sourceRoot": "tools/openivm-telemetry-html/openivm_telemetry_html",
+  "targets": {
+    "test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "cwd": "tools/openivm-telemetry-html",
+        "command": "python3 -B -m unittest discover -s tests -t ."
+      }
+    },
+    "package": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "outputs": ["{projectRoot}/dist"],
+      "options": {
+        "cwd": "tools/openivm-telemetry-html",
+        "command": "python3 -m pip wheel --no-deps --no-build-isolation --wheel-dir dist ."
+      }
+    }
+  }
+}

@@ -91,6 +91,9 @@ both local artifacts are durably stored**. It removes this request's export
 index/metadata, not the cumulative legacy SHOW log. Unfinished/busy releases
 fail explicitly; missing/already-released requests are an idempotent no-op.
 
+[`openivm-telemetry-html`](../../tools/openivm-telemetry-html/README.md) renders
+the exported records, with the operation's phase spans, as a notebook HTML report.
+
 All retention settings below use the `spark.openivm.queryLog.export.` prefix
 and are read from SparkContext configuration at the application's first `begin`:
 
