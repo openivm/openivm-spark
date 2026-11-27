@@ -344,6 +344,24 @@ private[openivm] object OpenIvmStateBarrier {
     }
   }
 
+  // Inspection takes the root before any registry slot/native mutex, sharing
+  // the scan deadline rather than entering the ordinary unbounded read wait.
+  private[rocksdb] def withDbInspection[A](dbPath: String, budget: OpenIvmMetadataSnapshot.Budget)(
+      body: => Either[String, A]
+  ): Either[String, A] =
+    if (checkpointWorkerPath.get() != null) withDbOperation(dbPath)(body)
+    else {
+      val state = forDbPath(dbPath)
+      if (state == null) body
+      else {
+        val lock = state.lock.readLock()
+        if (!lock.tryLock(budget.remainingNanos, TimeUnit.NANOSECONDS)) Left("busy")
+        else
+          try body
+          finally lock.unlock()
+      }
+    }
+
   private[openivm] def withDbMutation[A](dbPath: String)(body: => A): A = {
     if (checkpointWorkerPath.get() != null)
       throw new IllegalStateException("Checkpoint worker attempted to mutate database state")

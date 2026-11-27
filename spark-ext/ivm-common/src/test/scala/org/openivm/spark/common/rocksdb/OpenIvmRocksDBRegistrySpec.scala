@@ -402,6 +402,84 @@ class OpenIvmRocksDBRegistrySpec extends AnyFunSpec with BeforeAndAfterEach with
       OpenIvmRocksDBRegistry.close(dir.getAbsolutePath)
     }
 
+    it("snapshot API waits for the checkpoint root without holding the registry slot") {
+      val spark       = newSpark("registry-snapshot-checkpoint-order")
+      val root        = newDir("snapshot-checkpoint-order").getCanonicalFile.toPath
+      val path        = root.resolve("rocksdb").toString
+      val destination = newDir("snapshot-checkpoint-copy").toPath.resolve("rocksdb")
+      val db          = OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta"))
+      db.withBatch(batch => db.put(batch, "meta", RocksDBCodec.utf8("key"), RocksDBCodec.utf8("value")))
+      db.setAfterRawOpenHookForTesting(() => fail("snapshot reopened RocksDB"))
+      val started = new CountDownLatch(1)
+      withPool(1) { ec =>
+        var inspecting = Option.empty[Future[JsonNode]]
+        try {
+          OpenIvmStateBarrier.withCaptureRootForTesting(root) {
+            inspecting = Some(Future {
+              started.countDown()
+              snapshot(spark, path, 5000L)
+            }(ec))
+            awaitLatch(started, "inspection attempted during checkpoint capture")
+            waitUntil(2.seconds)(OpenIvmStateBarrier.captureQueuedForTesting(root))
+            // Probe the checkpoint's slot acquisition with a budget, so the old
+            // lock inversion fails deterministically instead of wedging the JVM.
+            withClue("checkpoint root owner cannot lease the registry slot: ") {
+              snapshot(spark, path).path("available").asBoolean() shouldBe true
+            }
+            OpenIvmStateBarrier.withRootForTesting(root) {
+              OpenIvmStateBarrier.captureDatabases(spark, Vector(path -> destination), reuse = false)
+            }
+            Files.isRegularFile(destination.resolve("CURRENT")) shouldBe true
+          }
+          val result = Await.result(inspecting.get, RegistryRaceTimeout)
+          result.path("available").asBoolean() shouldBe true
+          result.path("version").asLong() shouldBe 1L
+          RocksDBCodec.fromUtf8(capturedRows(result, "meta")("key")) shouldBe "value"
+        } finally {
+          inspecting.foreach(Await.ready(_, RegistryRaceTimeout))
+          db.setAfterRawOpenHookForTesting(() => ())
+        }
+      }
+    }
+
+    it("snapshot API bounds registry and direct inspection waits at the checkpoint root") {
+      val spark   = newSpark("registry-snapshot-checkpoint-timeout")
+      val root    = newDir("snapshot-checkpoint-timeout").getCanonicalFile.toPath
+      val path    = root.resolve("rocksdb").toString
+      val db      = OpenIvmRocksDBRegistry.getOrOpen(spark, path, Seq("meta"))
+      val entered = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      db.setAfterRawOpenHookForTesting(() => fail("snapshot reopened RocksDB"))
+      withPool(3) { ec =>
+        val capturing = Future {
+          OpenIvmStateBarrier.withCaptureRootForTesting(root) {
+            entered.countDown()
+            awaitLatch(release, "checkpoint root release")
+          }
+        }(ec)
+        try {
+          awaitLatch(entered, "checkpoint root acquired")
+          val registry = Future(snapshot(spark, path, 50L))(ec)
+          val direct = Future {
+            db.captureMetadataIfOpen(new OpenIvmMetadataSnapshot.Budget(8192, 8L * 1024 * 1024, 50L))
+          }(ec)
+          try {
+            assertUnavailable(Await.result(registry, 2.seconds), "busy")
+            Await.result(direct, 2.seconds) shouldBe Left("busy")
+          } finally {
+            release.countDown()
+            Await.ready(registry, RegistryRaceTimeout)
+            Await.ready(direct, RegistryRaceTimeout)
+          }
+        } finally {
+          release.countDown()
+          Await.result(capturing, RegistryRaceTimeout)
+          db.setAfterRawOpenHookForTesting(() => ())
+        }
+      }
+      snapshot(spark, path).path("available").asBoolean() shouldBe true
+    }
+
     it("snapshot API returns no partial metadata when the scan budget expires") {
       val spark = newSpark("registry-snapshot-timeout")
       val dir   = newDir("snapshot-timeout")

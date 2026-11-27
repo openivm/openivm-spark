@@ -346,7 +346,10 @@ object OpenIvmRocksDBRegistry {
       else {
         val slot = entries.get(canonicalPath)
         if (slot == null) Left("absent")
-        else slot.captureMetadataIfOpen(spark.sparkContext.applicationId, budget)
+        else
+          OpenIvmStateBarrier.withDbInspection(canonicalPath, budget) {
+            slot.captureMetadataIfOpen(spark.sparkContext.applicationId, budget)
+          }
       }
     canonicalPath -> result
   }

@@ -997,6 +997,13 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     */
   private[rocksdb] def captureMetadataIfOpen(
       budget: OpenIvmMetadataSnapshot.Budget
+  ): Either[String, OpenIvmMetadataSnapshot.Captured] =
+    OpenIvmStateBarrier.withDbInspection(normalizedDbPath, budget) {
+      captureMetadataUnderBarrier(budget)
+    }
+
+  private def captureMetadataUnderBarrier(
+      budget: OpenIvmMetadataSnapshot.Budget
   ): Either[String, OpenIvmMetadataSnapshot.Captured] = {
     import OpenIvmMetadataSnapshot.{Captured, Entry, Unavailable}
     if (!writeMutex.tryLock(budget.remainingNanos, TimeUnit.NANOSECONDS))
