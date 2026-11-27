@@ -4461,6 +4461,10 @@ object SparkRefreshRewriter {
     }
   }
 
+  // Native scalar programs prefix the already-quoted output name: d_`days`,
+  // not `d_days`. Treat that compiler token as one alias until it is inlined.
+  private val ScalarDeltaAliasToken = """(?:d_)?(?:`(?:``|[^`])*`|"(?:[^"]|"")*"|\w+)"""
+
   /** Inline the `WITH openivm_delta AS (<cte>) UPDATE` pattern into a plain UPDATE.
     *
     * Finds `WITH openivm_delta AS (` in `stmt`, paren-matches the CTE body, builds
@@ -4479,23 +4483,23 @@ object SparkRefreshRewriter {
         val cteBody    = stmt.substring(openParenIdx + 1, closeParenIdx).trim
         val updatePart = stmt.substring(closeParenIdx + 1).trim
         val aliasMap   = parseCteSelectAliases(cteBody)
-        val refRe      = """(?i)\(\s*SELECT\s+(\w+)\s+FROM\s+openivm_delta\s*\)""".r
+        val refRe      = ("""(?i)\(\s*SELECT\s+(""" + ScalarDeltaAliasToken + """)\s+FROM\s+openivm_delta\s*\)""").r
         refRe.replaceAllIn(
           updatePart,
           mm => {
-            val alias = mm.group(1).toUpperCase
-            aliasMap.get(alias) match {
-              case None => mm.matched
-              case Some(expr) =>
-                java.util.regex.Matcher.quoteReplacement(s"(SELECT $expr FROM $deltaRef)")
-            }
+            val alias = mm.group(1).toUpperCase(java.util.Locale.ROOT)
+            val replacement = aliasMap
+              .get(alias)
+              .map(expr => s"(SELECT $expr FROM $deltaRef)")
+              .getOrElse(mm.matched)
+            java.util.regex.Matcher.quoteReplacement(replacement)
           }
         )
     }
   }
 
   /** Find the index of the `)` that closes the `(` at `openIdx`, respecting
-    * nesting and single-quoted string literals (with `''` as escape).
+    * nesting, string literals and delimited identifiers with doubled escapes.
     * Returns -1 if not found.
     */
   private def findMatchingCloseParen(s: String, openIdx: Int): Int = {
@@ -4503,6 +4507,8 @@ object SparkRefreshRewriter {
     var i     = openIdx
     while (i < s.length) {
       s(i) match {
+        case '`' => i = skipDelimited(s, i, '`')
+        case '"' => i = skipDelimited(s, i, '"')
         case '\'' =>
           i += 1
           var done = false
@@ -4536,20 +4542,19 @@ object SparkRefreshRewriter {
     * → Map("D_TOTAL" → "SUM(openivm_multiplicity * total)")
     */
   private def parseCteSelectAliases(cteBody: String): Map[String, String] = {
-    val upper       = cteBody.toUpperCase.trim
-    val selectStart = if (upper.startsWith("SELECT")) 6 else return Map.empty
+    val selectStart = if (startsWithSqlKeyword(cteBody, 0, "SELECT")) 6 else return Map.empty
 
     var depth   = 0
     var fromIdx = -1
     var i       = selectStart
-    while (i < upper.length && fromIdx < 0) {
-      upper(i) match {
-        case '(' => depth += 1; i += 1
-        case ')' => depth -= 1; i += 1
-        case 'F'
-            if depth == 0 && i + 4 <= upper.length &&
-              upper.substring(i, i + 4) == "FROM" &&
-              (i + 4 >= upper.length || upper(i + 4).isWhitespace) =>
+    while (i < cteBody.length && fromIdx < 0) {
+      cteBody(i) match {
+        case '\'' => i = skipSingleQuoted(cteBody, i)
+        case '`'  => i = skipDelimited(cteBody, i, '`')
+        case '"'  => i = skipDelimited(cteBody, i, '"')
+        case '('  => depth += 1; i += 1
+        case ')'  => depth -= 1; i += 1
+        case _ if depth == 0 && startsWithSqlKeyword(cteBody, i, "FROM") =>
           fromIdx = i
         case _ => i += 1
       }
@@ -4559,11 +4564,11 @@ object SparkRefreshRewriter {
       if (fromIdx > 0) cteBody.substring(selectStart, fromIdx).trim
       else cteBody.substring(selectStart).trim
 
-    splitSelectList(selectList).flatMap { item =>
+    splitTopLevelCsv(selectList).flatMap { item =>
       val trimmed = item.trim
-      val asRe    = """(?i)\s+AS\s+(\w+)\s*$""".r
+      val asRe    = ("""(?i)\s+AS\s+(""" + ScalarDeltaAliasToken + """)\s*$""").r
       asRe.findFirstMatchIn(trimmed).map { m =>
-        m.group(1).toUpperCase -> trimmed.substring(0, m.start).trim
+        m.group(1).toUpperCase(java.util.Locale.ROOT) -> trimmed.substring(0, m.start).trim
       }
     }.toMap
   }

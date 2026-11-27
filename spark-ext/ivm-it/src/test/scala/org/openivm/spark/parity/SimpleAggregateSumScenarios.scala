@@ -2,6 +2,8 @@ package org.openivm.spark.parity
 
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
+import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
+
 /** Additive-monoid slice of the SIMPLE_AGGREGATE parity coverage (SUM, COUNT,
   * AVG, STDDEV, STDDEV_POP, VARIANCE / VAR_POP). See
   * [[SimpleAggregateMinMaxSpec]] for MIN/MAX, empty-table, NULL-handling and
@@ -9,6 +11,69 @@ import org.openivm.spark.parity.base.IvmParitySpecBase
   */
 abstract class SimpleAggregateSumScenarios extends IvmParitySpecBase("simple-aggregate-sum") {
   self: org.openivm.spark.parity.base.IvmParityMode =>
+
+  describe("quoted scalar aggregate aliases") {
+    it("refreshes SUM and COUNT named days directly from the source") {
+      sql("CREATE TABLE sa_quoted_src(id INT, amount INT) USING DELTA")
+      sql("INSERT INTO sa_quoted_src VALUES (1, 10), (2, 20), (3, NULL)")
+      val body = "SELECT SUM(amount) AS n, COUNT(*) AS days, COUNT(amount) AS MiXeD FROM sa_quoted_src"
+      sql(s"CREATE MATERIALIZED VIEW sa_quoted_mv AS $body")
+
+      def check(): Unit = {
+        val id = spark.sessionState.sqlParser.parseTableIdentifier("sa_quoted_mv")
+        MvCatalog.lookup(spark, id).get.refreshType shouldBe RefreshTypeCode.SimpleAggregate
+        assertMvCorrect("sa_quoted_mv", body)
+      }
+
+      check()
+      sql("INSERT INTO sa_quoted_src VALUES (4, 30), (5, NULL)")
+      refreshMv("sa_quoted_mv")
+      check()
+      sql("UPDATE sa_quoted_src SET amount = 15 WHERE id = 1")
+      sql("DELETE FROM sa_quoted_src WHERE id = 2")
+      refreshMv("sa_quoted_mv")
+      check()
+      refreshMv("sa_quoted_mv")
+      check()
+    }
+
+    it("refreshes SUM and COUNT named days through a WINDOW_PARTITION cascade") {
+      sql("CREATE TABLE sa_quoted_chain_src(id INT, grp STRING, amount INT) USING DELTA")
+      sql("INSERT INTO sa_quoted_chain_src VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30)")
+      val parentBody =
+        "SELECT id, grp, SUM(amount) OVER (PARTITION BY grp) AS num_records FROM sa_quoted_chain_src"
+      val childBody = "SELECT SUM(num_records) AS n, COUNT(*) AS days FROM sa_quoted_parent"
+      sql(s"CREATE MATERIALIZED VIEW sa_quoted_parent AS $parentBody")
+      sql(s"CREATE MATERIALIZED VIEW sa_quoted_child AS $childBody")
+
+      def check(): Unit = {
+        val parentId = spark.sessionState.sqlParser.parseTableIdentifier("sa_quoted_parent")
+        val childId  = spark.sessionState.sqlParser.parseTableIdentifier("sa_quoted_child")
+        MvCatalog.lookup(spark, parentId).get.refreshType shouldBe RefreshTypeCode.WindowPartition
+        MvCatalog.lookup(spark, childId).get.refreshType shouldBe RefreshTypeCode.SimpleAggregate
+        assertMvCorrect("sa_quoted_parent", parentBody)
+        assertMvCorrect(
+          "sa_quoted_child",
+          s"SELECT SUM(num_records) AS n, COUNT(*) AS days FROM ($parentBody) expected"
+        )
+      }
+
+      check()
+      sql("INSERT INTO sa_quoted_chain_src VALUES (4, 'a', 40), (5, 'c', NULL)")
+      refreshMv("sa_quoted_parent")
+      assertMvCorrect("sa_quoted_parent", parentBody)
+      refreshMv("sa_quoted_child")
+      check()
+      sql("UPDATE sa_quoted_chain_src SET amount = 25 WHERE id = 2")
+      sql("DELETE FROM sa_quoted_chain_src WHERE id = 3")
+      refreshMv("sa_quoted_parent")
+      refreshMv("sa_quoted_child")
+      check()
+      refreshMv("sa_quoted_parent")
+      refreshMv("sa_quoted_child")
+      check()
+    }
+  }
 
   // ── (1) SUM scalar aggregate ───────────────────────────────────────────────
 

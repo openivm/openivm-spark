@@ -31,6 +31,44 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
   private val mvLocation      = "dbfs:/delta/mv_r"
   private val viewDeltaPath   = "dbfs:/delta/_tmp/mv_r_delta_uuid"
 
+  describe("scalar aggregate CTE aliases") {
+    it("inlines the native prefixed quoted COUNT alias alongside SUM") {
+      val sql =
+        """WITH openivm_delta AS (
+          |SELECT SUM(openivm_multiplicity * n) AS d_n,
+          |SUM(openivm_multiplicity * `days`) AS d_`days`
+          |FROM openivm_delta_mv_r)
+          |UPDATE openivm_data_mv_r SET
+          |n = COALESCE(n, 0) + COALESCE((SELECT d_n FROM openivm_delta), 0),
+          |`days` = COALESCE(`days`, 0) + COALESCE((SELECT d_`days` FROM openivm_delta), 0);""".stripMargin
+      val rewritten = SparkRefreshRewriter
+        .rewrite(sql, mvName, mvLocation, viewLogicalName, Map.empty, viewDeltaPath)
+        .statements
+        .mkString("\n")
+      rewritten should include(s"(SELECT SUM(openivm_multiplicity * n) FROM delta.`$viewDeltaPath`)")
+      rewritten should include(s"(SELECT SUM(openivm_multiplicity * `days`) FROM delta.`$viewDeltaPath`)")
+      rewritten should not include "FROM openivm_delta"
+      rewritten should not include "d_`days`"
+    }
+
+    it("preserves escaped, mixed-case and delimited scalar alias tokens") {
+      for (
+        column <- Seq("MiXeD", "`from value`", "`a,b)`", "`a``b$`", "\"a\"\"b$\"");
+        alias  <- Seq(s"d_$column", s"`d_${column.replace("`", "``")}`")
+      ) {
+        val expression = s"SUM(openivm_multiplicity * $column)"
+        val sql =
+          s"""WITH openivm_delta AS (SELECT $expression AS $alias FROM openivm_delta_mv_r)
+             |UPDATE openivm_data_mv_r SET $column = COALESCE((SELECT $alias FROM openivm_delta), 0);""".stripMargin
+        val rewritten = SparkRefreshRewriter
+          .rewrite(sql, mvName, mvLocation, viewLogicalName, Map.empty, viewDeltaPath)
+          .statements
+          .mkString("\n")
+        rewritten shouldBe s"UPDATE `mydb`.`mv_r` SET $column = COALESCE((SELECT $expression FROM delta.`$viewDeltaPath`), 0)"
+      }
+    }
+  }
+
   describe("current native source and outer-join contracts") {
     it("preserves source-column exclusion in affected-key reconstruction UNIONs") {
       val input = """CREATE OR REPLACE TEMP TABLE openivm_affected_mv_r AS
