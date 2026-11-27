@@ -35,7 +35,7 @@ Commands:
   test-inventory [sbt-args] Write the selected target's discovered tests.
   compare-test-inventory    Compare Spark 3.5 and Spark 4.1 inventories.
   assembly [sbt-args]       Build the ivmExtension assembly JAR.
-  verify [sbt-args]         pins-sync, lint, compile, inventory, assembly, test.
+  verify [sbt-args]         pins-sync, native-pin check, lint, compile, inventory, assembly, test.
   verify-all [sbt-args]     Verify both targets and compare inventories.
   window-benchmark          Run the WindowNoopWriteHarness micro-benchmark.
   state-guard-perf          Run the opt-in state-guard concurrent-refresh perf and crash-recovery suite.
@@ -322,6 +322,7 @@ cmd_assembly() {
 cmd_verify() {
     cmd_pins_sync
     prepare_sbt 1
+    bash "$SCRIPT_DIR/verify-native.sh"
     setup_test_log_dir
     run_sbt "$@" \
         ivmExtension/clean \

@@ -59,10 +59,14 @@ jobs:
       - name: Synchronize candidate image reference
         run: npx --no-install nx run devcontainer:tag -- --update-consumer
 
-      - name: Build, test, and publish immutable image
+      - name: Build, validate runtime and Metals import, and publish immutable image
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx --no-install nx run devcontainer:publish
+
+      - name: Remove smoke containers
+        if: always()
+        run: npx --no-install nx run devcontainer:cleanup
 
       - name: Remove registry credentials
         if: always()

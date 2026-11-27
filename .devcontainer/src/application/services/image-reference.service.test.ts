@@ -302,6 +302,7 @@ test('Spark workspace is flattened and pins the IDE JDKs', () => {
     '**/.bloop/**': true,
     '**/.metals/**': true,
     '**/target/**': true,
+    '**/target': true,
   });
 });
 

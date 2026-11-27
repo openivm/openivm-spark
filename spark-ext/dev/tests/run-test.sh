@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+unset OPENIVM_CLI_PATH OPENIVM_EXTENSION_PATH OPENIVM_SPARK_TARGET TARGET \
+    OPENIVM_JAVA_HOME_SPARK_35 OPENIVM_JAVA_HOME_SPARK_41 \
+    OPENIVM_TEST_LOG_ROOT OPENIVM_TEST_FORKS
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEV_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -62,7 +65,7 @@ EOF
 
 cat >"$WORK_DIR/native/duckdb" <<'EOF'
 #!/usr/bin/env bash
-exit 0
+printf '%s\n' "${DIRECT_RUNNER_NATIVE_VERSION:-${OPENIVM_COMMIT:0:10}}"
 EOF
 : >"$WORK_DIR/native/openivm.duckdb_extension"
 : >"$WORK_DIR/openivm-source/Makefile"
@@ -103,6 +106,22 @@ grep -Fqx "native_dir=$WORK_DIR/native" "$CAPTURE.env"
 grep -Fq -- "-Dopenivm.test.forks=3" "$CAPTURE.env"
 grep -Fq -- "-Dopenivm.test.log.dir=$WORK_DIR/logs/test-20261001-152913" "$CAPTURE.env"
 [[ -d "$WORK_DIR/logs/test-20261001-152913" ]]
+
+for native_version in deadbee invalid; do
+    set +e
+    OPENIVM_JAVA_HOME_SPARK_35="$WORK_DIR/jdk" \
+    OPENIVM_SBT_BIN="$WORK_DIR/bin/sbt" \
+    OPENIVM_NATIVE_DIR="$WORK_DIR/native" \
+    DIRECT_RUNNER_CAPTURE="$WORK_DIR/native-mismatch" \
+    DIRECT_RUNNER_NATIVE_VERSION="$native_version" \
+        "$RUNNER" --target spark-3.5 --skip-pins-sync verify \
+        >"$WORK_DIR/native-mismatch.stdout" 2>"$WORK_DIR/native-mismatch.stderr"
+    native_rc=$?
+    set -e
+    [[ "$native_rc" -eq 1 ]]
+    [[ ! -e "$WORK_DIR/native-mismatch.args" ]]
+    grep -Fq "pins.env requires" "$WORK_DIR/native-mismatch.stderr"
+done
 
 OPENIVM_JAVA_HOME_SPARK_35="$WORK_DIR/jdk" \
 OPENIVM_SBT_BIN="$WORK_DIR/bin/sbt" \

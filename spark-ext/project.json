@@ -5,6 +5,14 @@
   "root": "spark-ext",
   "sourceRoot": "spark-ext",
   "targets": {
+    "tooling-test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "cwd": "spark-ext",
+        "command": "bash dev/tests/run-test.sh"
+      }
+    },
     "fmt": {
       "executor": "nx:run-commands",
       "cache": false,

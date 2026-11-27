@@ -2,7 +2,7 @@ name: gci
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, exp/generated-action-ownership]
   workflow_dispatch:
 
 concurrency:
@@ -20,9 +20,6 @@ jobs:
     timeout-minutes: 350
     container:
       image: ghcr.io/openivm/openivm-spark-devcontainer:b7ad83c26be4fd4ebff3ba8056030ab8810980415470475ae8efe6ebc5fdbd99
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -50,18 +47,6 @@ jobs:
           python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes \
             --target "$py4j_dir" -r "spark-ext/dev/requirements-py4j-$SPARK_TARGET.txt"
           printf 'PYTHONPATH=%s%s\n' "$py4j_dir" "${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
-
-      - name: Verify native compiler matches the source pin
-        shell: bash
-        run: |
-          set -euo pipefail
-          source spark-ext/dev/pins.env
-          actual="$("$OPENIVM_CLI_PATH" -init /dev/null -unsigned -noheader -csv -c "LOAD '$OPENIVM_EXTENSION_PATH'; SELECT extension_version FROM duckdb_extensions() WHERE extension_name='openivm';")"
-          if [[ ! "$actual" =~ ^[0-9a-f]{7,40}$ || "$OPENIVM_COMMIT" != "$actual"* ]]; then
-            echo "Native compiler mismatch: image has $actual; pins.env requires $OPENIVM_COMMIT. Rebuild the devcontainer image."
-            exit 1
-          fi
-          echo "Native compiler matches source pin: $actual"
 
       - name: Verify
         run: >-
@@ -98,9 +83,6 @@ jobs:
     runs-on: [self-hosted, openivm-spark-azure]
     container:
       image: ghcr.io/openivm/openivm-spark-devcontainer:b7ad83c26be4fd4ebff3ba8056030ab8810980415470475ae8efe6ebc5fdbd99
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
