@@ -137,6 +137,23 @@ class SparkExpressionPrepassSpec extends AnyFlatSpec with Matchers {
     }
   }
 
+  it should "reject unsafe descendants inside native marker inputs" in {
+    val inputs = Seq(
+      "custom_fn(s)"                   -> "Unsupported function",
+      "app.custom_fn(s)"               -> "Unsupported function",
+      "CAST(rand() AS STRING)"         -> "Unsupported function",
+      "(SELECT max(s) FROM other_src)" -> "Unsupported subquery"
+    )
+    inputs.foreach { case (input, message) =>
+      withClue(input) {
+        val error = intercept[IllegalArgumentException] {
+          SparkExpressionPrepass.prepare(s"SELECT lower(reverse($input)) FROM src", caseSensitive = false)
+        }
+        error.getMessage should include(message)
+      }
+    }
+  }
+
   it should "preserve monitoring expression shapes through native initial-load compilation" in {
     val cli       = sys.env("OPENIVM_CLI_PATH")
     val extension = sys.env("OPENIVM_EXTENSION_PATH")

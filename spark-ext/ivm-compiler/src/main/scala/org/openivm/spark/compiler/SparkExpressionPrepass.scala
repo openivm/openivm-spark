@@ -5,7 +5,13 @@ import java.util.Locale
 
 import scala.collection.mutable
 
-import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedFunction, UnresolvedStar}
+import org.apache.spark.sql.catalyst.FunctionIdentifier
+import org.apache.spark.sql.catalyst.analysis.{
+  FunctionRegistry,
+  UnresolvedAttribute,
+  UnresolvedFunction,
+  UnresolvedStar
+}
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
   CaseWhen,
@@ -393,8 +399,10 @@ private[spark] object SparkExpressionPrepass {
         }
       case _ =>
         target(expr) match {
-          case Some(result) => targets += ((expr, result, scope))
-          case None         => expr.children.foreach(child => expressions(child, scope))
+          case Some(result) =>
+            targets += ((expr, result, scope))
+            expr.children.foreach(child => expressions(child, scope))
+          case None => expr.children.foreach(child => expressions(child, scope))
         }
     }
 
@@ -421,21 +429,68 @@ private[spark] object SparkExpressionPrepass {
       }
     }
     val encodedExpressions = mutable.Map.empty[(Int, String, ResultType, Vector[String]), (Expression, String)]
-    val replacements = uniqueTargets.toSeq
-      .map { case (span, (expr, result, scope)) =>
-        val arguments = mutable.ArrayBuffer.empty[String]
-        val body      = template(sql, expr, span, arguments, caseSensitive)
-        val inputs    = if (arguments.isEmpty) Seq("0") else arguments.toSeq
-        val key       = (scope, sql.substring(span.start, span.end), result, inputs.toVector)
-        val encoded = encodedExpressions.get(key) match {
-          case Some((previous, existing)) if expr.semanticEquals(previous) => existing
-          case _ =>
-            val created = markers.encode(inputs, result)(args => body(args))
-            encodedExpressions.update(key, expr -> created)
-            created
-        }
-        span -> encoded
+    val orderedTargets     = uniqueTargets.toSeq.sortBy { case (span, _) => (span.start, -span.end) }
+
+    def validateNativeInput(expr: Expression): Unit = {
+      expr match {
+        case function: UnresolvedFunction =>
+          if (function.nameParts.size != 1)
+            throw new IllegalArgumentException("Unsupported function inside Spark expression marker")
+          val name = FunctionIdentifier(function.nameParts.head)
+          if (
+            !FunctionRegistry.builtin.functionExists(name) ||
+            !FunctionRegistry.builtin.lookupFunction(name, function.arguments).deterministic
+          )
+            throw new IllegalArgumentException("Unsupported function inside Spark expression marker")
+        case _: SubqueryExpression =>
+          throw new IllegalArgumentException("Unsupported subquery inside Spark expression marker")
+        case _ =>
       }
+      expr.children.foreach(validateNativeInput)
+    }
+
+    def nativeInput(expr: Expression): String = {
+      validateNativeInput(expr)
+      renderTargets(expressionSpan(sql, expr), includeRoot = false)
+    }
+
+    def encode(span: Span, expr: Expression, result: ResultType, scope: Int): String = {
+      val arguments = mutable.ArrayBuffer.empty[String]
+      val body      = template(sql, expr, span, arguments, caseSensitive, nativeInput)
+      val inputs    = if (arguments.isEmpty) Seq("0") else arguments.toSeq
+      val key       = (scope, sql.substring(span.start, span.end), result, inputs.toVector)
+      encodedExpressions.get(key) match {
+        case Some((previous, existing)) if expr.semanticEquals(previous) => existing
+        case _ =>
+          val created = markers.encode(inputs, result)(args => body(args))
+          encodedExpressions.update(key, expr -> created)
+          created
+      }
+    }
+
+    // Native inputs retain their scalar/aggregate structure; only their Spark-specific descendants are opaque.
+    def renderTargets(span: Span, includeRoot: Boolean): String = {
+      val output = new StringBuilder
+      var cursor = span.start
+      orderedTargets.foreach { case (location, (expr, result, scope)) =>
+        if (location.start >= cursor && location.end <= span.end && (includeRoot || location != span)) {
+          output ++= sql.substring(cursor, location.start)
+          output ++= encode(location, expr, result, scope)
+          cursor = location.end
+        }
+      }
+      output ++= sql.substring(cursor, span.end)
+      output.toString
+    }
+
+    val replacements = mutable.ArrayBuffer.empty[(Span, String)]
+    var targetEnd    = 0
+    orderedTargets.foreach { case (span, (expr, result, scope)) =>
+      if (span.start >= targetEnd) {
+        replacements += span -> encode(span, expr, result, scope)
+        targetEnd = span.end
+      }
+    }
     val generatorEdits = generators
       .groupBy { case (explode, _) => expressionSpan(sql, explode) }
       .toSeq
@@ -445,7 +500,7 @@ private[spark] object SparkExpressionPrepass {
         val bounds = sequence.arguments.take(2).map { arg =>
           val span      = expressionSpan(sql, arg)
           val arguments = mutable.ArrayBuffer.empty[String]
-          val body      = template(sql, arg, span, arguments, caseSensitive)
+          val body      = template(sql, arg, span, arguments, caseSensitive, nativeInput)
           markers.encode(arguments.toSeq, DateBound)(body)
         }
         expressionSpan(sql, explode) ->
@@ -494,7 +549,8 @@ private[spark] object SparkExpressionPrepass {
       expr: Expression,
       span: Span,
       arguments: mutable.ArrayBuffer[String],
-      caseSensitive: Boolean
+      caseSensitive: Boolean,
+      nativeInput: Expression => String
   ): Seq[String] => String = {
     val edits = mutable.ArrayBuffer.empty[Edit]
     def visit(node: Expression): Unit = node match {
@@ -546,7 +602,7 @@ private[spark] object SparkExpressionPrepass {
             case other        => other
           }
           val valueSpan = expressionSpan(sql, inner)
-          template(sql, inner, valueSpan, arguments, caseSensitive)
+          template(sql, inner, valueSpan, arguments, caseSensitive, nativeInput)
         }
         edits += Edit(
           location,
@@ -557,9 +613,18 @@ private[spark] object SparkExpressionPrepass {
         if (
           f.nameParts.size != 1 || !allowedFunctions.contains(f.nameParts.head.toLowerCase(Locale.ROOT)) ||
           f.isDistinct || f.filter.nonEmpty || f.ignoreNulls
-        )
-          throw new IllegalArgumentException("Unsupported function inside Spark expression marker")
-        f.children.foreach(visit)
+        ) {
+          val location = expressionSpan(sql, f)
+          val value    = nativeInput(f)
+          val existing = arguments.indexOf(value)
+          val index =
+            if (existing >= 0) existing
+            else {
+              arguments += value
+              arguments.size - 1
+            }
+          edits += Edit(location, args => s"(${args(index)})")
+        } else f.children.foreach(visit)
       case other =>
         val name = other.getClass.getSimpleName
         if (!allowedNodes.contains(name))
