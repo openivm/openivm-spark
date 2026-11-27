@@ -3095,7 +3095,8 @@ case class CreateMaterializedViewCommand(
     ifNotExists: Boolean,
     provider: Option[String],
     originalQueryText: String,
-    clusterColumns: Seq[String] = Seq.empty
+    clusterColumns: Seq[String] = Seq.empty,
+    publicOutputs: PublicOutputNames = PublicOutputNames.Empty
 ) extends LeafRunnableCommand {
 
   override def run(spark: SparkSession): Seq[Row] = {
@@ -3188,12 +3189,24 @@ case class CreateMaterializedViewCommand(
             try {
               CommandConcurrencyInjection.maybePauseBeforeCreate()
               DriverHeavyOperationAdmission.withPermit(spark, "create") {
-                val create =
+                val qualified =
                   if (
                     name.database.isEmpty && MvCatalog.lookupForRelation(isolated, name).isEmpty &&
                     MvCatalog.lookupStored(isolated, TableIdentifier(name.table)).isDefined
                   ) copy(name = MvCatalog.qualifiedName(isolated, name))
                   else this
+                // Reserved `openivm_` user aliases compile and persist under physical names;
+                // the public view restores the user's names.
+                val create =
+                  if (qualified.publicOutputs.nonEmpty) qualified
+                  else
+                    PublicOutputNames.plan(isolated, qualified.originalQueryText).fold(qualified) { mapped =>
+                      qualified.copy(
+                        originalQueryText = mapped.physicalSql,
+                        clusterColumns = qualified.clusterColumns.map(mapped.names.physical),
+                        publicOutputs = mapped.names
+                      )
+                    }
                 create.runCreate(
                   isolated,
                   profile,
@@ -3693,10 +3706,13 @@ case class CreateMaterializedViewCommand(
     val topKViewSuffix =
       if (effectiveRefreshType != RefreshTypeCode.FullRefresh) topKViewSpec.suffixSql else None
     val requiresCasePreservingView =
-      analyzed.output.exists(column => column.name != column.name.toLowerCase(java.util.Locale.ROOT)) &&
-        !catalogPreservesColumnCase(spark)
+      analyzed.output.exists { column =>
+        val public = publicOutputs.publicName(column.name)
+        public != public.toLowerCase(java.util.Locale.ROOT)
+      } && !catalogPreservesColumnCase(spark)
     val usesBackingDataTable =
-      isHavingViewIncremental || topKViewSuffix.nonEmpty || requiresPublicProjection || requiresCasePreservingView
+      isHavingViewIncremental || topKViewSuffix.nonEmpty || requiresPublicProjection ||
+        requiresCasePreservingView || publicOutputs.nonEmpty
     val dataIdent: TableIdentifier =
       if (usesBackingDataTable) dataTableId(name) else name
     // A managed lakehouse catalog (Fabric) ignores the `LOCATION` clause and
@@ -3882,7 +3898,8 @@ case class CreateMaterializedViewCommand(
     val allProps =
       userProps ++ baseProps ++ countProp ++ havingProp ++ backingViewProp ++ clusterColsProp ++ cascadeDeltaProps ++
         queryShapeProps ++ classificationProps ++ timeTravelPinProps ++ pinIdentityProps ++ compiledProps ++
-        watermarkProps ++ mvDependencyMapProps ++ groupedWindowPlan.toSeq.flatMap(_.properties)
+        watermarkProps ++ mvDependencyMapProps ++ groupedWindowPlan.toSeq.flatMap(_.properties) ++
+        publicOutputs.properties
     val now = new Timestamp(System.currentTimeMillis())
 
     val meta = MvMetadata(
@@ -4186,7 +4203,7 @@ case class CreateMaterializedViewCommand(
                 }
                 val field    = matches.head
                 val physical = s"`${field.name.replace("`", "``")}`"
-                val logical  = userColumn.name.replace("`", "``")
+                val logical  = publicOutputs.publicName(userColumn.name).replace("`", "``")
                 val value =
                   if (field.dataType == userColumn.dataType) physical
                   else s"CAST($physical AS ${userColumn.dataType.sql})"
@@ -4199,7 +4216,7 @@ case class CreateMaterializedViewCommand(
               if (havingPred.isEmpty && topKViewSuffix.isEmpty)
                 Map(MvProjectionSource.CatalogProperty -> "true")
               else Map.empty[String, String]
-            val publicViewProperties = userProps ++ projectionProperties
+            val publicViewProperties = userProps ++ projectionProperties ++ publicOutputs.properties
             val publicViewPropertiesClause =
               if (publicViewProperties.nonEmpty)
                 s"TBLPROPERTIES (${renderTableProperties(publicViewProperties).mkString(", ")}) "
@@ -8466,10 +8483,11 @@ case class RefreshMaterializedViewCommand(
                         .save(viewDeltaPath)
                     }
                   } else {
-                    val exactDiff = supportsExactDiffCascade(userSchema)
+                    val exactDiff   = supportsExactDiffCascade(userSchema)
+                    val outputNames = MvProjectionSource.outputNames(spark, sqlIdent(name))
                     val cascadeSelect = buildFullRefreshCascadeSql(
                       dataPath = meta.location,
-                      targetColumns = userSchema.fieldNames.toSeq,
+                      targetColumns = userSchema.fieldNames.toSeq.map(outputNames.physical),
                       preRefreshVersion = oldVersion,
                       exactDiff = exactDiff
                     )

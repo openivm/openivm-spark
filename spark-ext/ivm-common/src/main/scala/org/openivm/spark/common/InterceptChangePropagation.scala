@@ -65,10 +65,15 @@ final class InterceptChangePropagation extends ChangePropagation {
       batches: Seq[ChangeBatch]
   ): String = {
     val sql = super.registerSourceDeltaView(spark, sourceTable, sourceSchema, batches)
-    if (MvProjectionSource.isProjection(spark, sourceTable)) {
+    MvProjectionSource.projectionView(spark, sourceTable).foreach { view =>
       val name = StagingDeltaView.deltaViewName(sourceTable)
       MvProjectionSource
-        .project(spark.table(name), sourceSchema, Seq("openivm_multiplicity", "openivm_timestamp"))
+        .project(
+          spark.table(name),
+          sourceSchema,
+          Seq("openivm_multiplicity", "openivm_timestamp"),
+          PublicOutputNames.of(view.desc.properties)
+        )
         .createOrReplaceTempView(name)
     }
     sql

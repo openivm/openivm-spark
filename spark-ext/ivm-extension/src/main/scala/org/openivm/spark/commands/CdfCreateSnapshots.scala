@@ -87,7 +87,11 @@ private[spark] object CdfCreateSnapshots {
           !schemaChanged || MvProjectionSource.isProjection(spark, source.name),
           s"CREATE source '${source.name}' schema changed while capturing its snapshot"
         )
-        source.name -> MvProjectionSource.project(raw, source.schema)
+        source.name -> MvProjectionSource.project(
+          raw,
+          source.schema,
+          names = MvProjectionSource.outputNames(spark, source.name)
+        )
       }.toMap
       val used = scala.collection.mutable.Set.empty[String]
       def replace(original: LogicalPlan, source: Source): LogicalPlan = {

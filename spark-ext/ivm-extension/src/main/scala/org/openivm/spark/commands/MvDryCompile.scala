@@ -78,13 +78,16 @@ object MvDryCompile {
   def dryCompile(
       spark: SparkSession,
       name: TableIdentifier,
-      queryText: String,
+      userQueryText: String,
       clusterColumns: Seq[String] = Seq.empty
   ): DryCompileResult = {
     import MvCommandHelper._
     // Clustering is a physical-layout hint only; it changes neither the refresh
     // classification nor the rewritten SQL, so it is intentionally unused here.
     val _ = clusterColumns
+    // Classify exactly what CREATE compiles; the registry keeps the public schema.
+    val queryText =
+      PublicOutputNames.plan(spark, userQueryText).fold(userQueryText)(_.physicalSql)
 
     val (qualNames, qualSchemas, compileSchemas, shortToQual) =
       collectSourceSchemas(spark, queryText)
@@ -103,7 +106,7 @@ object MvDryCompile {
       Map.empty
     )
     val analyzed     = spark.sql(queryText).queryExecution.analyzed
-    val outputSchema = spark.sql(queryText).schema
+    val outputSchema = spark.sql(userQueryText).schema
 
     // Best-effort workload facts. Cold-DAG stub tables are plain parquet (not
     // Delta), so stats/constraint discovery may throw — fall back to defaults.
