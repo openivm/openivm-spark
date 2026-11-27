@@ -3160,9 +3160,6 @@ case class CreateMaterializedViewCommand(
     val upstreamMvByQual: Map[String, MvMetadata] = profile.timeStep("create_resolve_upstream_mvs") {
       computeUpstreamMvByQual(spark, qualNames)
     }
-    val sourceIsMv: Boolean = upstreamMvByQual.nonEmpty
-    val distinctUpstreamMvCount: Int =
-      upstreamMvByQual.values.map(m => metaName(m.name)).toSet.size
     // Upstream MVs that cannot feed a view-delta. DIAGNOSTIC ONLY — it never
     // demotes; see computeUpstreamSnapshotTriggerDetail.
     val upstreamSnapshotTriggerDetail: Option[String] =
@@ -3248,22 +3245,17 @@ case class CreateMaterializedViewCommand(
       emitsCascadeViewDelta = emitsCascadeViewDelta,
       upstreamSnapshotTrigger = classification.upstreamSnapshotTrigger
     )
-    // `sourceIsMv`/`distinctUpstreamMvCount` are computed for logging visibility
-    // only; the demotion is driven by the shared classifier above.
-    val _ = (sourceIsMv, distinctUpstreamMvCount)
 
-    {
-      val msg =
-        s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${classification.compileRefreshTypeName}' " +
-          s"effective_refresh_type='$effectiveRefreshTypeName' reason='$classifyReason' " +
-          s"emits_cascade_view_delta='$emitsCascadeViewDelta' " +
-          MvCommandHelper.pinTelemetryKv(pinTelemetry.status, pinTelemetry.reason, pinTelemetry.pins) +
-          classification.upstreamSnapshotTrigger.fold("")(d => s" upstream_snapshot_trigger='$d'")
-      if (classification.isDemotionToFullRefresh)
-        logError(msg)
-      else
-        logInfo(msg)
-    }
+    val classificationMessage =
+      s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${classification.compileRefreshTypeName}' " +
+        s"effective_refresh_type='$effectiveRefreshTypeName' reason='$classifyReason' " +
+        s"emits_cascade_view_delta='$emitsCascadeViewDelta' " +
+        MvCommandHelper.pinTelemetryKv(pinTelemetry.status, pinTelemetry.reason, pinTelemetry.pins) +
+        classification.upstreamSnapshotTrigger.fold("")(d => s" upstream_snapshot_trigger='$d'")
+    if (classification.isDemotionToFullRefresh)
+      logError(classificationMessage)
+    else
+      logInfo(classificationMessage)
 
     // Incremental maintenance evaluates an expression only for the rows, groups or partitions a
     // refresh touches, so a random or time-dependent one leaves the view diverging from a
@@ -5881,27 +5873,23 @@ case class RefreshMaterializedViewCommand(
                   .map(SourceVersionDelta.buildBagDiffSql(_, schema))
                   .getOrElse(propagation.buildSourceDeltaViewSql(qualTable, schema, tableBatches))
                 var registrationSucceeded = false
-                val viewSql =
-                  try {
-                    val registered = sourceVersionBatch
-                      .map(SourceVersionDelta.registerSourceDeltaView(spark, _, schema))
-                      .getOrElse(propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches))
-                    registrationSucceeded = true
-                    registered
-                  } finally {
-                    val ms = (System.nanoTime() - t0) / 1000000L
-                    sqlLog.record(
-                      category = "register_source_delta",
-                      stmtOrder = qlogOrder.getAndIncrement(),
-                      attemptIdx = 0,
-                      stmtKind = "temp_view",
-                      sql = diagnosticSql,
-                      durationMs = ms,
-                      succeeded = registrationSucceeded
-                    )
-                  }
-                // viewSql is the exact SQL the impl executed (used by impl-specific diagnostics).
-                val _ = viewSql
+                try {
+                  sourceVersionBatch
+                    .map(SourceVersionDelta.registerSourceDeltaView(spark, _, schema))
+                    .getOrElse(propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches))
+                  registrationSucceeded = true
+                } finally {
+                  val ms = (System.nanoTime() - t0) / 1000000L
+                  sqlLog.record(
+                    category = "register_source_delta",
+                    stmtOrder = qlogOrder.getAndIncrement(),
+                    attemptIdx = 0,
+                    stmtKind = "temp_view",
+                    sql = diagnosticSql,
+                    durationMs = ms,
+                    succeeded = registrationSucceeded
+                  )
+                }
                 tempViewShortNames += qualTable.split("\\.").last
 
                 if (diagnosticsEnabled) {
@@ -6257,18 +6245,15 @@ case class RefreshMaterializedViewCommand(
 
           val rewritten =
             if (FeatureGate.regularNtermLiteralPruneEnabled(spark)) {
-              val requests = rewrittenBase.statements.flatMap(SparkRefreshRewriter.regularNtermKeyRequests).distinct
+              val pruning  = rewrittenBase.statements.map(SparkRefreshRewriter.planRegularNtermPruning)
+              val requests = pruning.flatMap(_.requests).distinct
               val literals = collectRegularNtermLiteralKeys(spark, requests, freshSchemas)
               if (literals.nonEmpty) {
                 logInfo(
                   s"[openivm-mv] refresh view='${sqlIdent(name)}' " +
                     s"outcome='regular_nterm_literal_prune' key_sets='${literals.size}'"
                 )
-                rewrittenBase.copy(
-                  statements = rewrittenBase.statements.map(
-                    SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(_, literals)
-                  )
-                )
+                rewrittenBase.copy(statements = pruning.map(_.withLiteralKeys(literals)))
               } else rewrittenBase
             } else rewrittenBase
 
