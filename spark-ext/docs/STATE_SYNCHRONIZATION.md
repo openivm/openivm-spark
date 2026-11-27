@@ -1,5 +1,14 @@
 # State synchronization
 
+## Where state lives
+
+![OpenIVM state stores: Delta row data, local RocksDB metadata, and optional OneLake recovery](../../docs/images/openivm-state-stores.drawio.png)
+
+The local quickstart uses RocksDB metadata and intercept staging; configured
+Delta catalogs and CDF keep progress in Delta. Optional recovery copies do not
+contain the Delta tables, and asynchronous state sync can lag.
+[Open the editable DrawIO](../../docs/images/openivm-state-stores.drawio).
+
 ## Crash-safe snapshots
 
 Synchronous backups retain per-namespace request barriers: only requests captured

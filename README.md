@@ -82,15 +82,6 @@ successful application.
 [Read the architecture overview](docs/architecture/openivm-spark/0.OVERVIEW.md) ·
 [Follow an aggregate refresh end to end](docs/architecture/openivm-spark/13-end-to-end-trace-aggregatesumspec.md)
 
-### Where state lives
-
-![OpenIVM state stores: Delta row data, local RocksDB metadata, and optional OneLake recovery](docs/images/openivm-state-stores.drawio.png)
-
-The local quickstart uses RocksDB metadata and intercept staging; configured
-Delta catalogs and CDF keep progress in Delta. Optional recovery copies do not
-contain the Delta tables, and asynchronous state sync can lag.
-[Open the editable DrawIO](docs/images/openivm-state-stores.drawio).
-
 ## Documentation
 
 | Start here | Guides |
