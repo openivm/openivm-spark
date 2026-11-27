@@ -16,8 +16,6 @@
   <a href="https://github.com/openivm/ivm-bench">IVM Bench</a>
 </p>
 
-![OpenIVM Delta and RocksDB state architecture](openivm-delta-rocksdb-architecture.drawio.png)
-
 OpenIVM for Spark is a Spark SQL extension that compiles and applies
 incremental maintenance plans for materialized views. Spark executes the
 resulting SQL against Delta Lake; OpenIVM and LPTS compile the plans in a
@@ -84,10 +82,14 @@ successful application.
 [Read the architecture overview](docs/architecture/openivm-spark/0.OVERVIEW.md) ·
 [Follow an aggregate refresh end to end](docs/architecture/openivm-spark/13-end-to-end-trace-aggregatesumspec.md)
 
-The Delta and RocksDB state architecture, including how catalog and state-sync
-state are shared across concurrent refreshes, is diagrammed in
-[openivm-delta-rocksdb-architecture.drawio.png](openivm-delta-rocksdb-architecture.drawio.png)
-([editable DrawIO](openivm-delta-rocksdb-architecture.drawio)).
+### Where state lives
+
+![OpenIVM state stores: Delta row data, local RocksDB metadata, and optional OneLake recovery](docs/images/openivm-state-stores.drawio.png)
+
+The local quickstart uses RocksDB metadata and intercept staging; configured
+Delta catalogs and CDF keep progress in Delta. Optional recovery copies do not
+contain the Delta tables, and asynchronous state sync can lag.
+[Open the editable DrawIO](docs/images/openivm-state-stores.drawio).
 
 ## Documentation
 

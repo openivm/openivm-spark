@@ -211,3 +211,13 @@ request is idempotent.
 The public constants and row/page types live in
 `org.openivm.spark.insights.OpenIvmInsightsContract`; the broker entry point is
 `OpenIvmInsightsBroker`.
+
+## Cross-thread query-hash annotations
+
+When an event callback began capture on a different Java thread, append
+`FOR REQUEST '<existing-request-id>'` to `OPENIVM INSIGHTS ANNOTATE MATERIALIZED VIEW
+QUERY HASH ...`. The exact application-scoped request must already be active and
+have matching materialized-view model context. Missing, ended, mismatched, or
+conflicting bound requests fail closed. No new request, global/session binding or
+thread-local rebinding occurs; the lifecycle owner still ENDs, exports and RELEASEs
+the original capture. Omitting FOR REQUEST retains thread-bound behavior.

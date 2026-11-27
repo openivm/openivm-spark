@@ -27,6 +27,17 @@ mkdir -p "$WORK_DIR/jdk/bin" "$WORK_DIR/jdk21/bin" "$WORK_DIR/bin" "$WORK_DIR/na
 mkdir -p "$LEGACY_TARGET_212" "$LEGACY_TARGET_213"
 touch "$LEGACY_TARGET_212/stale.jar" "$LEGACY_TARGET_213/stale.jar"
 
+mkdir -p "$WORK_DIR/docs"
+touch "$WORK_DIR/docs/BOUNDED_TELEMETRY_QUEUE.md" "$WORK_DIR/docs/SPARK_41.md"
+bash "$DEV_DIR/check-doc-names.sh" "$WORK_DIR/docs"
+touch "$WORK_DIR/docs/bounded-telemetry.md" "$WORK_DIR/docs/UPPER.MD"
+if bash "$DEV_DIR/check-doc-names.sh" "$WORK_DIR/docs" 2>"$WORK_DIR/doc-names.stderr"; then
+    echo "Documentation naming check accepted invalid filenames" >&2
+    exit 1
+fi
+grep -Fq "SCREAMING_CASE.md: $WORK_DIR/docs/bounded-telemetry.md" "$WORK_DIR/doc-names.stderr"
+grep -Fq "SCREAMING_CASE.md: $WORK_DIR/docs/UPPER.MD" "$WORK_DIR/doc-names.stderr"
+
 cat >"$WORK_DIR/jdk/bin/java" <<'EOF'
 #!/usr/bin/env bash
 echo 'openjdk version "17.0.12" 2024-07-16' >&2

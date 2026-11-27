@@ -4,7 +4,7 @@ import re
 import unittest
 
 import state_guard_eval
-from . import DARWIN, FIXTURES, MANIFEST
+from . import DARWIN, FIXTURES, MANIFEST, make_fixtures, scratch_dir
 
 CONFIGS = DARWIN / "configs"
 LANES = "abcde"
@@ -208,11 +208,25 @@ class ManifestMirrorTests(unittest.TestCase):
 
 
 class FixtureReproducibilityTests(unittest.TestCase):
-    def test_committed_fixtures_are_what_the_generator_produces(self):
-        spec = importlib.util.spec_from_file_location("make_fixtures", FIXTURES / "make_fixtures.py")
-        generator = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(generator)
-        self.assertEqual(generator.check(), [])
+    def test_generated_reports_are_reproducible(self):
+        self.assertEqual(make_fixtures.check(FIXTURES), [])
+
+    def test_output_directory_preserves_policy_inputs_and_detects_report_drift(self):
+        with scratch_dir() as root:
+            policy_input = root / "diffs" / "oracle.json"
+            policy_input.parent.mkdir()
+            policy_input.write_text('{"ok": false}\n', encoding="utf-8")
+            self.assertEqual(make_fixtures.main(["--output-dir", str(root)]), 0)
+            self.assertEqual(make_fixtures.main(["--output-dir", str(root), "--check"]), 0)
+            self.assertEqual(policy_input.read_text(encoding="utf-8"), '{"ok": false}\n')
+            (root / "reports" / "bad-crash" / "run.json").unlink()
+            (root / "reports" / "bad-parity" / "run.json").write_text("{}\n", encoding="utf-8")
+            (root / "reports" / "unexpected.json").write_text("{}\n", encoding="utf-8")
+            self.assertCountEqual(make_fixtures.check(root), [
+                "reports/bad-crash/run.json: missing",
+                "reports/bad-parity/run.json: stale",
+                "reports/unexpected.json: unexpected file",
+            ])
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 """Offline validation of the state-guard evaluator (stdlib unittest, no Darwin / Nx / Spark)."""
 
+import atexit
 import contextlib
 import copy
 import shutil
@@ -9,7 +10,7 @@ from pathlib import Path
 
 DARWIN = Path(__file__).resolve().parent.parent
 EVALUATOR = DARWIN / "evaluator"
-FIXTURES = DARWIN / "fixtures"
+POLICY_FIXTURES = DARWIN / "fixtures" / "diffs"
 SCRATCH = DARWIN / ".scratch"
 
 if str(EVALUATOR) not in sys.path:
@@ -17,6 +18,7 @@ if str(EVALUATOR) not in sys.path:
 
 import policy  # noqa: E402
 import report  # noqa: E402
+from ..fixtures import make_fixtures  # noqa: E402
 
 MANIFEST = policy.load_manifest()
 
@@ -40,3 +42,9 @@ def scratch_dir():
         shutil.rmtree(path, ignore_errors=True)
         with contextlib.suppress(OSError):
             SCRATCH.rmdir()
+
+
+_fixture_stack = contextlib.ExitStack()
+atexit.register(_fixture_stack.close)
+FIXTURES = _fixture_stack.enter_context(scratch_dir())
+make_fixtures.write(FIXTURES)

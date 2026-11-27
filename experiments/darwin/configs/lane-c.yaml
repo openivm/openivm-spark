@@ -1,5 +1,5 @@
 # Darwin lane C: per-MV publication / queue.
-# Run through `darwin evolve` with the environment documented in experiments/darwin/README.md:
+# Run through `darwin evolve` with the environment documented in experiments/darwin/docs/RUNNING_LANES.md:
 #   OPENIVM_DARWIN_TRUSTED      checkout of the frozen harness commit that holds the trusted evaluator
 #   OPENIVM_DARWIN_BASELINE_SHA the full harness commit SHA every candidate is compared against
 #   OPENIVM_DARWIN_LOCK_SHA256  pinned sha256 of experiments/darwin/evaluator.lock.json

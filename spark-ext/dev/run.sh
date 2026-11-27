@@ -262,6 +262,7 @@ cmd_fmt() {
 }
 
 cmd_lint() {
+    bash "$SCRIPT_DIR/check-doc-names.sh"
     prepare_sbt 0
     run_sbt "$@" scalafmtCheckAll scalafmtSbtCheck
 }
@@ -322,6 +323,7 @@ cmd_assembly() {
 }
 
 cmd_verify() {
+    bash "$SCRIPT_DIR/check-doc-names.sh"
     cmd_pins_sync
     prepare_sbt 1
     bash "$SCRIPT_DIR/verify-native.sh"

@@ -4,7 +4,7 @@ import subprocess
 import unittest
 
 import policy
-from . import FIXTURES, MANIFEST, scratch_dir
+from . import MANIFEST, POLICY_FIXTURES, scratch_dir
 
 BARRIER = MANIFEST["lanes"]["a"]["owned"][0]
 MVC = MANIFEST["lanes"]["a"]["shared"][0]
@@ -24,7 +24,7 @@ def write(root, rel, data):
 
 class DiffFixtureTests(unittest.TestCase):
     def test_every_diff_fixture_matches_the_expected_verdict(self):
-        cases = sorted((FIXTURES / "diffs").glob("*.json"))
+        cases = sorted(POLICY_FIXTURES.glob("*.json"))
         self.assertGreaterEqual(len(cases), 12)
         for path in cases:
             case = json.loads(path.read_text(encoding="utf-8"))

@@ -135,3 +135,57 @@ staging path keyed by `(base_table, op_type, txn_ts)`. `REFRESH MATERIALIZED VIE
 recompiles the view via openivm + lpts (target dialect `spark`), rewrites the
 emitted DuckDB-style SQL into Spark-executable form (`SparkRefreshRewriter` +
 `LptsSparkDialect`), and applies it to the MV's Delta table.
+
+## Experimental global-window cascades
+
+`spark.openivm.refresh.globalWindowCdfMerge.enabled` is opt-in and defaults to
+`false`. For a global-window recompute with a downstream consumer, actual CDF
+propagation, and a CDF-enabled physical target, it replaces the full target in
+one Delta MERGE. This produces CDF deletes for the old rows and inserts for the
+new rows; the downstream view can consume them incrementally. The full-domain
+rewrite is an executor helper, not generated incremental SQL. It can write a
+large change feed and has not been shown to improve end-to-end performance.
+Unscoped external overwrites and unavailable change history keep their normal
+full-refresh safeguards.
+
+## Opt-in public CDF progress without a materialized-view write
+
+`spark.openivm.refresh.publicCdfNoWrite.enabled` (default `false`, Spark startup
+configuration) can advance a CDF offset without writing the consumer Delta table.
+It is limited to persisted `SIMPLE_PROJECTION` consumers that directly project
+attributes from one verified, owned upstream MV. The captured interval must have
+complete MERGE history without metadata or protocol changes, or a single
+same-table `WRITE` overwrite with literal `true` predicate and complete inferred
+CDF (data-changing adds and removes, no explicit CDC files or deletion vectors).
+A plain, unpartitioned `WRITE` overwrite without a predicate is admitted only
+for versions 0→1 with two small transaction log entries and one small data file
+on each side. The initial Delta commit must establish that the exact file
+removed was the sole live file; the overwrite must leave only its replacement.
+This check reads transaction metadata, not an additional data snapshot. The proof requires an exact signed public row bag, including duplicate and NULL
+multiplicity; commit metrics are not a substitute. The replacement path also
+supports binary, unpadded strings, `DECIMAL(18,2)`, and microsecond timestamps.
+Pins, other replacement intervals, missing identity or history, and unsupported
+plans are not eligible. The usual
+refresh path remains in charge when the proof is unavailable. This relies on
+the existing managed-MV lifecycle locks, not a cross-driver DDL fence.
+
+## Managed initial CTAS namespaces
+
+When `spark.openivm.managedTablesRoot` is set, initial CREATE data writes use the
+logical qualified target identifier plus LOCATION, not a `delta.<path>` CTAS
+identifier. This keeps Fabric auto-discovery in the target's real namespace.
+Non-managed deployments retain concurrent path CTAS. Ownership, table identity,
+precommit cleanup, committed-path reuse and subsequent registration are unchanged.
+
+## Native namespace session isolation
+
+CREATE/REFRESH session clones retain inherited current-catalog/database state
+without revalidating unchanged namespaces through public catalog setters. This
+preserves Fabric internal database names while still propagating non-default
+V2 catalogs and multipart namespaces when their cloned state differs.
+
+## Related contracts
+
+- [Guarded refresh](GUARDED_REFRESH.md) describes query-hash and physical-table identity checks.
+- [State synchronization](STATE_SYNCHRONIZATION.md) describes checkpoint publication and restore.
+- [Generated SQL](GENERATED_SQL.md) describes native-to-Spark dialect translation.

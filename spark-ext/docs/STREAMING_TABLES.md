@@ -371,3 +371,43 @@ with OpenIVM starts/stops; external
 writers must never share the checkpoint. Set the flag to `false` to leave native
 Spark restart behavior unchanged. Interrupted repairs leave at most an uncommitted
 empty batch, which Spark can execute safely on the next restart.
+
+## STREAM over catalog views
+
+`STREAM(view_name)` resolves the stored view through Catalyst under its recorded
+catalog/namespace, then reads each physical Delta leaf as a stream. Nested and
+qualified views preserve output casts, column aliases, projections, branch-local
+filters, and `UNION ALL` multiplicity; repeated leaves remain separate source
+occurrences in their original order. Relation-local `WITH` reader options apply
+to every leaf within that STREAM boundary. Other relations remain batch reads.
+
+Non-Delta/constant leaves, subquery expressions, and reader options that change
+the stored input schema (for example enabling CDF on an ordinary Delta view) fail
+explicitly. Spark's normal streaming operator/output-mode checks still apply:
+wrapping a view does not make arbitrary batch SQL streamable.
+
+Expanded plans, Delta table identities, schemas, and reader options participate
+in the normal definition fingerprint. Recreating a base table or changing view
+semantics/leaf ordering requires the normal rejection or `onQueryChange=rebuild`
+policy. Restarts reuse the managed target checkpoint; no view-specific checkpoint
+or offset rewrite is introduced.
+
+## Targeted streaming status polling
+
+`SHOW STREAMING TABLES [IN namespace] [LIKE 'pattern']` returns the existing nine status fields.
+LIKE uses Spark SHOW patterns (case-insensitive, `*` wildcard and `|` alternatives) on the unqualified table name, not the backtick-qualified `table_name` result. For a result identity `` `catalog`.`schema`.`table_name` ``, use `IN catalog.schema LIKE 'table_name'`; retain the fully qualified identity when validating the returned row.
+Simple literal LIKE names (`[A-Za-z0-9_]+`) resolve the one qualified target
+directly without `SHOW TABLES`/namespace enumeration. Wildcard/regex patterns
+and unfiltered SHOW retain catalog enumeration. Selected targets still undergo
+Delta resolution, manifest reads and ownership validation; registered missing
+targets still report metadata errors.
+Poll a specific table with `SHOW STREAMING TABLES IN catalog.schema LIKE 'table_name'`; keep checking identity fields, failures, and `is_active` until the query has actually stopped.
+Omitting LIKE retains namespace enumeration and validation. Filtering does not cache ownership metadata or bypass completion waiting.
+
+## Native streaming status lookup diagnostics
+
+Targeted SHOW analyzes the exact target without suppressing native catalog/storage
+exceptions. A known-owned target whose lookup fails remains a failure row:
+`last_failure` includes the bounded, redacted exception/cause chain. Ownership is
+not assumed from registry state; no path fallback, retry or successful-completion
+substitution is performed.

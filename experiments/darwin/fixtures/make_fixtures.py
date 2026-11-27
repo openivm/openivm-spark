@@ -1,6 +1,9 @@
-"""Deterministic generator for the synthetic report sets and policy diffs used by the offline tests.
+"""Deterministic generator for synthetic reports used by the offline tests.
 
-Usage: python make_fixtures.py [--check]
+Usage: python make_fixtures.py [--output-dir PATH] [--check]
+
+Reports default to experiments/darwin/.scratch/fixtures/reports. Maintained policy inputs
+in fixtures/diffs are independent test oracles, not generator outputs.
 
 The numbers are synthetic. The baseline reuses the four reference spans measured on the modeled
 latency profile (MV6 capture wait 5.509 s, MV5 catalog finalization 12.439 s, MV1 publication queue
@@ -14,6 +17,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+DEFAULT_OUTPUT = HERE.parent / ".scratch" / "fixtures"
 EVALUATOR = HERE.parent / "evaluator"
 sys.path.insert(0, str(EVALUATOR))
 
@@ -328,54 +332,6 @@ def report_sets() -> dict[str, dict[str, object]]:
     return sets
 
 
-def change(path: str, status: str = "M", old: str = "100644", new: str = "100644", binary: bool = False) -> dict:
-    return {"path": path, "status": status, "old_mode": old, "new_mode": new, "binary": binary}
-
-
-def diff_cases() -> dict[str, dict]:
-    lanes = MANIFEST["lanes"]
-    a_owned, mvc = lanes["a"]["owned"][0], lanes["a"]["shared"][0]
-    b_owned, b_shared = lanes["b"]["owned"][1], lanes["b"]["shared"][1]
-    rdb = a_owned.rsplit("/", 1)[0]
-    e_new = [rdb + "/OpenIvmStateDeltaWriter.scala", rdb + "/OpenIvmStateSyncCodecV2.scala"]
-    return {
-        "a-owned-and-shared": {"lane": "a", "changes": [change(a_owned), change(mvc)], "ok": True, "violations": [], "shared_touched": 1},
-        "a-touches-b-file": {"lane": "a", "changes": [change(b_owned)], "ok": False, "violations": ["not in lane A allowlist"], "shared_touched": 0},
-        "b-shared-delta-backend": {"lane": "b", "changes": [change(b_shared)], "ok": True, "violations": [], "shared_touched": 1},
-        "frozen-test-file": {
-            "lane": "a",
-            "changes": [change("spark-ext/ivm-it/src/test/scala/org/openivm/spark/perf/StateGuardPerfSpec.scala")],
-            "ok": False,
-            "violations": ["frozen"],
-            "shared_touched": 0,
-        },
-        "frozen-telemetry": {
-            "lane": "a",
-            "changes": [change("spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/telemetry/OpenIvmExecutionSpan.scala")],
-            "ok": False,
-            "violations": ["frozen"],
-            "shared_touched": 0,
-        },
-        "frozen-build-and-experiments": {
-            "lane": "c",
-            "changes": [change("spark-ext/build.sbt"), change("experiments/darwin/manifest.json")],
-            "ok": False,
-            "violations": ["spark-ext/build.sbt: frozen", "experiments/darwin/manifest.json: frozen"],
-            "shared_touched": 0,
-        },
-        "gitattributes": {"lane": "a", "changes": [change(".gitattributes", "A")], "ok": False, "violations": ["frozen"], "shared_touched": 0},
-        "deleted-owned": {"lane": "a", "changes": [change(a_owned, "D")], "ok": False, "violations": ["deleted"], "shared_touched": 0},
-        "symlink-new": {"lane": "e", "changes": [change(e_new[0], "A", "000000", "120000")], "ok": False, "violations": ["symlink"], "shared_touched": 0},
-        "mode-change": {"lane": "a", "changes": [change(a_owned, "M", "100644", "100755")], "ok": False, "violations": ["mode change"], "shared_touched": 0},
-        "binary-owned": {"lane": "a", "changes": [change(a_owned, binary=True)], "ok": False, "violations": ["binary blob"], "shared_touched": 0},
-        "new-file-lane-a": {"lane": "a", "changes": [change(rdb + "/OpenIvmNewHelper.scala", "A")], "ok": False, "violations": ["new file outside lane A allowlist"], "shared_touched": 0},
-        "e-new-files": {"lane": "e", "changes": [change(p, "A") for p in e_new], "ok": True, "violations": [], "shared_touched": 0},
-        "e-new-wrong-name": {"lane": "e", "changes": [change(rdb + "/OpenIvmHelper.scala", "A")], "ok": False, "violations": ["new file outside lane E allowlist"], "shared_touched": 0},
-        "protocol-files": {"lane": "a", "changes": [change("output/ideas.json", "A"), change("output/notes.md", "A")], "ok": True, "violations": [], "shared_touched": 0},
-        "path-traversal": {"lane": "a", "changes": [change("../outside.scala", "A")], "ok": False, "violations": ["unsafe path"], "shared_touched": 0},
-    }
-
-
 def dump(document: object) -> str:
     return json.dumps(document, indent=1) + "\n"
 
@@ -389,12 +345,17 @@ def generate() -> dict[str, str]:
         files[f"{folder}/run.json"] = dump({**parts.get("run", {}), "outcomes": parts.get("outcomes", WITNESS_OUTCOMES)})
         if "changes" in parts:
             files[f"{folder}/changes.json"] = dump(parts["changes"])
-    for name, case in diff_cases().items():
-        files[f"diffs/{name}.json"] = dump(case)
     return files
 
 
-def check(root: Path = HERE) -> list[str]:
+def write(root: Path = DEFAULT_OUTPUT) -> None:
+    for rel, text in generate().items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def check(root: Path = DEFAULT_OUTPUT) -> list[str]:
     expected = generate()
     problems = []
     for rel, text in expected.items():
@@ -403,24 +364,22 @@ def check(root: Path = HERE) -> list[str]:
             problems.append(f"{rel}: missing")
         elif path.read_bytes().replace(b"\r\n", b"\n").decode("utf-8") != text:
             problems.append(f"{rel}: stale")
-    on_disk = {p.relative_to(root).as_posix() for sub in ("reports", "diffs") for p in (root / sub).rglob("*.json")}
+    on_disk = {p.relative_to(root).as_posix() for p in (root / "reports").rglob("*.json")}
     problems += [f"{rel}: unexpected file" for rel in sorted(on_disk - set(expected))]
     return problems
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="verify the checked-in fixtures are current")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT, help="scratch root containing reports/")
+    parser.add_argument("--check", action="store_true", help="verify generated reports in the output directory")
     args = parser.parse_args(argv)
     if args.check:
-        problems = check()
+        problems = check(args.output_dir)
         for problem in problems:
             print(problem, file=sys.stderr)
         return 1 if problems else 0
-    for rel, text in generate().items():
-        path = HERE / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8", newline="\n")
+    write(args.output_dir)
     return 0
 
 

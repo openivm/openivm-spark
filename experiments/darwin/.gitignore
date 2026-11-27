@@ -1,0 +1,37 @@
+__pycache__/
+/.scratch/
+/output/
+/outputs/
+/reports/
+/runs/
+/artifacts/
+
+# Only the five maintained, credential-free lane examples belong in Git.
+/configs/*
+!/configs/lane-a.yaml
+!/configs/lane-b.yaml
+!/configs/lane-c.yaml
+!/configs/lane-d.yaml
+!/configs/lane-e.yaml
+
+# Generate synthetic reports under .scratch, never beside the policy oracles.
+/fixtures/reports/
+
+# Only the reviewed policy inputs and expected verdicts belong in Git.
+/fixtures/diffs/*
+!/fixtures/diffs/a-owned-and-shared.json
+!/fixtures/diffs/a-touches-b-file.json
+!/fixtures/diffs/b-shared-delta-backend.json
+!/fixtures/diffs/binary-owned.json
+!/fixtures/diffs/deleted-owned.json
+!/fixtures/diffs/e-new-files.json
+!/fixtures/diffs/e-new-wrong-name.json
+!/fixtures/diffs/frozen-build-and-experiments.json
+!/fixtures/diffs/frozen-telemetry.json
+!/fixtures/diffs/frozen-test-file.json
+!/fixtures/diffs/gitattributes.json
+!/fixtures/diffs/mode-change.json
+!/fixtures/diffs/new-file-lane-a.json
+!/fixtures/diffs/path-traversal.json
+!/fixtures/diffs/protocol-files.json
+!/fixtures/diffs/symlink-new.json
