@@ -45,13 +45,15 @@ import scala.collection.mutable
  * @param baseTable       qualified name of the base table being modified
  * @param postStagingOps  post-DML sequence of (plan, stagingPath, opType) tuples
  * @param dependentMaterializedViews identities of MVs whose change feed receives this write
+ * @param captureCommittedChanges capture exact target changes after MERGE, whose source is not a signed row image
  */
 case class StagedDmlNode(
     dml: LogicalPlan,
     stagingOps: Seq[(LogicalPlan, String, String)],
     baseTable: String,
     postStagingOps: Seq[(LogicalPlan, String, String)] = Seq.empty,
-    dependentMaterializedViews: Seq[String] = Seq.empty
+    dependentMaterializedViews: Seq[String] = Seq.empty,
+    captureCommittedChanges: Boolean = false
 ) extends LeafRunnableCommand {
 
   override lazy val output: Seq[Attribute] = dml.output
@@ -87,7 +89,8 @@ case class StagedDmlNode(
               deltas.foreach(delta => StagedDmlNode.cleanupStagingPath(spark, delta.stagingPath, failure))
               throw failure
           }
-          val published = SourceChangeLedger.publishWrite(spark, baseTable, before, deltas.toVector)
+          val published =
+            SourceChangeLedger.publishWrite(spark, baseTable, before, deltas.toVector, captureCommittedChanges)
           if (OpenIvmInsightsBroker.hasActiveRegularSparkCapture(spark))
             StagedDmlNode.emitChangeCapture(spark, baseTable, published, dependentMaterializedViews)
         } finally {

@@ -88,15 +88,19 @@ private[spark] object SourceChangeLedger extends Logging {
     * @param baseTable qualified base-table name
     * @param before    position returned by [[reconcileLocked]] before the write ran
     * @param deltas    records the write staged
+    * @param captureCommittedChanges require exact committed target changes instead of pre-staged MERGE source rows
     * @return the records published
     */
   def publishWrite(
       spark: SparkSession,
       baseTable: String,
       before: Option[SourceLedgerEntry],
-      deltas: Seq[StagingDelta]
+      deltas: Seq[StagingDelta],
+      captureCommittedChanges: Boolean = false
   ): Seq[StagingDelta] =
     DeltaTableVersion.deltaLogOption(spark, baseTable).flatMap(log => position(log).map(log -> _)) match {
+      case None if captureCommittedChanges =>
+        throw new IllegalStateException(s"Cannot capture committed MERGE changes for missing Delta table $baseTable")
       case None =>
         deltas.foreach(StagingCatalog.record(spark, _))
         deltas
@@ -105,6 +109,20 @@ private[spark] object SourceChangeLedger extends Logging {
         // The write committed nothing, so it changed no rows.
         deltas.foreach(delta => StagedDmlNode.deleteStagingPath(spark, delta.stagingPath))
         Seq.empty
+      case Some((_, after)) if captureCommittedChanges =>
+        val start = before
+          .filter(entry => entry.tableId == after.tableId && entry.version < after.version)
+          .getOrElse(throw new IllegalStateException(s"Cannot identify the committed MERGE interval for $baseTable"))
+        require(
+          comparable(spark, baseTable, start.version, after.version),
+          s"Cannot capture exact MERGE changes for $baseTable in (${start.version}, ${after.version}]"
+        )
+        // MERGE source rows omit target-only actions and need not have the target schema.
+        // Capture the committed interval, including concurrent commits, before advancing its ledger.
+        // A capture failure leaves the position unchanged for reconciliation; never acknowledge a partial delta.
+        val captured = exactChange(spark, baseTable, start.version, after.version)
+        publish(spark, baseTable, after, captured)
+        captured
       case Some((_, after))
           if before.exists(start => start.tableId == after.tableId && start.version + 1L == after.version) =>
         publish(spark, baseTable, after, deltas)

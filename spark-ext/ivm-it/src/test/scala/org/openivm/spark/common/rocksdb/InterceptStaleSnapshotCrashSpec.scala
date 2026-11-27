@@ -8,7 +8,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.FeatureGate
+import org.openivm.spark.common.{FeatureGate, MvCatalog, RefreshTypeCode}
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -20,6 +20,7 @@ private[rocksdb] object InterceptStaleSnapshotCrashProbe {
     val phase               = args(1)
     val backend             = args(2)
     val snapshotAfterInsert = args(3).toBoolean
+    val mergeChanges        = args.lift(4).contains("merge")
     val source              = "default.barrier_crash_source"
     val mv                  = "default.barrier_crash_mv"
     val query               = s"SELECT id, SUM(amount) AS total FROM $source GROUP BY id"
@@ -56,14 +57,29 @@ private[rocksdb] object InterceptStaleSnapshotCrashProbe {
         actual.exceptAll(expected).count() == 0L && expected.exceptAll(actual).count() == 0L,
         "materialized view differs from full recomputation"
       )
+      if (mergeChanges)
+        require(
+          MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier(mv)).get.refreshType !=
+            RefreshTypeCode.FullRefresh,
+          "MERGE recovery must stay incremental"
+        )
     }
     try {
       if (phase == "crash") {
         sql(s"CREATE TABLE $source(id INT, amount INT) USING DELTA")
         sql(s"INSERT INTO $source VALUES (1, 10)")
+        if (mergeChanges) sql(s"INSERT INTO $source VALUES (2, 20)")
         sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
         if (!snapshotAfterInsert) OpenIvmStateSync.backupNow(spark)
-        sql(s"INSERT INTO $source VALUES (1, 25)")
+        if (mergeChanges)
+          sql(s"""
+            MERGE INTO $source t
+            USING (SELECT * FROM VALUES (1, 25), (2, -1), (3, 50) AS changes(id, amount)) s ON t.id = s.id
+            WHEN MATCHED AND s.amount < 0 THEN DELETE
+            WHEN MATCHED THEN UPDATE SET t.amount = t.amount + s.amount
+            WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (s.id, s.amount)
+          """)
+        else sql(s"INSERT INTO $source VALUES (1, 25)")
         if (snapshotAfterInsert) OpenIvmStateSync.backupNow(spark)
         OpenIvmStateSync.setBeforeSnapshotCommitHookForTesting(() => {
           parity()
@@ -107,7 +123,7 @@ class InterceptStaleSnapshotCrashSpec extends AnyFunSpec with Matchers {
         }
       )
 
-  private def checkRecovery(backend: String, snapshotAfterInsert: Boolean): Unit = {
+  private def checkRecovery(backend: String, snapshotAfterInsert: Boolean, mergeChanges: Boolean = false): Unit = {
     val root = Paths.get("target").toAbsolutePath.resolve(s"intercept-stale-snapshot-${UUID.randomUUID()}")
     Files.createDirectories(root)
     val javaBin = Paths.get(System.getProperty("java.home"), "bin", "java").toString
@@ -123,7 +139,8 @@ class InterceptStaleSnapshotCrashSpec extends AnyFunSpec with Matchers {
           root.toString,
           phase,
           backend,
-          snapshotAfterInsert.toString
+          snapshotAfterInsert.toString,
+          if (mergeChanges) "merge" else "insert"
         )): _*
       ).redirectErrorStream(true).redirectOutput(log.toFile).start()
       try {
@@ -137,12 +154,21 @@ class InterceptStaleSnapshotCrashSpec extends AnyFunSpec with Matchers {
     val local = root.resolve("state").resolve("_openivm")
     deleteTree(local)
     run("recover", 0)
+    if (mergeChanges)
+      Option(System.getProperty("openivm.test.log.dir")).foreach { directory =>
+        Seq("crash.log", "recover.log", "crash-pid").foreach { name =>
+          Files.copy(root.resolve(name), Paths.get(directory).resolve(s"${root.getFileName}-$name"))
+        }
+      }
     deleteTree(root)
   }
 
   for (backend <- Seq("delta", "rocksdb"); snapshotAfterInsert <- Seq(false, true)) {
     it(s"recovers $backend after a ${if (snapshotAfterInsert) "post" else "pre"}-input snapshot") {
       checkRecovery(backend, snapshotAfterInsert)
+    }
+    it(s"recovers $backend MERGE changes after a ${if (snapshotAfterInsert) "post" else "pre"}-input snapshot") {
+      checkRecovery(backend, snapshotAfterInsert, mergeChanges = true)
     }
   }
 }

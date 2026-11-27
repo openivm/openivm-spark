@@ -424,6 +424,7 @@ object OpTypes {
 - `INSERT`, `OVERWRITE`, `UPDATE_AFTER`: synthesize `+1` (`StagingDeltaView.scala:72-77`);
 - `DELETE`, `UPDATE_BEFORE`: synthesize `-1` (`StagingDeltaView.scala:79-84`);
 - `MERGE_SRC`: currently unsupported by that builder and falls through to `None` (`StagingDeltaView.scala:86-88`).
+- Intercepted MERGE no longer stages `MERGE_SRC`: it publishes the exact committed target `DELETE` / `INSERT` bags for its Delta-version interval (see [Intercepted MERGE changes](../../../spark-ext/docs/MATERIALIZED_VIEWS.md#intercepted-merge-changes)). Legacy `MERGE_SRC` records remain unsupported.
 
 ______________________________________________________________________
 

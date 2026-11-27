@@ -143,8 +143,13 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] wit
         val dependents = dependentMvs(tableName)
         if (tableName.isEmpty || dependents.isEmpty) m
         else {
-          val ops = Seq((m.source, stagingPath(tableName, "MERGE_SRC"), "MERGE_SRC"))
-          StagedDmlNode(m, ops, tableName, dependentMaterializedViews = dependents)
+          StagedDmlNode(
+            m,
+            Seq.empty,
+            tableName,
+            dependentMaterializedViews = dependents,
+            captureCommittedChanges = true
+          )
         }
 
       // -----------------------------------------------------------------------
@@ -175,8 +180,13 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] wit
         val dependents = dependentMvs(tableName)
         if (tableName.isEmpty || dependents.isEmpty) w
         else {
-          val ops = Seq((w.query, stagingPath(tableName, "MERGE_SRC"), "MERGE_SRC"))
-          StagedDmlNode(w, ops, tableName, dependentMaterializedViews = dependents)
+          StagedDmlNode(
+            w,
+            Seq.empty,
+            tableName,
+            dependentMaterializedViews = dependents,
+            captureCommittedChanges = true
+          )
         }
 
       // -----------------------------------------------------------------------
@@ -220,8 +230,13 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] wit
         val dependents = dependentMvs(tableName)
         if (tableName.isEmpty || dependents.isEmpty) m
         else {
-          val ops = Seq((m.sourceTable, stagingPath(tableName, "MERGE_SRC"), "MERGE_SRC"))
-          StagedDmlNode(m, ops, tableName, dependentMaterializedViews = dependents)
+          StagedDmlNode(
+            m,
+            Seq.empty,
+            tableName,
+            dependentMaterializedViews = dependents,
+            captureCommittedChanges = true
+          )
         }
 
       case _ => plan

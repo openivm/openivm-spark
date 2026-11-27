@@ -136,6 +136,17 @@ recompiles the view via openivm + lpts (target dialect `spark`), rewrites the
 emitted DuckDB-style SQL into Spark-executable form (`SparkRefreshRewriter` +
 `LptsSparkDialect`), and applies it to the MV's Delta table.
 
+## Intercepted MERGE changes
+
+In intercept mode, MERGE publishes signed **target** changes from the committed
+Delta-version interval, not its source rows. The existing exact multiset-difference
+capture handles matched updates/deletes, unmatched inserts and target-only actions
+without enabling Delta CDF. Staging records and the source ledger position publish
+together only after capture succeeds; an identity mismatch or unavailable exact
+comparison fails without advancing that position or substituting a full refresh.
+The MERGE itself may already have committed when capture fails; do not blindly
+retry the DML. The existing reconciliation path can recover unrecorded commits.
+
 ## Experimental global-window cascades
 
 `spark.openivm.refresh.globalWindowCdfMerge.enabled` is opt-in and defaults to
