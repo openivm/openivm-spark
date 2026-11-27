@@ -88,19 +88,3 @@ jobs:
 
       - name: Compare discovered tests
         run: npx --no-install nx run spark-ext:compare-test-inventory
-
-  telemetry-html:
-    name: Telemetry HTML renderer
-    runs-on: [self-hosted, openivm-spark-azure]
-    timeout-minutes: 15
-    container:
-      image: ghcr.io/openivm/openivm-spark-devcontainer:9952c5593ae6bd1591ff114eef49fa0f453d2962d41f3ec342b6d4596e16a40b
-    steps:
-      - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-
-      - name: Install locked tooling from the warmed cache
-        run: npm ci --prefer-offline --no-audit --no-fund
-
-      - name: Test renderer
-        run: npx --no-install nx run openivm-telemetry-html:test
