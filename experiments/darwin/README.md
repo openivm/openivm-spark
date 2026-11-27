@@ -9,7 +9,7 @@ faster than a fresh baseline measured on the same box.
 ## Documentation
 
 - [Evidence and layout](docs/OVERVIEW.md) explains modeled-latency limits, maintained files and historical qualification.
-- [Running lanes](docs/RUNNING_LANES.md) covers pinned tools, trusted evaluator identities and the five runnable lane configs.
+- [Running lanes](docs/RUNNING_LANES.md) covers pinned tools, trusted evaluator identities, the lane-A sample config and how to derive lanes B–E.
 - [Evaluation](docs/EVALUATION.md) defines crash, correctness, incremental, concurrency and acceptance gates.
 - [Lane ownership](docs/LANES.md) lists each lane's goals, allowed files and frozen boundaries.
 - [Report schema](docs/REPORT_SCHEMA.md) describes perf, crash, witness and synthetic report contracts.

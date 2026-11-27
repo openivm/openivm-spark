@@ -10,7 +10,6 @@ from pathlib import Path
 
 DARWIN = Path(__file__).resolve().parent.parent
 EVALUATOR = DARWIN / "evaluator"
-POLICY_FIXTURES = DARWIN / "fixtures" / "diffs"
 SCRATCH = DARWIN / ".scratch"
 
 if str(EVALUATOR) not in sys.path:

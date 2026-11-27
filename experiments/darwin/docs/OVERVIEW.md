@@ -29,10 +29,9 @@ experiments/darwin/
   manifest.yaml            maintained human mirror; not parsed by the evaluator
   evaluator.lock.json      integrity hashes of evaluator/*.py and manifest.json
   evaluator/               trusted CLI, policy, report, scoring, runner and lock code
-  configs/lane-{a..e}.yaml  five maintained, credential-free Darwin evolve examples
+  configs/lane-a.yaml       credential-free Darwin evolve sample; lanes B-E are derived locally
   fixtures/make_fixtures.py deterministic synthetic report generator
-  fixtures/diffs/          maintained policy inputs and expected verdicts
-  tests/                   offline unittest suite
+  tests/                   offline unittest suite, including inline policy cases
   provision-agent-tools.sh pinned agent-tool provisioning
   validate-offline.sh      offline test entry point
   .scratch/                ignored generated reports, local configs and test scratch

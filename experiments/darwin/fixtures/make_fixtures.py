@@ -2,8 +2,7 @@
 
 Usage: python make_fixtures.py [--output-dir PATH] [--check]
 
-Reports default to experiments/darwin/.scratch/fixtures/reports. Maintained policy inputs
-in fixtures/diffs are independent test oracles, not generator outputs.
+Reports default to experiments/darwin/.scratch/fixtures/reports and are never tracked in Git.
 
 The numbers are synthetic. The baseline reuses the four reference spans measured on the modeled
 latency profile (MV6 capture wait 5.509 s, MV5 catalog finalization 12.439 s, MV1 publication queue

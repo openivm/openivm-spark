@@ -75,7 +75,25 @@ darwin evolve experiments/darwin/configs/lane-a.yaml \
   --home "$PWD/.scratch/darwin-home-a" --env-file /workspaces/openivm-spark/.env --repo .
 ```
 
-Likewise `lane-b` .. `lane-e`. Each lane: `max_iterations: 18`, early stop after 8 iterations without
+Only `configs/lane-a.yaml` is tracked; it is the end-to-end sample. To run lane `<x>` (b–e), copy it to the
+ignored `configs/lane-<x>.yaml` and change these, following [lane ownership](LANES.md) and `manifest.json`
+`lanes.<x>`:
+
+- the header title, the experiment name `openivm-state-guard-lane-<x>` and the evaluator's `--lane <x>`;
+- the prompt's lane title, goal and target-metric wording;
+- the editable-files list, which must equal that lane's `owned`, `shared` and `new_files` entries;
+- the known-gap sentence "This lane may touch that path", kept only for lanes in `known_gap.lanes_that_may_touch`;
+- the metrics block, which must declare exactly the names `state_guard_eval.Output(manifest, "<x>")` emits.
+
+`validate-offline.sh` checks every config present, tracked or not, so run it before `darwin evolve` with
+`--home "$PWD/.scratch/darwin-home-<x>"`. The R8 campaign's exact lane configs remain in branch history:
+
+```bash
+path=experiments/darwin/configs/lane-b.yaml
+git show "$(git log --diff-filter=D -1 --format=%H -- "$path")^:$path"
+```
+
+Each lane: `max_iterations: 18`, early stop after 8 iterations without
 improvement of `combined_score` (absolute `min_improvement: 0.5`; the score spans roughly 0-175), agent
 timeout 3600 s, evaluator timeout 7200 s per iteration. The agent only edits files; the evaluator owns builds,
 tests and benchmarks.

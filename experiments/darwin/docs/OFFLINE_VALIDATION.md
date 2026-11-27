@@ -4,35 +4,33 @@
 
 The evaluator tests need Python 3.12 and Bash, not Darwin, Spark or a
 network connection. Run them from the repository root in the pinned devcontainer.
-PyYAML, when already available, also validates the five Darwin YAML schemas;
-without it, that one optional test is reported as skipped.
+PyYAML, when already available, also validates the YAML schema of every lane config
+present; without it, that one optional test is reported as skipped.
 
 ## Maintained inputs versus generated reports
 
 Keep these small, reviewable inputs in Git:
 
-- `configs/lane-a.yaml` through `lane-e.yaml` are the maintained end-to-end
-  Darwin examples, with exact experiment names, trusted evaluator arguments,
-  model/budget pins, metric lookups and lane-specific prompts.
+- `configs/lane-a.yaml` is the maintained end-to-end Darwin sample, with the exact
+  experiment name, trusted evaluator arguments, model/budget pins, metric lookups
+  and lane prompt. [Running lanes](RUNNING_LANES.md) derives lanes B–E from it.
 - `manifest.json` owns policy, witness identities, budgets, gates and thresholds;
   `manifest.yaml` is its maintained human mirror.
 - `evaluator.lock.json` is a required integrity artifact, not a performance
   report; it locks `evaluator/*.py` and `manifest.json`.
-- `fixtures/diffs/*.json` are maintained deterministic policy inputs and
-  expected verdicts; the report generator neither derives nor rewrites them.
 - `fixtures/make_fixtures.py` defines the synthetic report scenarios.
+- `tests/test_policy.py` holds the policy cases and expected verdicts inline.
 
 Generate reports instead of committing JSON snapshots. The generator defaults
 to `experiments/darwin/.scratch/fixtures/reports/`; tests create an isolated
-scratch fixture tree per process and remove it on exit. Local config copies,
-Darwin homes, raw outputs and caches belong in ignored `.scratch/`.
-The directory `.gitignore` also rejects non-curated configs, legacy
-`fixtures/reports/`, and `output/`, `outputs/`, `reports/`, `runs/` and
-`artifacts/`. Entries under `fixtures/diffs/` are ignored except for the 16
-explicitly allowlisted, maintained JSON oracles; adding a new reviewed oracle
-requires updating that allowlist too. Python sources and documentation remain
-trackable. Ignoring a file does not make it an allowed candidate edit:
-the evaluator's frozen-path and lane policies still apply.
+scratch fixture tree per process and remove it on exit. Local lane configs,
+Darwin homes, raw outputs and caches stay untracked: the directory `.gitignore`
+is an allowlist of the harness, its docs and tests, `configs/lane-a.yaml` and
+`fixtures/make_fixtures.py`, and it also rejects `output/`, `outputs/`,
+`reports/`, `runs/` and `artifacts/` at any depth. Adding a tracked file
+outside that allowlist needs a reviewed `.gitignore` change. Ignoring a file does
+not make it an allowed candidate edit: the evaluator's frozen-path and lane
+policies still apply.
 
 ## Run the offline suite
 
@@ -92,7 +90,7 @@ code 2 means an evaluator infrastructure error, not a candidate verdict.
 
 `baseline`, `good-candidate` and `lane-a-only` complete the 16 generated sets.
 The baseline's deliberate stale-snapshot failure tests regression accounting;
-it is not a claim about the current product. Policy inputs separately retain
+it is not a claim about the current product. The inline policy cases separately retain
 cross-lane/frozen-path, new-file, deletion, symlink, mode-change, binary,
 path-traversal and protocol-file cases. The suite also retains timeout,
 tampered-lock, redaction, malformed-report, known-gap misuse and runner safety

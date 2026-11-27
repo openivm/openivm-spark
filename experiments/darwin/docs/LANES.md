@@ -24,4 +24,4 @@ Frozen for every lane (any diff vs the baseline => 0.0): `experiments/**`, `spar
 blobs and file-mode changes. The changed set is `git diff --name-status --no-renames <baseline>` plus
 `git ls-files --others --exclude-standard`; Darwin's `output/*.json|md` protocol files are ignored.
 
-Use the [running guide](RUNNING_LANES.md) for the five maintained configs and trusted evaluator setup.
+Use the [running guide](RUNNING_LANES.md) to derive a lane config from the lane-A sample and set up the trusted evaluator.
