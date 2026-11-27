@@ -267,17 +267,17 @@ final class OpenIvmExecutionSpan private[telemetry] (
     }
 
   def complete(finalOutcome: String, finalDriverThread: String): Unit =
-    if (enabled) {
-      lock.synchronized {
-        if (completedAtNanos.isEmpty) {
-          val endNanos = System.nanoTime()
-          completedAtEpochMs = Some(System.currentTimeMillis())
-          completedAtNanos = Some(endNanos)
-          outcome = Some(OpenIvmExecutionSpan.normalizeString(finalOutcome))
-          driverThread = Some(OpenIvmExecutionSpan.normalizeString(finalDriverThread))
-        }
-      }
+    if (enabled) lock.synchronized { completeIfNeeded(finalOutcome, finalDriverThread) }
+
+  private def completeIfNeeded(finalOutcome: String, finalDriverThread: String): Unit = {
+    if (completedAtNanos.isEmpty) {
+      val endNanos = System.nanoTime()
+      completedAtEpochMs = Some(System.currentTimeMillis())
+      completedAtNanos = Some(endNanos)
+      outcome = Some(OpenIvmExecutionSpan.normalizeString(finalOutcome))
+      driverThread = Some(OpenIvmExecutionSpan.normalizeString(finalDriverThread))
     }
+  }
 
   def emitIfNeeded(defaultOutcome: String, defaultDriverThread: String): Unit = {
     val payload =
@@ -286,13 +286,7 @@ final class OpenIvmExecutionSpan private[telemetry] (
         lock.synchronized {
           if (emitted) None
           else {
-            if (completedAtNanos.isEmpty) {
-              val endNanos = System.nanoTime()
-              completedAtEpochMs = Some(System.currentTimeMillis())
-              completedAtNanos = Some(endNanos)
-              outcome = Some(OpenIvmExecutionSpan.normalizeString(defaultOutcome))
-              driverThread = Some(OpenIvmExecutionSpan.normalizeString(defaultDriverThread))
-            }
+            completeIfNeeded(defaultOutcome, defaultDriverThread)
             emitted = true
             val completedEpochMs = completedAtEpochMs.getOrElse(startedAtEpochMs)
             val durationMs =
@@ -300,93 +294,9 @@ final class OpenIvmExecutionSpan private[telemetry] (
             val finalDriverThread =
               driverThread.getOrElse(OpenIvmExecutionSpan.normalizeString(defaultDriverThread))
             val finalOutcome = outcome.getOrElse(OpenIvmExecutionSpan.normalizeString(defaultOutcome))
-            val logPayload = OpenIvmExecutionSpan.renderJson(
-              requestId = requestId,
-              dbtNodeId = dbtNodeId,
-              materializedView = materializedView,
-              operation = operation,
-              startedAtEpochMs = startedAtEpochMs,
-              completedAtEpochMs = math.max(startedAtEpochMs, completedEpochMs),
-              durationMs = math.max(0L, durationMs),
-              driverThread = finalDriverThread,
-              outcome = finalOutcome,
-              compileRefreshType = refreshClassification.compileRefreshType,
-              effectiveRefreshType = refreshClassification.effectiveRefreshType,
-              refreshReason = refreshClassification.refreshReason,
-              timeTravelPinStatus = timeTravelPinStatus,
-              timeTravelPinReason = timeTravelPinReason,
-              sameMvLockWaitMs = sameMvLockWaitMs,
-              driverAdmissionWaitMs = driverAdmissionMs,
-              catalogPublicationAdmissionWidth = catalogPublicationAdmissionWidth,
-              catalogPublicationAdmissionWaitMs = catalogPublicationAdmissionMs,
-              compilerMs = compilerMs,
-              catalogMs = catalogMs,
-              rocksDbWriteMs = rocksDbWriteMs,
-              rocksDbWriteCount = rocksDbWriteCount,
-              analysisMs = analysisMs,
-              watermarkMs = watermarkMs,
-              ctasMs = ctasMs,
-              ctasDataWriteMs = ctasDataWriteMs,
-              hiveCatalogPublicationMs = hiveCatalogPublishMs,
-              metadataPublicationMs = metadataPublicationMs,
-              deltaVersionLookupMs = deltaVersionLookupMs,
-              deltaVersionLookupCount = deltaVersionLookupCount,
-              rocksDbFlushMs = rocksDbFlushMs,
-              rocksDbFlushCount = rocksDbFlushCount,
-              rocksDbFlushFailures = rocksDbFlushFailures,
-              rocksDbJvmLockWaitMs = rocksDbJvmLockWaitMs,
-              rocksDbExternalWaitMs = rocksDbExternalWaitMs,
-              rocksDbBackupMs = rocksDbBackupMs
-            )
-            val exportPayload = configuredExport.map { export =>
-              export -> OpenIvmExecutionSpan.renderExportJson(
-                identity = export.identity,
-                requestId = requestId,
-                dbtNodeId = dbtNodeId,
-                materializedView = materializedView,
-                operation = operation,
-                startedAtEpochMs = startedAtEpochMs,
-                completedAtEpochMs = completedEpochMs,
-                durationMs = durationMs,
-                driverThread = finalDriverThread,
-                outcome = finalOutcome,
-                compileRefreshType = refreshClassification.compileRefreshType,
-                effectiveRefreshType = refreshClassification.effectiveRefreshType,
-                refreshReason = refreshClassification.refreshReason,
-                timeTravelPinStatus = timeTravelPinStatus,
-                timeTravelPinReason = timeTravelPinReason,
-                sameMvLockWaitMs = sameMvLockWaitMs,
-                driverAdmissionWaitMs = driverAdmissionMs,
-                catalogPublicationAdmissionWidth = catalogPublicationAdmissionWidth,
-                catalogPublicationAdmissionWaitMs = catalogPublicationAdmissionMs,
-                compilerMs = compilerMs,
-                catalogMs = catalogMs,
-                rocksDbWriteMs = rocksDbWriteMs,
-                rocksDbWriteCount = rocksDbWriteCount,
-                analysisMs = analysisMs,
-                watermarkMs = watermarkMs,
-                ctasMs = ctasMs,
-                ctasDataWriteMs = ctasDataWriteMs,
-                hiveCatalogPublicationMs = hiveCatalogPublishMs,
-                metadataPublicationMs = metadataPublicationMs,
-                deltaVersionLookupMs = deltaVersionLookupMs,
-                deltaVersionLookupCount = deltaVersionLookupCount,
-                rocksDbFlushMs = rocksDbFlushMs,
-                rocksDbFlushCount = rocksDbFlushCount,
-                rocksDbFlushFailures = rocksDbFlushFailures,
-                rocksDbJvmLockWaitMs = rocksDbJvmLockWaitMs,
-                rocksDbExternalWaitMs = rocksDbExternalWaitMs,
-                rocksDbBackupMs = rocksDbBackupMs,
-                sourceVersions = sourceVersions.values.toSeq,
-                pendingDeltaCount = pendingDeltaCount
-              )
-            }
+            val json         = renderJson(completedEpochMs, durationMs, finalDriverThread, finalOutcome)
             Some(
-              OpenIvmExecutionSpan.RenderedPayload(
-                exportPayload.map(_._2).getOrElse(logPayload),
-                exportPayload,
-                completedExportReuseAllowed
-              )
+              OpenIvmExecutionSpan.RenderedPayload(json, configuredExport.map(_ -> json), completedExportReuseAllowed)
             )
           }
         }
@@ -420,6 +330,94 @@ final class OpenIvmExecutionSpan private[telemetry] (
       }
     }
   }
+
+  // Exported spans also supply the log payload, so serialize the selected contract once.
+  private def renderJson(
+      completedEpochMs: Long,
+      durationMs: Long,
+      finalDriverThread: String,
+      finalOutcome: String
+  ): String = {
+    val identity  = configuredExport.map(_.identity.validated)
+    val exporting = identity.isDefined
+    val fields    = new LinkedHashMap[String, AnyRef]()
+    def putMillis(key: String, value: Option[Long]): Unit =
+      value.foreach(v => fields.put(key, java.lang.Long.valueOf(v)))
+    def putCount(key: String, count: Long): Unit =
+      fields.put(key, java.lang.Long.valueOf(count))
+    def putRocksDbWrites(): Unit = {
+      putMillis("rocksdb_write_ms", rocksDbWriteMs)
+      if (rocksDbWriteCount > 0L) putCount("rocksdb_write_count", rocksDbWriteCount)
+    }
+
+    identity match {
+      case Some(export) =>
+        fields.put("schema_id", OpenIvmTelemetryContract.SchemaId)
+        fields.put("schema_version", java.lang.Integer.valueOf(OpenIvmTelemetryContract.SchemaVersion))
+        fields.put("campaign_id", export.campaignId)
+        fields.put("request_id", requestId.getOrElse(export.requestId))
+        fields.put("correlation_id", export.correlationId)
+        fields.put("dbt_node_id", dbtNodeId.getOrElse(export.dbtNodeId))
+      case None =>
+        requestId.foreach(fields.put("request_id", _))
+        dbtNodeId.foreach(fields.put("dbt_node_id", _))
+    }
+    fields.put("materialized_view", materializedView)
+    fields.put("operation", operation)
+    identity.foreach(export => fields.put("phase", export.phase))
+    val end = if (exporting) completedEpochMs else math.max(startedAtEpochMs, completedEpochMs)
+    fields.put("engine_started_at", Instant.ofEpochMilli(startedAtEpochMs).toString)
+    fields.put("engine_completed_at", Instant.ofEpochMilli(end).toString)
+    putCount("duration_ms", if (exporting) durationMs else math.max(0L, durationMs))
+    fields.put("driver_thread", finalDriverThread)
+    fields.put("outcome", finalOutcome)
+    refreshClassification.compileRefreshType.foreach(fields.put("compile_refresh_type", _))
+    refreshClassification.effectiveRefreshType.foreach(fields.put("effective_refresh_type", _))
+    refreshClassification.refreshReason.foreach(fields.put("refresh_reason", _))
+    timeTravelPinStatus.foreach(fields.put("time_travel_pin_status", _))
+    timeTravelPinReason.foreach(fields.put("time_travel_pin_reason", _))
+
+    if (exporting) {
+      val versions = new java.util.ArrayList[java.util.Map[String, AnyRef]]()
+      OpenIvmTelemetryContract.validatedSourceVersions(sourceVersions.values.toSeq).foreach { version =>
+        val item = new LinkedHashMap[String, AnyRef]()
+        item.put("relation", version.relation)
+        item.put("start_version", java.lang.Long.valueOf(version.startVersion))
+        item.put("end_version", java.lang.Long.valueOf(version.endVersion))
+        versions.add(item)
+      }
+      fields.put("source_versions", versions)
+      putCount("pending_delta_count", math.max(0L, pendingDeltaCount))
+    }
+
+    putMillis("same_mv_lock_wait_ms", sameMvLockWaitMs)
+    putMillis("driver_admission_wait_ms", driverAdmissionMs)
+    catalogPublicationAdmissionWidth.foreach(v =>
+      fields.put("catalog_publication_admission_width", java.lang.Integer.valueOf(v))
+    )
+    putMillis("catalog_publication_admission_wait_ms", catalogPublicationAdmissionMs)
+    putMillis("compiler_ms", compilerMs)
+    putMillis("catalog_ms", catalogMs)
+    // Preserve the order and omission rules of the existing log and export payloads.
+    if (!exporting) putRocksDbWrites()
+    putMillis("analysis_ms", analysisMs)
+    putMillis("watermark_ms", watermarkMs)
+    putMillis("ctas_ms", ctasMs)
+    putMillis("ctas_data_write_ms", ctasDataWriteMs)
+    putMillis("hive_catalog_publication_ms", hiveCatalogPublishMs)
+    putMillis("metadata_publication_ms", metadataPublicationMs)
+    putMillis("delta_version_lookup_ms", deltaVersionLookupMs)
+    if (deltaVersionLookupCount > 0L) putCount("delta_version_lookup_count", deltaVersionLookupCount)
+    if (exporting) putRocksDbWrites()
+    putMillis("rocksdb_flush_ms", rocksDbFlushMs)
+    if (!exporting || rocksDbFlushCount > 0L) putCount("rocksdb_flush_count", rocksDbFlushCount)
+    if (!exporting || rocksDbFlushFailures > 0L) putCount("rocksdb_flush_failed_count", rocksDbFlushFailures)
+    putMillis("rocksdb_jvm_lock_wait_ms", rocksDbJvmLockWaitMs)
+    putMillis("rocksdb_external_lock_wait_ms", rocksDbExternalWaitMs)
+    putMillis("rocksdb_backup_ms", rocksDbBackupMs)
+    OpenIvmExecutionSpan.Json.writeValueAsString(fields)
+  }
+
 }
 
 object OpenIvmExecutionSpan extends Logging {
@@ -800,197 +798,6 @@ object OpenIvmExecutionSpan extends Logging {
 
   private def firstNonBlank(sources: Iterator[String]*): Option[String] =
     sources.iterator.flatten.find(_.nonEmpty)
-
-  private def renderJson(
-      requestId: Option[String],
-      dbtNodeId: Option[String],
-      materializedView: String,
-      operation: String,
-      startedAtEpochMs: Long,
-      completedAtEpochMs: Long,
-      durationMs: Long,
-      driverThread: String,
-      outcome: String,
-      compileRefreshType: Option[String],
-      effectiveRefreshType: Option[String],
-      refreshReason: Option[String],
-      timeTravelPinStatus: Option[String],
-      timeTravelPinReason: Option[String],
-      sameMvLockWaitMs: Option[Long],
-      driverAdmissionWaitMs: Option[Long],
-      catalogPublicationAdmissionWidth: Option[Int],
-      catalogPublicationAdmissionWaitMs: Option[Long],
-      compilerMs: Option[Long],
-      catalogMs: Option[Long],
-      rocksDbWriteMs: Option[Long],
-      rocksDbWriteCount: Long,
-      analysisMs: Option[Long],
-      watermarkMs: Option[Long],
-      ctasMs: Option[Long],
-      ctasDataWriteMs: Option[Long],
-      hiveCatalogPublicationMs: Option[Long],
-      metadataPublicationMs: Option[Long],
-      deltaVersionLookupMs: Option[Long],
-      deltaVersionLookupCount: Long,
-      rocksDbFlushMs: Option[Long],
-      rocksDbFlushCount: Long,
-      rocksDbFlushFailures: Long,
-      rocksDbJvmLockWaitMs: Option[Long],
-      rocksDbExternalWaitMs: Option[Long],
-      rocksDbBackupMs: Option[Long]
-  ): String = {
-    val fields = new LinkedHashMap[String, AnyRef]()
-    requestId.foreach(fields.put("request_id", _))
-    dbtNodeId.foreach(fields.put("dbt_node_id", _))
-    fields.put("materialized_view", materializedView)
-    fields.put("operation", operation)
-    fields.put("engine_started_at", Instant.ofEpochMilli(startedAtEpochMs).toString)
-    fields.put("engine_completed_at", Instant.ofEpochMilli(completedAtEpochMs).toString)
-    fields.put("duration_ms", java.lang.Long.valueOf(durationMs))
-    fields.put("driver_thread", driverThread)
-    fields.put("outcome", outcome)
-    compileRefreshType.foreach(fields.put("compile_refresh_type", _))
-    effectiveRefreshType.foreach(fields.put("effective_refresh_type", _))
-    refreshReason.foreach(fields.put("refresh_reason", _))
-    timeTravelPinStatus.foreach(fields.put("time_travel_pin_status", _))
-    timeTravelPinReason.foreach(fields.put("time_travel_pin_reason", _))
-    sameMvLockWaitMs.foreach(v => fields.put("same_mv_lock_wait_ms", java.lang.Long.valueOf(v)))
-    driverAdmissionWaitMs.foreach(v => fields.put("driver_admission_wait_ms", java.lang.Long.valueOf(v)))
-    catalogPublicationAdmissionWidth.foreach(v =>
-      fields.put("catalog_publication_admission_width", java.lang.Integer.valueOf(v))
-    )
-    catalogPublicationAdmissionWaitMs.foreach(v =>
-      fields.put("catalog_publication_admission_wait_ms", java.lang.Long.valueOf(v))
-    )
-    compilerMs.foreach(v => fields.put("compiler_ms", java.lang.Long.valueOf(v)))
-    catalogMs.foreach(v => fields.put("catalog_ms", java.lang.Long.valueOf(v)))
-    rocksDbWriteMs.foreach(v => fields.put("rocksdb_write_ms", java.lang.Long.valueOf(v)))
-    if (rocksDbWriteCount > 0L) fields.put("rocksdb_write_count", java.lang.Long.valueOf(rocksDbWriteCount))
-    analysisMs.foreach(v => fields.put("analysis_ms", java.lang.Long.valueOf(v)))
-    watermarkMs.foreach(v => fields.put("watermark_ms", java.lang.Long.valueOf(v)))
-    ctasMs.foreach(v => fields.put("ctas_ms", java.lang.Long.valueOf(v)))
-    ctasDataWriteMs.foreach(v => fields.put("ctas_data_write_ms", java.lang.Long.valueOf(v)))
-    hiveCatalogPublicationMs.foreach(v => fields.put("hive_catalog_publication_ms", java.lang.Long.valueOf(v)))
-    metadataPublicationMs.foreach(v => fields.put("metadata_publication_ms", java.lang.Long.valueOf(v)))
-    deltaVersionLookupMs.foreach(v => fields.put("delta_version_lookup_ms", java.lang.Long.valueOf(v)))
-    if (deltaVersionLookupCount > 0L) {
-      fields.put("delta_version_lookup_count", java.lang.Long.valueOf(deltaVersionLookupCount))
-    }
-    rocksDbFlushMs.foreach(v => fields.put("rocksdb_flush_ms", java.lang.Long.valueOf(v)))
-    fields.put("rocksdb_flush_count", java.lang.Long.valueOf(rocksDbFlushCount))
-    fields.put("rocksdb_flush_failed_count", java.lang.Long.valueOf(rocksDbFlushFailures))
-    rocksDbJvmLockWaitMs.foreach(v => fields.put("rocksdb_jvm_lock_wait_ms", java.lang.Long.valueOf(v)))
-    rocksDbExternalWaitMs.foreach(v => fields.put("rocksdb_external_lock_wait_ms", java.lang.Long.valueOf(v)))
-    rocksDbBackupMs.foreach(v => fields.put("rocksdb_backup_ms", java.lang.Long.valueOf(v)))
-    Json.writeValueAsString(fields)
-  }
-
-  private def renderExportJson(
-      identity: OpenIvmTelemetryContract.ExecutionIdentity,
-      requestId: Option[String],
-      dbtNodeId: Option[String],
-      materializedView: String,
-      operation: String,
-      startedAtEpochMs: Long,
-      completedAtEpochMs: Long,
-      durationMs: Long,
-      driverThread: String,
-      outcome: String,
-      compileRefreshType: Option[String],
-      effectiveRefreshType: Option[String],
-      refreshReason: Option[String],
-      timeTravelPinStatus: Option[String],
-      timeTravelPinReason: Option[String],
-      sameMvLockWaitMs: Option[Long],
-      driverAdmissionWaitMs: Option[Long],
-      catalogPublicationAdmissionWidth: Option[Int],
-      catalogPublicationAdmissionWaitMs: Option[Long],
-      compilerMs: Option[Long],
-      catalogMs: Option[Long],
-      rocksDbWriteMs: Option[Long],
-      rocksDbWriteCount: Long,
-      analysisMs: Option[Long],
-      watermarkMs: Option[Long],
-      ctasMs: Option[Long],
-      ctasDataWriteMs: Option[Long],
-      hiveCatalogPublicationMs: Option[Long],
-      metadataPublicationMs: Option[Long],
-      deltaVersionLookupMs: Option[Long],
-      deltaVersionLookupCount: Long,
-      rocksDbFlushMs: Option[Long],
-      rocksDbFlushCount: Long,
-      rocksDbFlushFailures: Long,
-      rocksDbJvmLockWaitMs: Option[Long],
-      rocksDbExternalWaitMs: Option[Long],
-      rocksDbBackupMs: Option[Long],
-      sourceVersions: Seq[OpenIvmTelemetryContract.SourceVersion],
-      pendingDeltaCount: Long
-  ): String = {
-    val validatedIdentity = identity.validated
-    val fields            = new LinkedHashMap[String, AnyRef]()
-    fields.put("schema_id", OpenIvmTelemetryContract.SchemaId)
-    fields.put("schema_version", java.lang.Integer.valueOf(OpenIvmTelemetryContract.SchemaVersion))
-    fields.put("campaign_id", validatedIdentity.campaignId)
-    fields.put("request_id", requestId.getOrElse(validatedIdentity.requestId))
-    fields.put("correlation_id", validatedIdentity.correlationId)
-    fields.put("dbt_node_id", dbtNodeId.getOrElse(validatedIdentity.dbtNodeId))
-    fields.put("materialized_view", materializedView)
-    fields.put("operation", operation)
-    fields.put("phase", validatedIdentity.phase)
-    fields.put("engine_started_at", Instant.ofEpochMilli(startedAtEpochMs).toString)
-    fields.put("engine_completed_at", Instant.ofEpochMilli(completedAtEpochMs).toString)
-    fields.put("duration_ms", java.lang.Long.valueOf(durationMs))
-    fields.put("driver_thread", driverThread)
-    fields.put("outcome", outcome)
-    compileRefreshType.foreach(fields.put("compile_refresh_type", _))
-    effectiveRefreshType.foreach(fields.put("effective_refresh_type", _))
-    refreshReason.foreach(fields.put("refresh_reason", _))
-    timeTravelPinStatus.foreach(fields.put("time_travel_pin_status", _))
-    timeTravelPinReason.foreach(fields.put("time_travel_pin_reason", _))
-
-    val versionArray = new java.util.ArrayList[java.util.Map[String, AnyRef]]()
-    OpenIvmTelemetryContract.validatedSourceVersions(sourceVersions).foreach { version =>
-      val item = new LinkedHashMap[String, AnyRef]()
-      item.put("relation", version.relation)
-      item.put("start_version", java.lang.Long.valueOf(version.startVersion))
-      item.put("end_version", java.lang.Long.valueOf(version.endVersion))
-      versionArray.add(item)
-    }
-    fields.put("source_versions", versionArray)
-    fields.put("pending_delta_count", java.lang.Long.valueOf(math.max(0L, pendingDeltaCount)))
-
-    sameMvLockWaitMs.foreach(v => fields.put("same_mv_lock_wait_ms", java.lang.Long.valueOf(v)))
-    driverAdmissionWaitMs.foreach(v => fields.put("driver_admission_wait_ms", java.lang.Long.valueOf(v)))
-    catalogPublicationAdmissionWidth.foreach(v =>
-      fields.put("catalog_publication_admission_width", java.lang.Integer.valueOf(v))
-    )
-    catalogPublicationAdmissionWaitMs.foreach(v =>
-      fields.put("catalog_publication_admission_wait_ms", java.lang.Long.valueOf(v))
-    )
-    compilerMs.foreach(v => fields.put("compiler_ms", java.lang.Long.valueOf(v)))
-    catalogMs.foreach(v => fields.put("catalog_ms", java.lang.Long.valueOf(v)))
-    analysisMs.foreach(v => fields.put("analysis_ms", java.lang.Long.valueOf(v)))
-    watermarkMs.foreach(v => fields.put("watermark_ms", java.lang.Long.valueOf(v)))
-    ctasMs.foreach(v => fields.put("ctas_ms", java.lang.Long.valueOf(v)))
-    ctasDataWriteMs.foreach(v => fields.put("ctas_data_write_ms", java.lang.Long.valueOf(v)))
-    hiveCatalogPublicationMs.foreach(v => fields.put("hive_catalog_publication_ms", java.lang.Long.valueOf(v)))
-    metadataPublicationMs.foreach(v => fields.put("metadata_publication_ms", java.lang.Long.valueOf(v)))
-    deltaVersionLookupMs.foreach(v => fields.put("delta_version_lookup_ms", java.lang.Long.valueOf(v)))
-    if (deltaVersionLookupCount > 0L) {
-      fields.put("delta_version_lookup_count", java.lang.Long.valueOf(deltaVersionLookupCount))
-    }
-    rocksDbWriteMs.foreach(v => fields.put("rocksdb_write_ms", java.lang.Long.valueOf(v)))
-    if (rocksDbWriteCount > 0L) fields.put("rocksdb_write_count", java.lang.Long.valueOf(rocksDbWriteCount))
-    rocksDbFlushMs.foreach(v => fields.put("rocksdb_flush_ms", java.lang.Long.valueOf(v)))
-    if (rocksDbFlushCount > 0L) fields.put("rocksdb_flush_count", java.lang.Long.valueOf(rocksDbFlushCount))
-    if (rocksDbFlushFailures > 0L) {
-      fields.put("rocksdb_flush_failed_count", java.lang.Long.valueOf(rocksDbFlushFailures))
-    }
-    rocksDbJvmLockWaitMs.foreach(v => fields.put("rocksdb_jvm_lock_wait_ms", java.lang.Long.valueOf(v)))
-    rocksDbExternalWaitMs.foreach(v => fields.put("rocksdb_external_lock_wait_ms", java.lang.Long.valueOf(v)))
-    rocksDbBackupMs.foreach(v => fields.put("rocksdb_backup_ms", java.lang.Long.valueOf(v)))
-    Json.writeValueAsString(fields)
-  }
 
   private def logSpan(payload: String): Unit =
     logInfo(LogPrefix + payload)

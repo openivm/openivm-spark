@@ -6170,23 +6170,24 @@ case class RefreshMaterializedViewCommand(
             RefreshPerf.timePhase(refreshId, viewLabel, "rewrite") {
               val snapshotVersions = sourceSnapshotWatermarks.collect {
                 case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
-              } ++ sourceSnapshotAdvanceOldVersions
-              val snapshotRelations = snapshotVersions.flatMap { case (source, version) =>
-                if (executionSnapshotPinsByQualified.keys.exists(_.equalsIgnoreCase(source))) None
-                else {
-                  val relation = currentSourceRelations.get(source).orElse {
-                    try Some(spark.table(source))
-                    catch { case _: AnalysisException => None }
-                  }
-                  relation
-                    .flatMap(MvProjectionSource.readProjection(spark, _, Map("versionAsOf" -> version.toString)))
-                    .map { snapshot =>
-                      val tempName = s"openivm_source_snapshot_${source.split("\\.").last}"
-                      snapshot.createOrReplaceTempView(tempName)
-                      sourceSnapshotTempViews += tempName
-                      source -> s"`${tempName.replace("`", "``")}`"
+              }
+              val snapshotRelations = (snapshotVersions ++ sourceSnapshotAdvanceOldVersions).flatMap {
+                case (source, version) =>
+                  if (executionSnapshotPinsByQualified.keys.exists(_.equalsIgnoreCase(source))) None
+                  else {
+                    val relation = currentSourceRelations.get(source).orElse {
+                      try Some(spark.table(source))
+                      catch { case _: AnalysisException => None }
                     }
-                }
+                    relation
+                      .flatMap(MvProjectionSource.readProjection(spark, _, Map("versionAsOf" -> version.toString)))
+                      .map { snapshot =>
+                        val tempName = s"openivm_source_snapshot_${source.split("\\.").last}"
+                        snapshot.createOrReplaceTempView(tempName)
+                        sourceSnapshotTempViews += tempName
+                        source -> s"`${tempName.replace("`", "``")}`"
+                      }
+                  }
               }
               SparkRefreshRewriter.rewrite(
                 compiledSql = compiled.sql,
@@ -6228,9 +6229,7 @@ case class RefreshMaterializedViewCommand(
                 // Path is stable across ADVANCE; the clause/old-version above and
                 // sourceSnapshotAdvanceOldVersions below carry the version.
                 sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
-                sourceSnapshotVersions = sourceSnapshotWatermarks.collect {
-                  case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
-                },
+                sourceSnapshotVersions = snapshotVersions,
                 sourceSnapshotAdvanceOldVersions = sourceSnapshotAdvanceOldVersions,
                 mvVersionBeforeRefresh = Some(meta.lastVersion),
                 sourceSnapshotRelations = snapshotRelations,

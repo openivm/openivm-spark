@@ -2362,21 +2362,19 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         "((t2_account_id) > (0)) AND ((CAST(t1_account_id AS BIGINT)) = (t2_account_id))"
       )
       for (program <- Seq(sql, wrapped)) {
-        val pruning = SparkRefreshRewriter.planRegularNtermPruning(program)
-        pruning.requests shouldBe Seq(request)
-        val rewritten = pruning.withLiteralKeys(Map(request -> Seq("10", "20")))
+        SparkRefreshRewriter.regularNtermKeyRequests(program) shouldBe Seq(request)
+        val rewritten = SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(program, Map(request -> Seq("10", "20")))
         rewritten should include("WHERE t2_account_id IN (10, 20)")
         rewritten should include("FROM t1_projection")
         rewritten should include("FROM `accounts` VERSION AS OF 17")
       }
       val disjunction = wrapped.replace("AND", "OR")
-      val pruning = SparkRefreshRewriter.planRegularNtermPruning(disjunction)
-      pruning.requests shouldBe empty
-      pruning.withLiteralKeys(Map(request -> Seq("10"))) shouldBe disjunction
+      SparkRefreshRewriter.regularNtermKeyRequests(disjunction) shouldBe empty
+      SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(disjunction, Map(request -> Seq("10"))) shouldBe disjunction
     }
 
     it("leaves the N-term SQL unchanged when no bounded key set is available") {
-      SparkRefreshRewriter.planRegularNtermPruning(canonical).withLiteralKeys(Map.empty) shouldBe canonical
+      SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(canonical, Map.empty) shouldBe canonical
     }
 
     it("does not derive literal-pruning requests from outer joins") {
@@ -2394,7 +2392,7 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           |)
           |SELECT * FROM t2_join""".stripMargin
 
-      SparkRefreshRewriter.planRegularNtermPruning(outerJoin).requests shouldBe empty
+      SparkRefreshRewriter.regularNtermKeyRequests(outerJoin) shouldBe empty
     }
   }
 

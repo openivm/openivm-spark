@@ -250,16 +250,7 @@ object SparkRefreshRewriter {
         if (aliases.isEmpty) None
         else Some(selectIdx + "SELECT".length -> s" /*+ BROADCAST(${aliases.mkString(", ")}) */")
       }
-      if (edits.isEmpty) sql
-      else {
-        val out  = new StringBuilder(sql)
-        var bias = 0
-        edits.foreach { case (idx, hint) =>
-          out.insert(idx + bias, hint)
-          bias += hint.length
-        }
-        out.toString()
-      }
+      replaceSqlRanges(sql, edits.map { case (offset, text) => (offset, offset, text) })
     }
   }
 
@@ -312,16 +303,7 @@ object SparkRefreshRewriter {
           )
         }
       }
-      if (edits.isEmpty) sql
-      else {
-        val out  = new StringBuilder(sql)
-        var bias = 0
-        edits.foreach { case (idx, hint) =>
-          out.insert(idx + bias, hint)
-          bias += hint.length
-        }
-        out.toString()
-      }
+      replaceSqlRanges(sql, edits.map { case (offset, text) => (offset, offset, text) })
     }
   }
 
@@ -1256,7 +1238,7 @@ object SparkRefreshRewriter {
       }
     }
 
-    replaceCteBodies(sql, replacements)
+    replaceSqlRanges(sql, replacements)
   }
 
   /** The relation reference the old-state (pre-refresh / pre-advance) read of
@@ -1329,6 +1311,12 @@ object SparkRefreshRewriter {
     new RegularNtermPruning(sql, ctes, regularNtermPruneSites(ctes))
   }
 
+  def regularNtermKeyRequests(sql: String): Seq[RegularNtermKeyRequest] =
+    planRegularNtermPruning(sql).requests
+
+  def pruneRegularNtermWithLiteralKeys(sql: String, literals: Map[RegularNtermKeyRequest, Seq[String]]): String =
+    if (literals.isEmpty) sql else planRegularNtermPruning(sql).withLiteralKeys(literals)
+
   final class RegularNtermPruning private[SparkRefreshRewriter] (
       sql: String,
       ctes: Seq[ParsedCte],
@@ -1352,12 +1340,12 @@ object SparkRefreshRewriter {
         if (predicates.isEmpty) None
         else Some((cte.bodyStart, cte.bodyEnd, predicates.foldLeft(cte.body)(addTopLevelWhereConjunct)))
       }
-      replaceCteBodies(sql, replacements)
+      replaceSqlRanges(sql, replacements)
     }
   }
 
-  // The bodies are disjoint and appear in their original SQL order.
-  private def replaceCteBodies(sql: String, replacements: Seq[(Int, Int, String)]): String = {
+  // Replacements and insertions are disjoint and appear in their original SQL order.
+  private def replaceSqlRanges(sql: String, replacements: Seq[(Int, Int, String)]): String = {
     if (replacements.isEmpty) return sql
     val out    = new java.lang.StringBuilder(sql.length)
     var offset = 0
@@ -3943,7 +3931,11 @@ object SparkRefreshRewriter {
       mvLocation: String,
       mvVersionBeforeRefresh: Option[Long]
   ): String =
-    replaceMvDataRef(rewriteSourceSnapshotCreate(stmt), viewLogicalName, deltaSnapshotRef(mvLocation, mvVersionBeforeRefresh))
+    replaceMvDataRef(
+      rewriteSourceSnapshotCreate(stmt),
+      viewLogicalName,
+      deltaSnapshotRef(mvLocation, mvVersionBeforeRefresh)
+    )
 
   /** Materialises the current rows for affected GROUP_RECOMPUTE keys as a
     * Spark temporary view. The native compiler uses a DuckDB TEMP TABLE here
@@ -4909,16 +4901,7 @@ object SparkRefreshRewriter {
         if (blockAliases.isEmpty) None
         else Some(selectIdx + "SELECT".length -> s" /*+ BROADCAST(${blockAliases.mkString(", ")}) */")
       }
-      if (edits.isEmpty) sql
-      else {
-        val out  = new StringBuilder(sql)
-        var bias = 0
-        edits.foreach { case (idx, hint) =>
-          out.insert(idx + bias, hint)
-          bias += hint.length
-        }
-        out.toString()
-      }
+      replaceSqlRanges(sql, edits.map { case (offset, text) => (offset, offset, text) })
     }
   }
 
