@@ -123,6 +123,10 @@ export class SmokeTestService implements SmokeAutomation {
         name: 'Metals Bloop import',
         script: 'bash .devcontainer/scripts/validate-metals.sh',
       },
+      ...['spark-3.5', 'spark-4.1'].map((target) => ({
+        name: `locked Python bridge (${target})`,
+        script: `bash spark-ext/dev/python-env.sh ${target}`,
+      })),
       {
         name: 'host Docker socket access',
         script: "docker version --format '{{.Client.Version}}/{{.Server.Version}}'",

@@ -46,6 +46,7 @@ cat >"$WORK_DIR/bin/sbt" <<'EOF'
     printf 'cli=%s\n' "$OPENIVM_CLI_PATH"
     printf 'extension=%s\n' "$OPENIVM_EXTENSION_PATH"
     printf 'sbt_opts=%s\n' "$SBT_OPTS"
+    printf 'pythonpath=%s\n' "$PYTHONPATH"
 } >"$DIRECT_RUNNER_CAPTURE.env"
 printf '%s\n' "$@" >"$DIRECT_RUNNER_CAPTURE.args"
 exit "${DIRECT_RUNNER_FAKE_RC:-0}"
@@ -63,6 +64,12 @@ printf 'cwd=%s\n' "$PWD" >"$OPENIVM_MAKE_CAPTURE.env"
 printf '%s\n' "$@" >"$OPENIVM_MAKE_CAPTURE.args"
 EOF
 
+cat >"$WORK_DIR/bin/python3" <<'EOF'
+#!/usr/bin/env bash
+[[ "$PYTHONPATH" == "/opt/openivm-python/$OPENIVM_SPARK_TARGET"* ]]
+EOF
+export PATH="$WORK_DIR/bin:$PATH"
+
 cat >"$WORK_DIR/native/duckdb" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "${DIRECT_RUNNER_NATIVE_VERSION:-${OPENIVM_COMMIT:0:10}}"
@@ -71,7 +78,7 @@ EOF
 : >"$WORK_DIR/openivm-source/Makefile"
 chmod +x "$WORK_DIR/jdk/bin/java" "$WORK_DIR/jdk21/bin/java" \
     "$WORK_DIR/bin/sbt" "$WORK_DIR/bin/docker" "$WORK_DIR/bin/make" \
-    "$WORK_DIR/native/duckdb"
+    "$WORK_DIR/native/duckdb" "$WORK_DIR/bin/python3"
 
 CAPTURE="$WORK_DIR/verify"
 OPENIVM_JAVA_HOME_SPARK_35="$WORK_DIR/jdk" \
@@ -103,6 +110,7 @@ cmp "$WORK_DIR/expected.args" "$CAPTURE.args"
 grep -Fqx "target=spark-3.5" "$CAPTURE.env"
 grep -Fqx "java_home=$WORK_DIR/jdk" "$CAPTURE.env"
 grep -Fqx "native_dir=$WORK_DIR/native" "$CAPTURE.env"
+grep -Fq "pythonpath=/opt/openivm-python/spark-3.5" "$CAPTURE.env"
 grep -Fq -- "-Dopenivm.test.forks=3" "$CAPTURE.env"
 grep -Fq -- "-Dopenivm.test.log.dir=$WORK_DIR/logs/test-20261001-152913" "$CAPTURE.env"
 [[ -d "$WORK_DIR/logs/test-20261001-152913" ]]
@@ -142,6 +150,7 @@ DIRECT_RUNNER_CAPTURE="$WORK_DIR/build41" \
 grep -Fqx "target=spark-4.1" "$WORK_DIR/build41.env"
 grep -Fqx "java_home=$WORK_DIR/jdk21" "$WORK_DIR/build41.env"
 grep -Fqx "compile" "$WORK_DIR/build41.args"
+grep -Fq "pythonpath=/opt/openivm-python/spark-4.1" "$WORK_DIR/build41.env"
 
 printf 'a.Test\nb.Test\n' >"$WORK_DIR/inventory/spark-3.5.txt"
 cp "$WORK_DIR/inventory/spark-3.5.txt" "$WORK_DIR/inventory/spark-4.1.txt"

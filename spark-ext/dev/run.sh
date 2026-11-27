@@ -190,6 +190,8 @@ setup_test_log_dir() {
 }
 
 run_sbt() {
+    # shellcheck source=python-env.sh
+    source "$SCRIPT_DIR/python-env.sh" "$OPENIVM_SPARK_TARGET"
     local sbt_bin="${OPENIVM_SBT_BIN:-sbt}"
     if [[ "$sbt_bin" == */* ]]; then
         [[ -x "$sbt_bin" ]] || die "SBT executable not found at $sbt_bin"

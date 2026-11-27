@@ -348,6 +348,8 @@ test('runtime smoke suite covers tools, native artifacts, lifecycle, SBT, and Do
     'lifecycle hook',
     'warmed Spark 3.5 and Spark 4.1 dependency caches',
     'Metals Bloop import',
+    'locked Python bridge (spark-3.5)',
+    'locked Python bridge (spark-4.1)',
     'host Docker socket access',
   ]);
   const scripts = checks.map((check) => check.script).join('\n');

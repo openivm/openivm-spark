@@ -49,6 +49,8 @@ test('declared image inputs mirror build/runtime assets and exclude host automat
     '.devcontainer/scripts/post-create.sh',
     'spark-ext/build.sbt',
     'spark-ext/dev/pins.env',
+    'spark-ext/dev/requirements-py4j-spark-3.5.txt',
+    'spark-ext/dev/requirements-py4j-spark-4.1.txt',
     'spark-ext/project/Dependencies.scala',
   ]) {
     assert.equal(inputs.has(expected), true, `missing hash input: ${expected}`);

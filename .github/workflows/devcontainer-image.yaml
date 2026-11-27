@@ -15,6 +15,7 @@ on:
       - 'spark-ext/build.sbt'
       - 'spark-ext/dev/docker/entrypoint.sh'
       - 'spark-ext/dev/pins.env'
+      - 'spark-ext/dev/requirements-py4j-*.txt'
       - 'spark-ext/dev/targets/**'
       - 'spark-ext/project/**'
       - '.github/workflows/devcontainer-image.yaml'

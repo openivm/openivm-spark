@@ -186,6 +186,13 @@ COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/ /usr/local/libexec/docker/cli-plugins/
 COPY --from=native-runtime-check /artifacts/ /opt/openivm/
 
+COPY spark-ext/dev/requirements-py4j-spark-3.5.txt spark-ext/dev/requirements-py4j-spark-4.1.txt /opt/openivm-python/
+RUN set -eu; for target in spark-3.5 spark-4.1; do \
+      python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes \
+        --target "/opt/openivm-python/${target}" \
+        -r "/opt/openivm-python/requirements-py4j-${target}.txt"; \
+    done
+
 RUN ln -s /opt/java/openjdk /opt/java/jdk-21 \
     && ln -s /opt/java/jdk-17 /opt/java/openjdk-17 \
     && existing_group="$(getent group 1000 | cut -d: -f1)" \

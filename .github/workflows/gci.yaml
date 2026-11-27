@@ -19,7 +19,7 @@ jobs:
     runs-on: [self-hosted, openivm-spark-azure]
     timeout-minutes: 350
     container:
-      image: ghcr.io/openivm/openivm-spark-devcontainer:b7ad83c26be4fd4ebff3ba8056030ab8810980415470475ae8efe6ebc5fdbd99
+      image: ghcr.io/openivm/openivm-spark-devcontainer:9952c5593ae6bd1591ff114eef49fa0f453d2962d41f3ec342b6d4596e16a40b
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -36,17 +36,6 @@ jobs:
 
       - name: Install locked tooling from the warmed cache
         run: npm ci --prefer-offline --no-audit --no-fund
-
-      - name: Install target Py4J
-        shell: bash
-        env:
-          SPARK_TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          py4j_dir="$(mktemp -d "$RUNNER_TEMP/openivm-py4j-$SPARK_TARGET.XXXXXX")"
-          python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes \
-            --target "$py4j_dir" -r "spark-ext/dev/requirements-py4j-$SPARK_TARGET.txt"
-          printf 'PYTHONPATH=%s%s\n' "$py4j_dir" "${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Verify
         run: >-
@@ -82,7 +71,7 @@ jobs:
     needs: verify
     runs-on: [self-hosted, openivm-spark-azure]
     container:
-      image: ghcr.io/openivm/openivm-spark-devcontainer:b7ad83c26be4fd4ebff3ba8056030ab8810980415470475ae8efe6ebc5fdbd99
+      image: ghcr.io/openivm/openivm-spark-devcontainer:9952c5593ae6bd1591ff114eef49fa0f453d2962d41f3ec342b6d4596e16a40b
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
