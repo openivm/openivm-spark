@@ -500,15 +500,18 @@ final class OpenIvmExecutionSpan private[telemetry] (
         requestId.foreach(fields.put("request_id", _))
         dbtNodeId.foreach(fields.put("dbt_node_id", _))
     }
-    fields.put("materialized_view", materializedView)
-    fields.put("operation", operation)
-    identity.foreach(export => fields.put("phase", export.phase))
     val end = if (exporting) completedEpochMs else math.max(startedAtEpochMs, completedEpochMs)
-    fields.put("engine_started_at", Instant.ofEpochMilli(startedAtEpochMs).toString)
-    fields.put("engine_completed_at", Instant.ofEpochMilli(end).toString)
-    putCount("duration_ms", if (exporting) durationMs else math.max(0L, durationMs))
-    fields.put("driver_thread", finalDriverThread)
-    fields.put("outcome", finalOutcome)
+    OpenIvmExecutionSpan.putSpanFields(
+      fields,
+      materializedView,
+      operation,
+      startedAtEpochMs,
+      end,
+      if (exporting) durationMs else math.max(0L, durationMs),
+      finalDriverThread,
+      finalOutcome,
+      identity.map(_.phase)
+    )
     refreshClassification.compileRefreshType.foreach(fields.put("compile_refresh_type", _))
     refreshClassification.effectiveRefreshType.foreach(fields.put("effective_refresh_type", _))
     refreshClassification.refreshReason.foreach(fields.put("refresh_reason", _))
@@ -562,6 +565,27 @@ final class OpenIvmExecutionSpan private[telemetry] (
 
 object OpenIvmExecutionSpan extends Logging {
   val TraceOperationIdProperty = "openivm.telemetry.refresh_id"
+
+  private def putSpanFields(
+      fields: LinkedHashMap[String, AnyRef],
+      materializedView: String,
+      operation: String,
+      startedAtEpochMs: Long,
+      completedAtEpochMs: Long,
+      durationMs: Long,
+      driverThread: String,
+      outcome: String,
+      phase: Option[String] = None
+  ): Unit = {
+    fields.put("materialized_view", materializedView)
+    fields.put("operation", operation)
+    phase.foreach(fields.put("phase", _))
+    fields.put("engine_started_at", Instant.ofEpochMilli(startedAtEpochMs).toString)
+    fields.put("engine_completed_at", Instant.ofEpochMilli(completedAtEpochMs).toString)
+    fields.put("duration_ms", java.lang.Long.valueOf(durationMs))
+    fields.put("driver_thread", driverThread)
+    fields.put("outcome", outcome)
+  }
 
   private def renderLockAcquisitions(
       acquisitions: Seq[LockAcquisitionTelemetry]
@@ -904,46 +928,20 @@ object OpenIvmExecutionSpan extends Logging {
     try {
       val startedAtEpochMs = Instant.parse(startUtc).toEpochMilli
       val durationMs       = TimeUnit.NANOSECONDS.toMillis(math.max(0L, durationNs))
-      val base = renderJson(
-        requestId = None,
-        dbtNodeId = None,
+      val fields           = new LinkedHashMap[String, AnyRef]()
+      putSpanFields(
+        fields = fields,
         materializedView = "",
         operation = "state_sync_backup",
         startedAtEpochMs = startedAtEpochMs,
         completedAtEpochMs = startedAtEpochMs + durationMs,
         durationMs = durationMs,
         driverThread = "state-sync",
-        outcome = outcome,
-        compileRefreshType = None,
-        effectiveRefreshType = None,
-        refreshReason = None,
-        timeTravelPinStatus = None,
-        timeTravelPinReason = None,
-        sameMvLockWaitMs = None,
-        lockAcquisitions = Seq.empty,
-        driverAdmissionWaitMs = None,
-        catalogPublicationAdmissionWidth = None,
-        catalogPublicationAdmissionWaitMs = None,
-        compilerMs = None,
-        catalogMs = None,
-        rocksDbWriteMs = None,
-        rocksDbWriteCount = 0L,
-        analysisMs = None,
-        watermarkMs = None,
-        ctasMs = None,
-        ctasDataWriteMs = None,
-        hiveCatalogPublicationMs = None,
-        metadataPublicationMs = None,
-        deltaVersionLookupMs = None,
-        deltaVersionLookupCount = 0L,
-        rocksDbFlushMs = None,
-        rocksDbFlushCount = 0L,
-        rocksDbFlushFailures = 0L,
-        rocksDbJvmLockWaitMs = None,
-        rocksDbExternalWaitMs = None,
-        rocksDbBackupMs = None
+        outcome = outcome
       )
-      val payload = withStateSync(base, evidence)
+      fields.put("rocksdb_flush_count", java.lang.Long.valueOf(0L))
+      fields.put("rocksdb_flush_failed_count", java.lang.Long.valueOf(0L))
+      val payload = withStateSync(Json.writeValueAsString(fields), evidence)
       val root    = Json.readTree(payload).deepCopy[com.fasterxml.jackson.databind.node.ObjectNode]()
       root.put("scope", "run")
       val runPayload = Json.writeValueAsString(root)
