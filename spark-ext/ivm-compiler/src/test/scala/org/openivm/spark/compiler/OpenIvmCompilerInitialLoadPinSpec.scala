@@ -59,6 +59,20 @@ class OpenIvmCompilerInitialLoadPinSpec extends AnyFunSpec with Matchers {
   }
 
   describe("initial-load statement extraction") {
+    it("binds a window source without exposing native CTE materialization hints to Spark") {
+      val sql = initialLoad(
+        """CREATE TABLE openivm_data_mv_stg AS WITH ranked AS MATERIALIZED (
+          | SELECT id, row_number() OVER (PARTITION BY bucket ORDER BY id) AS pos,
+          | 'AS MATERIALIZED (SELECT 1)' AS `AS MATERIALIZED (SELECT 2)` FROM parent
+          |) SELECT * FROM ranked;""".stripMargin
+      )
+      val bound = OpenIvmCompiler.reattachBareInitialLoadSources(
+        sql,
+        req("SELECT * FROM db.parent", qualified = Map("parent" -> "db.parent"))
+      )
+      bound should include("'AS MATERIALIZED (SELECT 1)' AS `AS MATERIALIZED (SELECT 2)` FROM db.parent")
+    }
+
     it("preserves literal semicolons and stops before the next sidecar statement") {
       initialLoad(
         """create table openivm_data_mv_stg as
