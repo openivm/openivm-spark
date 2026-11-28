@@ -372,16 +372,7 @@ object SparkRefreshRewriter {
         if (aliases.isEmpty) None
         else Some(selectIdx + "SELECT".length -> s" /*+ BROADCAST(${aliases.mkString(", ")}) */")
       }
-      if (edits.isEmpty) sql
-      else {
-        val out  = new StringBuilder(sql)
-        var bias = 0
-        edits.foreach { case (idx, hint) =>
-          out.insert(idx + bias, hint)
-          bias += hint.length
-        }
-        out.toString()
-      }
+      replaceSqlRanges(sql, edits.map { case (offset, text) => (offset, offset, text) })
     }
   }
 
@@ -434,16 +425,7 @@ object SparkRefreshRewriter {
           )
         }
       }
-      if (edits.isEmpty) sql
-      else {
-        val out  = new StringBuilder(sql)
-        var bias = 0
-        edits.foreach { case (idx, hint) =>
-          out.insert(idx + bias, hint)
-          bias += hint.length
-        }
-        out.toString()
-      }
+      replaceSqlRanges(sql, edits.map { case (offset, text) => (offset, offset, text) })
     }
   }
 
@@ -816,7 +798,7 @@ object SparkRefreshRewriter {
             hasRunningWindowProgram = true
             rewriteRunningWindowTempCreate(stmt, viewLogicalName, mvName, mvLocation, mvVersionBeforeRefresh)
           case StatementKind.RunningWindowFastInsert =>
-            Seq(rewriteRunningWindowFastInsert(stmt, viewLogicalName, mvName))
+            Seq(rewriteRunningWindowSqlRefs(stmt, viewLogicalName, backtickMvName(mvName)))
           case StatementKind.RunningWindowCascadeInsert =>
             Seq(rewriteRunningWindowCascadeInsert(stmt, viewLogicalName, mvName, viewDeltaPath))
           case StatementKind.RunningWindowTempDrop =>
@@ -824,7 +806,7 @@ object SparkRefreshRewriter {
           case StatementKind.GroupRecomputeAffectedCreate =>
             Seq(rewriteGroupRecomputeAffectedCreate(stmt, viewLogicalName, mvLocation, mvVersionBeforeRefresh))
           case StatementKind.GroupRecomputeAffectedDrop =>
-            Seq(rewriteGroupRecomputeAffectedDrop(stmt, viewLogicalName))
+            Seq(s"DROP VIEW IF EXISTS `openivm_affected_$viewLogicalName`")
           case StatementKind.GroupRecomputeRowsCreate =>
             Seq(rewriteGroupRecomputeRowsCreate(stmt, viewLogicalName, viewDeltaPath))
           case StatementKind.GroupRecomputeRowsInsert =>
@@ -1525,9 +1507,7 @@ object SparkRefreshRewriter {
       }
     }
 
-    replacements.sortBy(-_._1).foldLeft(sql) { case (rewritten, (start, end, body)) =>
-      rewritten.substring(0, start) + body + rewritten.substring(end)
-    }
+    replaceSqlRanges(sql, replacements)
   }
 
   /** The relation reference the old-state (pre-refresh / pre-advance) read of
@@ -1592,50 +1572,63 @@ object SparkRefreshRewriter {
     parsed.toVector
   }
 
-  /** Return the bounded delta-key sets that can prune direct base-table sides
-    * of regular N-term joins. Each request is derived from an equality inside
-    * one generated term, so callers may safely collect the requested delta
-    * column and feed it to [[pruneRegularNtermWithLiteralKeys]].
-    */
-  def regularNtermKeyRequests(sql: String): Seq[RegularNtermKeyRequest] =
-    regularNtermPruneSites(sql).map(_.request).distinct
+  /** Reuse the parsed join sites after collecting their bounded delta keys. */
+  private[spark] def planRegularNtermPruning(sql: String): RegularNtermPruning = {
+    val ctes =
+      if ("(?is)\\bVERSION\\s+AS\\s+OF\\b".r.findFirstIn(sql).isDefined) parseLeadingCtes(sql)
+      else Seq.empty
+    new RegularNtermPruning(sql, ctes, regularNtermPruneSites(ctes))
+  }
 
-  /** Add literal IN predicates to the direct base-table side of a regular
-    * N-term equality join. Missing requests are left untouched; callers use
-    * that fail-closed behaviour when a key set is too large or cannot be
-    * rendered as portable Spark SQL literals.
-    */
+  def regularNtermKeyRequests(sql: String): Seq[RegularNtermKeyRequest] =
+    planRegularNtermPruning(sql).requests
+
   def pruneRegularNtermWithLiteralKeys(
       sql: String,
       literalsByRequest: Map[RegularNtermKeyRequest, Seq[String]]
-  ): String = {
-    if (literalsByRequest.isEmpty) return sql
-    val ctes  = parseLeadingCtes(sql)
-    val sites = regularNtermPruneSites(sql).groupBy(_.cteName.toLowerCase)
-    val replacements = ctes.flatMap { cte =>
-      val predicates = sites
-        .getOrElse(cte.name.toLowerCase, Seq.empty)
-        .flatMap { site =>
-          literalsByRequest.get(site.request).map { literals =>
-            if (literals.isEmpty) "FALSE"
-            else s"${site.targetExpression} IN (${literals.mkString(", ")})"
+  ): String =
+    if (literalsByRequest.isEmpty) sql else planRegularNtermPruning(sql).withLiteralKeys(literalsByRequest)
+
+  private[spark] final class RegularNtermPruning private[SparkRefreshRewriter] (
+      sql: String,
+      ctes: Seq[ParsedCte],
+      sites: Seq[RegularNtermPruneSite]
+  ) {
+    def requests: Seq[RegularNtermKeyRequest] = sites.map(_.request).distinct
+
+    def withLiteralKeys(literalsByRequest: Map[RegularNtermKeyRequest, Seq[String]]): String = {
+      if (literalsByRequest.isEmpty || sites.isEmpty) return sql
+      val byCte = sites.groupBy(_.cteName.toLowerCase)
+      val replacements = ctes.flatMap { cte =>
+        val predicates = byCte
+          .getOrElse(cte.name.toLowerCase, Seq.empty)
+          .flatMap { site =>
+            literalsByRequest.get(site.request).map { literals =>
+              if (literals.isEmpty) "FALSE"
+              else s"${site.targetExpression} IN (${literals.mkString(", ")})"
+            }
           }
-        }
-        .distinct
-      if (predicates.isEmpty) None
-      else {
-        val body = predicates.foldLeft(cte.body)(addTopLevelWhereConjunct)
-        Some((cte.bodyStart, cte.bodyEnd, body))
+          .distinct
+        if (predicates.isEmpty) None
+        else Some((cte.bodyStart, cte.bodyEnd, predicates.foldLeft(cte.body)(addTopLevelWhereConjunct)))
       }
-    }
-    replacements.sortBy(-_._1).foldLeft(sql) { case (rewritten, (start, end, body)) =>
-      rewritten.substring(0, start) + body + rewritten.substring(end)
+      replaceSqlRanges(sql, replacements)
     }
   }
 
-  private def regularNtermPruneSites(sql: String): Seq[RegularNtermPruneSite] = {
-    if (!"(?is)\\bVERSION\\s+AS\\s+OF\\b".r.findFirstIn(sql).isDefined) return Seq.empty
-    val ctes   = parseLeadingCtes(sql)
+  // Replacements and insertions are disjoint and appear in their original SQL order.
+  private def replaceSqlRanges(sql: String, replacements: Seq[(Int, Int, String)]): String = {
+    if (replacements.isEmpty) return sql
+    val out    = new java.lang.StringBuilder(sql.length)
+    var offset = 0
+    replacements.foreach { case (start, end, body) =>
+      out.append(sql, offset, start).append(body)
+      offset = end
+    }
+    out.append(sql, offset, sql.length).toString
+  }
+
+  private def regularNtermPruneSites(ctes: Seq[ParsedCte]): Seq[RegularNtermPruneSite] = {
     val byName = ctes.map(cte => cte.name.toLowerCase -> cte).toMap
     if (byName.isEmpty) return Seq.empty
 
@@ -4034,8 +4027,13 @@ object SparkRefreshRewriter {
       mvLocation: String,
       mvVersionBeforeRefresh: Option[Long]
   ): Seq[String] = {
-    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
-    s = rewriteRunningWindowSnapshotRefs(s, viewLogicalName, mvName, mvLocation, mvVersionBeforeRefresh)
+    // Bounds and state are pre-refresh reads. The live name is the fallback
+    // when the caller cannot supply a Delta version.
+    val ref = mvVersionBeforeRefresh match {
+      case Some(version) => s"delta.`${mvLocation.replace("`", "``")}` VERSION AS OF $version"
+      case None          => backtickMvName(mvName)
+    }
+    val s = rewriteRunningWindowSqlRefs(rewriteCreateOrReplaceTempTableAsView(stmt), viewLogicalName, ref)
     val nameRe =
       "(?is)CREATE\\s+OR\\s+REPLACE\\s+TEMPORARY\\s+VIEW\\s+`?([A-Za-z0-9_]+)`?\\s+AS".r
     nameRe.findFirstMatchIn(s) match {
@@ -4047,13 +4045,6 @@ object SparkRefreshRewriter {
       case None    => Seq(s)
     }
   }
-
-  private def rewriteRunningWindowFastInsert(
-      stmt: String,
-      viewLogicalName: String,
-      mvName: TableIdentifier
-  ): String =
-    rewriteRunningWindowSqlRefs(stmt, viewLogicalName, mvName)
 
   /** Rewrite the WINDOW running-suffix fast-path cascade delta INSERT.
     *
@@ -4084,52 +4075,17 @@ object SparkRefreshRewriter {
       stmt,
       java.util.regex.Matcher.quoteReplacement(s"INSERT INTO delta.`$escapedPath`")
     )
-    rewriteRunningWindowSqlRefs(retargeted, viewLogicalName, mvName)
+    rewriteRunningWindowSqlRefs(retargeted, viewLogicalName, backtickMvName(mvName))
   }
 
-  /** Shared reference rewrites for the fast MV insert + fast cascade append:
-    * the `openivm_data_<view>` occurrence is the writable INSERT TARGET (fast
-    * insert) or absent (cascade), so it maps to the live MV identifier.
-    */
-  private def rewriteRunningWindowSqlRefs(
-      stmt: String,
-      viewLogicalName: String,
-      mvName: TableIdentifier
-  ): String = {
-    val dataViewRe = ("(?i)\\bopenivm_data_" +
-      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
-    var s = dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(backtickMvName(mvName)))
-    s = stripTimestampPredicate(s)
-    s = rewriteMemoryMainPrefix(s)
-    s = rewriteExcludeAsExcept(s)
-    s
+  private def rewriteRunningWindowSqlRefs(stmt: String, viewLogicalName: String, mvRef: String): String = {
+    val rebound = replaceMvDataRef(stmt, viewLogicalName, mvRef)
+    rewriteExcludeAsExcept(rewriteMemoryMainPrefix(stripTimestampPredicate(rebound)))
   }
 
-  /** Reference rewrites for the running-window `bounds`/`state` snapshot
-    * TEMP-TABLE creates. Their `openivm_data_<view>` occurrences are READS of
-    * the MV that must snapshot the PRE-refresh version (the program mutates the
-    * MV mid-refresh via the fallback DELETE+INSERT and the fast INSERT), so
-    * they pin to `delta.<location> VERSION AS OF <pre-refresh-version>`. Falls
-    * back to the live identifier when no version is known.
-    */
-  private def rewriteRunningWindowSnapshotRefs(
-      stmt: String,
-      viewLogicalName: String,
-      mvName: TableIdentifier,
-      mvLocation: String,
-      mvVersionBeforeRefresh: Option[Long]
-  ): String = {
-    val mvRef = mvVersionBeforeRefresh match {
-      case Some(version) => s"delta.`${mvLocation.replace("`", "``")}` VERSION AS OF $version"
-      case None          => backtickMvName(mvName)
-    }
-    val dataViewRe = ("(?i)\\bopenivm_data_" +
-      java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
-    var s = dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(mvRef))
-    s = stripTimestampPredicate(s)
-    s = rewriteMemoryMainPrefix(s)
-    s = rewriteExcludeAsExcept(s)
-    s
+  private def replaceMvDataRef(stmt: String, viewLogicalName: String, mvRef: String): String = {
+    val dataViewRe = ("(?i)\\bopenivm_data_" + java.util.regex.Pattern.quote(viewLogicalName) + "\\b").r
+    dataViewRe.replaceAllIn(stmt, java.util.regex.Matcher.quoteReplacement(mvRef))
   }
 
   private def rewriteRunningWindowTempDrop(stmt: String, viewLogicalName: String): String = {
@@ -4149,20 +4105,16 @@ object SparkRefreshRewriter {
       viewLogicalName: String,
       mvLocation: String,
       mvVersionBeforeRefresh: Option[Long]
-  ): String = {
-    val escapedLocation = mvLocation.replace("`", "``")
-    val snapshotTable = mvVersionBeforeRefresh match {
-      case Some(version) => s"delta.`$escapedLocation` VERSION AS OF $version"
-      case None          => s"delta.`$escapedLocation`"
-    }
-    val dataViewRe = ("(?i)\\bopenivm_data_" +
-      java.util.regex.Pattern.quote(viewLogicalName) +
-      "\\b").r
+  ): String =
+    replaceMvDataRef(
+      stripTimestampPredicate(rewriteCreateOrReplaceTempTableAsView(stmt)),
+      viewLogicalName,
+      deltaSnapshotRef(mvLocation, mvVersionBeforeRefresh)
+    )
 
-    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
-    s = stripTimestampPredicate(s)
-    s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(snapshotTable))
-    s
+  private def deltaSnapshotRef(location: String, version: Option[Long]): String = {
+    val table = s"delta.`${location.replace("`", "``")}`"
+    version.fold(table)(v => s"$table VERSION AS OF $v")
   }
 
   /** Rewrites current-diff and new-state source snapshots into Spark TEMPORARY
@@ -4295,39 +4247,12 @@ object SparkRefreshRewriter {
       viewLogicalName: String,
       mvLocation: String,
       mvVersionBeforeRefresh: Option[Long]
-  ): String = {
-    val escapedLocation = mvLocation.replace("`", "``")
-    val snapshotTable = mvVersionBeforeRefresh match {
-      case Some(version) => s"delta.`$escapedLocation` VERSION AS OF $version"
-      case None          => s"delta.`$escapedLocation`"
-    }
-    val dataViewRe = ("(?i)\\bopenivm_data_" +
-      java.util.regex.Pattern.quote(viewLogicalName) +
-      "\\b").r
-
-    var s = rewriteCreateOrReplaceTempTableAsView(stmt)
-    s = stripTimestampPredicate(s)
-    s = rewriteMemoryMainPrefix(s)
-    s = rewriteExcludeAsExcept(s)
-    s = dataViewRe.replaceAllIn(s, java.util.regex.Matcher.quoteReplacement(snapshotTable))
-    s
-  }
-
-  /** Rewrites the GROUP_RECOMPUTE Statement E into a Spark
-    * `DROP VIEW IF EXISTS` matching the TEMPORARY VIEW created by Statement B.
-    *
-    * Rebuilds the statement from `viewLogicalName` to avoid fragile pattern
-    * preservation (openivm sometimes emits the identifier unquoted, sometimes
-    * with DuckDB double-quotes).
-    */
-  private def rewriteGroupRecomputeAffectedDrop(
-      stmt: String,
-      viewLogicalName: String
-  ): String = {
-    val _            = stmt
-    val affectedName = s"openivm_affected_$viewLogicalName"
-    s"DROP VIEW IF EXISTS `$affectedName`"
-  }
+  ): String =
+    replaceMvDataRef(
+      rewriteSourceSnapshotCreate(stmt),
+      viewLogicalName,
+      deltaSnapshotRef(mvLocation, mvVersionBeforeRefresh)
+    )
 
   /** Materialises the current rows for affected GROUP_RECOMPUTE keys as a
     * Spark temporary view. The native compiler uses a DuckDB TEMP TABLE here
@@ -5298,16 +5223,7 @@ object SparkRefreshRewriter {
         if (blockAliases.isEmpty) None
         else Some(selectIdx + "SELECT".length -> s" /*+ BROADCAST(${blockAliases.mkString(", ")}) */")
       }
-      if (edits.isEmpty) sql
-      else {
-        val out  = new StringBuilder(sql)
-        var bias = 0
-        edits.foreach { case (idx, hint) =>
-          out.insert(idx + bias, hint)
-          bias += hint.length
-        }
-        out.toString()
-      }
+      replaceSqlRanges(sql, edits.map { case (offset, text) => (offset, offset, text) })
     }
   }
 

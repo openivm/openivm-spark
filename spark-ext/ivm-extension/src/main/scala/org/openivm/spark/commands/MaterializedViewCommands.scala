@@ -3543,9 +3543,6 @@ case class CreateMaterializedViewCommand(
         "_LEGACY_ERROR_TEMP_2273",
         Map("message" -> s"Managed materialized-view sources for '${metaName(name)}' changed during CREATE admission")
       )
-    val sourceIsMv: Boolean = upstreamMvByQual.nonEmpty
-    val distinctUpstreamMvCount: Int =
-      upstreamMvByQual.values.map(m => metaName(m.name)).toSet.size
     // Upstream MVs that cannot feed a view-delta. DIAGNOSTIC ONLY — it never
     // demotes; see computeUpstreamSnapshotTriggerDetail.
     val upstreamSnapshotTriggerDetail: Option[String] =
@@ -3626,22 +3623,17 @@ case class CreateMaterializedViewCommand(
       emitsCascadeViewDelta = emitsCascadeViewDelta,
       upstreamSnapshotTrigger = classification.upstreamSnapshotTrigger
     )
-    // `sourceIsMv`/`distinctUpstreamMvCount` are computed for logging visibility
-    // only; the demotion is driven by the shared classifier above.
-    val _ = (sourceIsMv, distinctUpstreamMvCount)
 
-    {
-      val msg =
-        s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${classification.compileRefreshTypeName}' " +
-          s"effective_refresh_type='$effectiveRefreshTypeName' reason='$classifyReason' " +
-          s"emits_cascade_view_delta='$emitsCascadeViewDelta' " +
-          MvCommandHelper.pinTelemetryKv(pinTelemetry.status, pinTelemetry.reason, pinTelemetry.pins) +
-          classification.upstreamSnapshotTrigger.fold("")(d => s" upstream_snapshot_trigger='$d'")
-      if (classification.isDemotionToFullRefresh)
-        logError(msg)
-      else
-        logInfo(msg)
-    }
+    val classificationMessage =
+      s"[openivm-mv] view='${sqlIdent(name)}' compiled_refresh_type='${classification.compileRefreshTypeName}' " +
+        s"effective_refresh_type='$effectiveRefreshTypeName' reason='$classifyReason' " +
+        s"emits_cascade_view_delta='$emitsCascadeViewDelta' " +
+        MvCommandHelper.pinTelemetryKv(pinTelemetry.status, pinTelemetry.reason, pinTelemetry.pins) +
+        classification.upstreamSnapshotTrigger.fold("")(d => s" upstream_snapshot_trigger='$d'")
+    if (classification.isDemotionToFullRefresh)
+      logError(classificationMessage)
+    else
+      logInfo(classificationMessage)
 
     // Incremental maintenance evaluates an expression only for the rows, groups or partitions a
     // refresh touches, so a random or time-dependent one leaves the view diverging from a
@@ -6689,36 +6681,31 @@ case class RefreshMaterializedViewCommand(
                   .map(SourceVersionDelta.buildBagDiffSql(_, schema))
                   .getOrElse(propagation.buildSourceDeltaViewSql(qualTable, schema, tableBatches))
                 var registrationSucceeded = false
-                val viewSql =
-                  try {
-                    val registered = sourceVersionBatch match {
-                      case Some(batch) => SourceVersionDelta.registerSourceDeltaView(spark, batch, schema)
-                      case None =>
-                        propagation match {
-                          case cdf: CdfChangePropagation if meta.refreshType == RefreshTypeCode.WindowPartition =>
-                            val (sql, coverage) =
-                              cdf.registerSourceDeltaWithCoverage(spark, qualTable, schema, tableBatches)
-                            coverage.foreach(view => registeredCdfDeltaViews(view.batch) = view)
-                            sql
-                          case _ => propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches)
-                        }
-                    }
-                    registrationSucceeded = true
-                    registered
-                  } finally {
-                    val ms = (System.nanoTime() - t0) / 1000000L
-                    sqlLog.record(
-                      category = "register_source_delta",
-                      stmtOrder = qlogOrder.getAndIncrement(),
-                      attemptIdx = 0,
-                      stmtKind = "temp_view",
-                      sql = diagnosticSql,
-                      durationMs = ms,
-                      succeeded = registrationSucceeded
-                    )
+                try {
+                  sourceVersionBatch match {
+                    case Some(batch) => SourceVersionDelta.registerSourceDeltaView(spark, batch, schema)
+                    case None =>
+                      propagation match {
+                        case cdf: CdfChangePropagation if meta.refreshType == RefreshTypeCode.WindowPartition =>
+                          val (_, coverage) =
+                            cdf.registerSourceDeltaWithCoverage(spark, qualTable, schema, tableBatches)
+                          coverage.foreach(view => registeredCdfDeltaViews(view.batch) = view)
+                        case _ => propagation.registerSourceDeltaView(spark, qualTable, schema, tableBatches)
+                      }
                   }
-                // viewSql is the exact SQL the impl executed (used by impl-specific diagnostics).
-                val _ = viewSql
+                  registrationSucceeded = true
+                } finally {
+                  val ms = (System.nanoTime() - t0) / 1000000L
+                  sqlLog.record(
+                    category = "register_source_delta",
+                    stmtOrder = qlogOrder.getAndIncrement(),
+                    attemptIdx = 0,
+                    stmtKind = "temp_view",
+                    sql = diagnosticSql,
+                    durationMs = ms,
+                    succeeded = registrationSucceeded
+                  )
+                }
                 tempViewShortNames += qualTable.split("\\.").last
 
                 if (diagnosticsEnabled) {
@@ -7011,23 +6998,24 @@ case class RefreshMaterializedViewCommand(
             RefreshPerf.timePhase(refreshId, viewLabel, "rewrite") {
               val snapshotVersions = sourceSnapshotWatermarks.collect {
                 case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
-              } ++ sourceSnapshotAdvanceOldVersions
-              val snapshotRelations = snapshotVersions.flatMap { case (source, version) =>
-                if (executionSnapshotPinsByQualified.keys.exists(_.equalsIgnoreCase(source))) None
-                else {
-                  val relation = currentSourceRelations.get(source).orElse {
-                    try Some(spark.table(source))
-                    catch { case _: AnalysisException => None }
-                  }
-                  relation
-                    .flatMap(MvProjectionSource.readProjection(spark, _, Map("versionAsOf" -> version.toString)))
-                    .map { snapshot =>
-                      val tempName = s"openivm_source_snapshot_${source.split("\\.").last}"
-                      snapshot.createOrReplaceTempView(tempName)
-                      sourceSnapshotTempViews += tempName
-                      source -> s"`${tempName.replace("`", "``")}`"
+              }
+              val snapshotRelations = (snapshotVersions ++ sourceSnapshotAdvanceOldVersions).flatMap {
+                case (source, version) =>
+                  if (executionSnapshotPinsByQualified.keys.exists(_.equalsIgnoreCase(source))) None
+                  else {
+                    val relation = currentSourceRelations.get(source).orElse {
+                      try Some(spark.table(source))
+                      catch { case _: AnalysisException => None }
                     }
-                }
+                    relation
+                      .flatMap(MvProjectionSource.readProjection(spark, _, Map("versionAsOf" -> version.toString)))
+                      .map { snapshot =>
+                        val tempName = s"openivm_source_snapshot_${source.split("\\.").last}"
+                        snapshot.createOrReplaceTempView(tempName)
+                        sourceSnapshotTempViews += tempName
+                        source -> s"`${tempName.replace("`", "``")}`"
+                      }
+                  }
               }
               SparkRefreshRewriter.rewrite(
                 compiledSql = compiled.sql,
@@ -7069,9 +7057,7 @@ case class RefreshMaterializedViewCommand(
                 // Path is stable across ADVANCE; the clause/old-version above and
                 // sourceSnapshotAdvanceOldVersions below carry the version.
                 sourceSnapshotPinnedPaths = MvCommandHelper.pinnedPathByShort(refreshBinding),
-                sourceSnapshotVersions = sourceSnapshotWatermarks.collect {
-                  case (source, ChangeWatermark.DeltaVersion(version)) => source -> version
-                },
+                sourceSnapshotVersions = snapshotVersions,
                 sourceSnapshotAdvanceOldVersions = sourceSnapshotAdvanceOldVersions,
                 mvVersionBeforeRefresh = Some(meta.lastVersion),
                 sourceSnapshotRelations = snapshotRelations,
@@ -7105,7 +7091,8 @@ case class RefreshMaterializedViewCommand(
           var literalPruneApplied = false
           val rewritten =
             if (FeatureGate.regularNtermLiteralPruneEnabled(spark)) {
-              val requests = rewrittenBase.statements.flatMap(SparkRefreshRewriter.regularNtermKeyRequests).distinct
+              val pruning  = rewrittenBase.statements.map(SparkRefreshRewriter.planRegularNtermPruning)
+              val requests = pruning.flatMap(_.requests).distinct
               val literals = collectRegularNtermLiteralKeys(spark, requests, freshSchemas)
               if (literals.nonEmpty) {
                 logInfo(
@@ -7113,11 +7100,7 @@ case class RefreshMaterializedViewCommand(
                     s"outcome='regular_nterm_literal_prune' key_sets='${literals.size}'"
                 )
                 literalPruneApplied = true
-                rewrittenBase.copy(
-                  statements = rewrittenBase.statements.map(
-                    SparkRefreshRewriter.pruneRegularNtermWithLiteralKeys(_, literals)
-                  )
-                )
+                rewrittenBase.copy(statements = pruning.map(_.withLiteralKeys(literals)))
               } else rewrittenBase
             } else rewrittenBase
 
