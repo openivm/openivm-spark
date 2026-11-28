@@ -425,6 +425,26 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     result.sql should not be empty
   }
 
+  it should "bind materialized CTEs emitted for a window with reused ranked inputs" in {
+    val branches = 0 until 8
+    val ranks =
+      branches.map(i => s"w$i AS (SELECT k, id, row_number() OVER (PARTITION BY k ORDER BY id + $i) rn FROM src)")
+    val keys  = branches.map(i => s"SELECT k FROM w$i WHERE rn = 1").mkString(" UNION ")
+    val order = branches.map(i => s"w$i.id").mkString(", ")
+    val joins = branches.map(i => s"LEFT JOIN w$i ON keys.k = w$i.k AND w$i.rn = 1").mkString(" ")
+    val request = CompileRequest(
+      viewName = "mv_ranked_inputs",
+      viewSql = s"WITH ${ranks.mkString(", ")}, keys AS ($keys) " +
+        s"SELECT keys.k, row_number() OVER (PARTITION BY keys.k ORDER BY $order) pos FROM keys $joins",
+      sources = Map("src" -> StructType.fromDDL("k INT, id INT")),
+      sourceQualifiedNames = Map("src" -> "db.src")
+    )
+    val result = sharedCompiler.compile(request)
+    result.refreshTypeName shouldBe "WINDOW_PARTITION"
+    result.initialLoadSql should not be empty
+    noException should be thrownBy OpenIvmCompiler.reattachBareInitialLoadSources(result.initialLoadSql, request)
+  }
+
   it should "translate native struct access and LAG SQL for Spark initial load" in {
     val result = sharedCompiler.compile(
       CompileRequest(

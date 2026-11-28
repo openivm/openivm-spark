@@ -119,6 +119,9 @@ object LptsSparkDialect {
   private val AntiJoinProjectionRe =
     """(?i)\bANTI\s+JOIN\s+(t\d+_projection_materialized_for_join)\s+ON\b""".r
 
+  private val MaterializedCteRe =
+    """(?i)\bAS\s+MATERIALIZED(?=\s*\(\s*SELECT\b(?!\s*[,)]))""".r.pattern
+
   private val BareWhereParenRe = """(?i)WHERE\s+\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)""".r
 
   // ── Public API ───────────────────────────────────────────────────────────────
@@ -139,7 +142,7 @@ object LptsSparkDialect {
     *     sees the exact string-literal content Spark's parser will receive.
     */
   def translate(sql: String): String = {
-    val qualified   = SparkFunctionShimSql.rewriteQualifiedSystemIntervals(sql)
+    val qualified   = SparkFunctionShimSql.rewriteQualifiedSystemIntervals(stripMaterializedCteHints(sql))
     val predicates  = rewriteWhereBooleanColumn(qualified)
     val unqualified = stripNativeBuiltinQualification(predicates)
     val castTypes   = rewriteQuotedCastTypes(unqualified)
@@ -156,6 +159,19 @@ object LptsSparkDialect {
     val identifiers = rewriteDoubleQuotedIdentifiers(rewriteErrorFn(rewriteCountStar(intervals)))
     val translated  = rewriteBareBackslashLiterals(rewriteTrimTwoArg(rewriteNativeInfinityAndTrim(identifiers)))
     deduplicateAntiJoinProjectionInputs(rewriteParenthesizedBareWhere(translated))
+  }
+
+  // Native SQL can request physical materialization for large generated CTEs.
+  // Keep the CTE and its references; Spark plans its own materialization.
+  private def stripMaterializedCteHints(sql: String): String = {
+    val matcher = MaterializedCteRe.matcher(sql)
+    if (!matcher.find()) return sql
+    matcher.useTransparentBounds(true)
+    SparkFunctionShimSql.rewriteOutsideProtected(sql, protectBackticks = true) { i =>
+      if (sql.regionMatches(true, i, "AS", 0, 2) && matcher.region(i, sql.length).lookingAt())
+        Some(matcher.end() -> sql.substring(i, i + 2))
+      else None
+    }
   }
 
   /** Spark analyzes `WHERE (flag)` as a row expression in generated CTEs,
