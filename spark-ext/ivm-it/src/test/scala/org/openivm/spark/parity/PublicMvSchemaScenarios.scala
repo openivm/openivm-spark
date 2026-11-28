@@ -5,6 +5,7 @@ import org.openivm.spark.common.{
   DeltaTableVersion,
   MvCatalog,
   MvMetadata,
+  PublicOutputNames,
   RefreshTypeCode,
   SourceVersionChangeBatch,
   SourceVersionDelta,
@@ -58,6 +59,20 @@ abstract class PublicMvSchemaScenarios extends IvmParitySpecBase("public-mv-sche
     physical.filterNot(column => userNames.exists(_.equalsIgnoreCase(column))) should not be empty
   }
 
+  private def assertMappedState(name: String, query: String, publics: Seq[String]): Unit = {
+    assertBackingState(name, query)
+    val view  = spark.sessionState.catalog.getTableMetadata(spark.sessionState.sqlParser.parseTableIdentifier(name))
+    val names = PublicOutputNames.of(view.properties)
+    names.pairs.map(_._1) shouldBe publics
+    val physical = spark.read.format("delta").load(metadata(name).location).schema.fieldNames.toSeq
+    names.pairs.foreach { case (public, column) =>
+      column should startWith("ivm_alias_")
+      column.toLowerCase(java.util.Locale.ROOT) should not include "openivm"
+      physical should contain(column)
+      physical.exists(_.equalsIgnoreCase(public)) shouldBe false
+    }
+  }
+
   describe("public MV schemas with compiler maintenance state") {
     it("retains null SUM state, public types and user-authored openivm column names across refresh") {
       sql("CREATE TABLE ps_amounts (id INT, bucket STRING, amount DECIMAL(10, 2)) USING DELTA")
@@ -67,15 +82,57 @@ abstract class PublicMvSchemaScenarios extends IvmParitySpecBase("public-mv-sche
           |COUNT(amount) AS PresentCount, AVG(amount) AS AverageAmount
           |FROM ps_amounts GROUP BY bucket""".stripMargin
       sql(s"CREATE MATERIALIZED VIEW default.ps_amounts_mv AS $query")
-      assertBackingState("ps_amounts_mv", query)
+      assertMappedState("ps_amounts_mv", query, Seq("openivm_user_total"))
 
       sql("UPDATE ps_amounts SET amount = 4.25 WHERE id = 1")
       refreshMv("ps_amounts_mv")
-      assertBackingState("ps_amounts_mv", query)
+      assertMappedState("ps_amounts_mv", query, Seq("openivm_user_total"))
 
       sql("DELETE FROM ps_amounts WHERE id IN (1, 3)")
       refreshMv("ps_amounts_mv")
-      assertBackingState("ps_amounts_mv", query)
+      assertMappedState("ps_amounts_mv", query, Seq("openivm_user_total"))
+    }
+
+    it("keeps native helper-colliding aliases incremental in both spellings across min-affecting changes") {
+      sql("CREATE TABLE ps_rowid (id INT, bucket STRING, amount INT) USING DELTA")
+      sql("INSERT INTO ps_rowid VALUES (1, 'a', 5), (2, 'a', 3), (3, 'b', 7), (4, 'b', 9)")
+      val queries = Seq(
+        ("ps_rowid_lower_mv", "openivm_target_rowid", "SELECT bucket, MIN(amount) AS openivm_target_rowid"),
+        ("ps_rowid_upper_mv", "OPENIVM_TARGET_ROWID", "SELECT bucket, MIN(amount) AS `OPENIVM_TARGET_ROWID`")
+      ).map { case (name, public, select) =>
+        (name, public, s"$select, COUNT(*) AS row_count FROM ps_rowid GROUP BY bucket")
+      }
+      queries.foreach { case (name, public, query) =>
+        sql(s"CREATE MATERIALIZED VIEW default.$name AS $query")
+        assertMappedState(name, query, Seq(public))
+      }
+      sql("DELETE FROM ps_rowid WHERE id = 2")
+      sql("UPDATE ps_rowid SET amount = 1 WHERE id = 4")
+      sql("INSERT INTO ps_rowid VALUES (5, 'c', 4)")
+      queries.foreach { case (name, public, query) =>
+        refreshMv(name)
+        assertMappedState(name, query, Seq(public))
+      }
+    }
+
+    it("preserves openivm_ literals and HAVING over a legitimate user alias across refresh") {
+      sql("CREATE TABLE ps_literal (id INT, bucket STRING, tag STRING, amount INT) USING DELTA")
+      sql(
+        "INSERT INTO ps_literal VALUES (1, 'a', 'openivm_keep', 4), (2, 'a', 'other', 2), " +
+          "(3, 'b', 'openivm_keep', 1), (4, 'b', 'openivm_keep', 5)"
+      )
+      val query =
+        """SELECT bucket, SUM(CASE WHEN tag = 'openivm_keep' THEN amount ELSE 0 END) AS openivm_kept,
+          |COUNT(*) AS row_count FROM ps_literal GROUP BY bucket
+          |HAVING SUM(CASE WHEN tag = 'openivm_keep' THEN amount ELSE 0 END) > 3""".stripMargin
+      sql(s"CREATE MATERIALIZED VIEW default.ps_literal_mv AS $query")
+      assertMappedState("ps_literal_mv", query, Seq("openivm_kept"))
+
+      sql("INSERT INTO ps_literal VALUES (5, 'c', 'openivm_keep', 9)")
+      sql("UPDATE ps_literal SET tag = 'other' WHERE id = 4")
+      sql("DELETE FROM ps_literal WHERE id = 1")
+      refreshMv("ps_literal_mv")
+      assertMappedState("ps_literal_mv", query, Seq("openivm_kept"))
     }
 
     it("hides DISTINCT occurrence state while preserving duplicate and NULL transitions") {

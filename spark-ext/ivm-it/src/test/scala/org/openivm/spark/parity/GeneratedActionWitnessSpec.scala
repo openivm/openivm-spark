@@ -1,0 +1,116 @@
+package org.openivm.spark.parity
+
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Paths}
+
+import org.apache.spark.sql.DataFrame
+import org.openivm.spark.common.{
+  DeltaCommitClassifier,
+  FeatureGate,
+  MvCatalog,
+  RefreshProfileCatalog,
+  RefreshSqlLogAsyncFlusher,
+  RefreshSqlLogCatalog,
+  RewriteLineage,
+  SparkRefreshRewriter
+}
+import org.openivm.spark.parity.base.{InterceptMode, IvmParitySpecBase}
+
+class GeneratedActionWitnessSpec extends IvmParitySpecBase("generated-action-witness") with InterceptMode {
+  private val evidence = Paths.get("/workspaces/openivm-spark/.logs/generated-action-witness")
+  Files.createDirectories(evidence.resolve("events"))
+
+  override protected def extraSparkConf: Map[String, String] = Map(
+    "spark.openivm.profile.refresh"      -> "true",
+    FeatureGate.QueryLogEnabledKey       -> "true",
+    FeatureGate.ExplainCaptureKey        -> "true",
+    FeatureGate.StateSyncAsyncEnabledKey -> "false",
+    FeatureGate.FuseScratchEnabledKey    -> "false",
+    "spark.eventLog.enabled"             -> "true",
+    "spark.eventLog.compress"            -> "false",
+    "spark.eventLog.dir"                 -> evidence.resolve("events").toUri.toString
+  )
+
+  private def write(name: String, data: String): Unit =
+    Files.write(evidence.resolve(name), data.getBytes(StandardCharsets.UTF_8))
+
+  private def writeJson(name: String, df: DataFrame): Unit =
+    write(name, df.toJSON.collect().mkString("", "\n", "\n"))
+
+  private def sameBag(a: DataFrame, b: DataFrame): Unit = {
+    a.exceptAll(b).count() shouldBe 0L
+    b.exceptAll(a).count() shouldBe 0L
+  }
+
+  private def snapshot(df: DataFrame): DataFrame =
+    spark.createDataFrame(spark.sparkContext.parallelize(df.collect().toSeq), df.schema)
+
+  it("captures ordinary target insert evidence across distinct changes and replay") {
+    RefreshProfileCatalog.ensureTables(spark)
+    sql("CREATE TABLE witness_src (id INT, v INT) USING DELTA")
+    sql("INSERT INTO witness_src VALUES (1, 10), (2, 20)")
+    sql("CREATE MATERIALIZED VIEW witness_mv AS SELECT id, v FROM witness_src WHERE v >= 10")
+    val meta = MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier("witness_mv")).get
+    write("target.txt", s"$meta\n")
+    writeJson("initial-mv.jsonl", spark.table("witness_mv").select("id", "v"))
+
+    def run(label: String, mutation: Option[String]): Unit = {
+      val previousMv      = snapshot(spark.table("witness_mv").select("id", "v"))
+      val previousSource  = snapshot(sql("SELECT id, v FROM witness_src WHERE v >= 10"))
+      val previousVersion = DeltaCommitClassifier.latestVersion(spark, meta.location)
+      mutation.foreach(sql)
+      RefreshProfileCatalog.removeAll(spark)
+      sql("REFRESH MATERIALIZED VIEW witness_mv").collect()
+      val currentVersion = DeltaCommitClassifier.latestVersion(spark, meta.location)
+      currentVersion shouldBe previousVersion + (if (mutation.isDefined) 1L else 0L)
+      val currentMv     = snapshot(spark.table("witness_mv").select("id", "v"))
+      val currentSource = snapshot(sql("SELECT id, v FROM witness_src WHERE v >= 10"))
+      sameBag(currentMv, currentSource)
+      sameBag(currentMv.exceptAll(previousMv), currentSource.exceptAll(previousSource))
+      sameBag(previousMv.exceptAll(currentMv), previousSource.exceptAll(currentSource))
+      writeJson(s"$label-mv.jsonl", currentMv)
+      writeJson(s"$label-source.jsonl", currentSource)
+      writeJson(s"$label-added.jsonl", currentMv.exceptAll(previousMv))
+      writeJson(s"$label-removed.jsonl", previousMv.exceptAll(currentMv))
+      val profile = sql("SHOW OPENIVM REFRESH PROFILE")
+      writeJson(s"$label-profile.jsonl", profile)
+      RefreshSqlLogAsyncFlusher.awaitQuiescence(30000) shouldBe true
+      writeJson(s"$label-query-log.jsonl", sql("SHOW OPENIVM QUERY LOG"))
+      writeJson(s"$label-history.jsonl", sql(s"DESCRIBE HISTORY delta.`${meta.location.replace("`", "``")}`"))
+      val attempts = profile.collect().filter(_.getString(4) == "execute_refresh_sql_attempt")
+      if (mutation.isDefined) {
+        val attempt = attempts.find(_.getString(6).contains("stmt_kind=insert_into")).get
+        val fields = attempt
+          .getString(6)
+          .split(";")
+          .map(_.split("=", 2))
+          .collect { case Array(k, v) =>
+            k -> v
+          }
+          .toMap
+        fields("status") shouldBe "success"
+        fields("origin_class") shouldBe "unknown"
+        fields("credit_ns") shouldBe "0"
+        fields("rewrite_rule") shouldBe "simple-projection-data-insert"
+        val logs       = RefreshSqlLogCatalog.scanAll(spark).filter(_.refreshId == attempt.getString(0))
+        val native     = logs.find(_.category == "compiler_program_native").get.sqlText
+        val normalized = logs.find(_.category == "compiler_program_normalized").get.sqlText
+        val executed =
+          logs.find(r => r.category == "rewritten_stmt" && r.stmtOrder == fields("query_log_order").toInt).get.sqlText
+        executed should startWith("INSERT INTO `witness_mv`")
+        RewriteLineage.sha256Utf8(native) shouldBe fields("compiler_program_digest")
+        RewriteLineage.sha256Utf8(normalized) shouldBe fields("normalized_program_digest")
+        RewriteLineage.sha256Utf8(executed) shouldBe fields("executed_digest")
+        val source =
+          SparkRefreshRewriter.splitStatements(native).filter(_.trim.nonEmpty)(fields("source_ordinal").toInt)
+        RewriteLineage.sha256Utf8(source) shouldBe fields("source_digest")
+      } else {
+        attempts.exists(_.getString(6).contains("reason=no_pending_deltas")) shouldBe true
+      }
+    }
+
+    run("insert-one", Some("INSERT INTO witness_src VALUES (3, 30), (4, 2)"))
+    run("insert-two", Some("INSERT INTO witness_src VALUES (5, 50), (6, 8)"))
+    run("replay", None)
+  }
+}

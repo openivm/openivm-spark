@@ -1,13 +1,15 @@
 package org.openivm.spark.analyzer
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, Expression, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Expression, Literal}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.analysis.{NamedRelation, ResolvedIdentifier}
 import org.apache.spark.sql.connector.catalog.{Identifier, StagedTable}
+import org.apache.spark.sql.delta.UpdateExpressionsSupport
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.internal.SQLConf
 import org.openivm.spark.common.{FeatureGate, MvCatalog}
 import org.rocksdb.RocksDBException
 
@@ -42,7 +44,9 @@ import java.util.UUID
  * [[IvmDmlInterceptorRule.bypass]] (thread-local) prevents re-interception when
  * [[StagedDmlNode.run()]] executes the original DML.
  */
-class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
+class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] with UpdateExpressionsSupport {
+
+  override def conf: SQLConf = session.sessionState.conf
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     if (!FeatureGate.enabled(session) || IvmDmlInterceptorRule.bypass.get()) return plan
@@ -109,7 +113,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
       // -----------------------------------------------------------------------
       // DeltaUpdateTable — Delta's native pre-lowered UPDATE node
       // -----------------------------------------------------------------------
-      case u: DeltaUpdateTable =>
+      case u: DeltaUpdateTable if u.resolved =>
         val tableName  = extractTableName(u.child)
         val dependents = dependentMvs(tableName)
         if (tableName.isEmpty || dependents.isEmpty) u
@@ -120,35 +124,10 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
           // beforePlan: rows matching the condition (the "old" values to retract).
           // afterPlan:  the same rows projected through the SET assignments (new
           //             values to add).
-          //
-          // DeltaUpdateTable.updateColumns/updateExpressions carry only the SET
-          // columns (one entry per assignment clause), NOT one entry per table
-          // column.  We therefore build an assignment map keyed by column name and
-          // project ALL columns: SET columns get their new expression, unchanged
-          // columns keep their original AttributeReference.  This mirrors the
-          // UpdateTable fallback case below and ensures the staging AFTER file
-          // contains every source column so that the StagingDeltaView SELECT can
-          // reference any of them (e.g. `SELECT region, amount FROM delta.AFTER`).
           val filteredPlan: LogicalPlan =
             u.condition.map(c => Filter(c, u.child)).getOrElse(u.child)
           val beforePlan: LogicalPlan = filteredPlan
-          val assignMap: Map[String, Expression] =
-            u.updateColumns
-              .zip(u.updateExpressions)
-              .flatMap { case (colExpr, valueExpr) =>
-                DeltaUpdateTable
-                  .getTargetColNameParts(colExpr)
-                  .headOption
-                  .map(_.toLowerCase -> valueExpr)
-              }
-              .toMap
-          val afterProjections = filteredPlan.output.map { attr =>
-            assignMap.get(attr.name.toLowerCase) match {
-              case Some(newValue) => Alias(newValue, attr.name)()
-              case None           => attr
-            }
-          }
-          val afterPlan: LogicalPlan = Project(afterProjections, filteredPlan)
+          val afterPlan               = updateAfterPlan(filteredPlan, u.updateColumns, u.updateExpressions)
           val preOps = Seq(
             (beforePlan, stagingPath(tableName, "UPDATE_BEFORE"), "UPDATE_BEFORE"),
             (afterPlan, stagingPath(tableName, "UPDATE_AFTER"), "UPDATE_AFTER")
@@ -164,8 +143,13 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
         val dependents = dependentMvs(tableName)
         if (tableName.isEmpty || dependents.isEmpty) m
         else {
-          val ops = Seq((m.source, stagingPath(tableName, "MERGE_SRC"), "MERGE_SRC"))
-          StagedDmlNode(m, ops, tableName, dependentMaterializedViews = dependents)
+          StagedDmlNode(
+            m,
+            Seq.empty,
+            tableName,
+            dependentMaterializedViews = dependents,
+            captureCommittedChanges = true
+          )
         }
 
       // -----------------------------------------------------------------------
@@ -196,8 +180,13 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
         val dependents = dependentMvs(tableName)
         if (tableName.isEmpty || dependents.isEmpty) w
         else {
-          val ops = Seq((w.query, stagingPath(tableName, "MERGE_SRC"), "MERGE_SRC"))
-          StagedDmlNode(w, ops, tableName, dependentMaterializedViews = dependents)
+          StagedDmlNode(
+            w,
+            Seq.empty,
+            tableName,
+            dependentMaterializedViews = dependents,
+            captureCommittedChanges = true
+          )
         }
 
       // -----------------------------------------------------------------------
@@ -213,7 +202,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
           StagedDmlNode(d, ops, tableName, dependentMaterializedViews = dependents)
         }
 
-      case u: UpdateTable =>
+      case u: UpdateTable if u.resolved =>
         val tableName  = extractTableName(u.table)
         val dependents = dependentMvs(tableName)
         if (tableName.isEmpty || dependents.isEmpty) u
@@ -228,16 +217,7 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
           val filteredPlan: LogicalPlan =
             u.condition.map(c => Filter(c, u.table)).getOrElse(u.table)
           val beforePlan: LogicalPlan = filteredPlan
-          val assignMap: Map[String, Expression] = u.assignments.collect { case Assignment(attr: Attribute, value) =>
-            attr.name.toLowerCase -> value
-          }.toMap
-          val afterProjections = filteredPlan.output.map { attr =>
-            assignMap.get(attr.name.toLowerCase) match {
-              case Some(newValue) => Alias(newValue, attr.name)()
-              case None           => attr
-            }
-          }
-          val afterPlan: LogicalPlan = Project(afterProjections, filteredPlan)
+          val afterPlan = updateAfterPlan(filteredPlan, u.assignments.map(_.key), u.assignments.map(_.value))
           val preOps = Seq(
             (beforePlan, stagingPath(tableName, "UPDATE_BEFORE"), "UPDATE_BEFORE"),
             (afterPlan, stagingPath(tableName, "UPDATE_AFTER"), "UPDATE_AFTER")
@@ -250,8 +230,13 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
         val dependents = dependentMvs(tableName)
         if (tableName.isEmpty || dependents.isEmpty) m
         else {
-          val ops = Seq((m.sourceTable, stagingPath(tableName, "MERGE_SRC"), "MERGE_SRC"))
-          StagedDmlNode(m, ops, tableName, dependentMaterializedViews = dependents)
+          StagedDmlNode(
+            m,
+            Seq.empty,
+            tableName,
+            dependentMaterializedViews = dependents,
+            captureCommittedChanges = true
+          )
         }
 
       case _ => plan
@@ -261,6 +246,23 @@ class IvmDmlInterceptorRule(session: SparkSession) extends Rule[LogicalPlan] {
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
+
+  private def updateAfterPlan(rows: LogicalPlan, keys: Seq[Expression], values: Seq[Expression]): LogicalPlan = {
+    // Use Delta's UPDATE coercion: a raw NULL becomes a typed null and nested struct fields align by name.
+    val aligned = generateUpdateExpressions(
+      targetSchema = rows.schema,
+      defaultExprs = rows.output,
+      nameParts = keys.map(DeltaUpdateTable.getTargetColNameParts(_)),
+      updateExprs = values,
+      resolver = conf.resolver,
+      generatedColumns = Nil
+    )
+    val columns = rows.output.zip(aligned).map {
+      case (attr, Some(value)) if value != attr => Alias(value, attr.name)()
+      case (attr, _)                            => attr
+    }
+    Project(columns, rows)
+  }
 
   /**
    * True when [[ReplaceData.query]] contains a [[Project]] with at least one

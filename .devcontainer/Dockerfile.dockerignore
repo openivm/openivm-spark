@@ -8,6 +8,8 @@
 !spark-ext/.sbtopts
 !spark-ext/build.sbt
 !spark-ext/dev/
+!spark-ext/dev/requirements-py4j-spark-3.5.txt
+!spark-ext/dev/requirements-py4j-spark-4.1.txt
 !spark-ext/dev/docker/
 !spark-ext/dev/docker/entrypoint.sh
 !spark-ext/project/

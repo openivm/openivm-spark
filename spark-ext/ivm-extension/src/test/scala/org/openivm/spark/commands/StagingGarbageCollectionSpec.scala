@@ -1,7 +1,7 @@
 package org.openivm.spark.commands
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.{FeatureGate, MvCatalog, OpenIvmGarbageCollector, StagingCatalog}
+import org.openivm.spark.common.{FeatureGate, MvCatalog, OpenIvmGarbageCollector, StagingCatalog, StagingDelta}
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.concurrent.Eventually
@@ -64,6 +64,60 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
   }
 
   describe("staging garbage collection") {
+    it("keeps GC telemetry off by default") {
+      val events = scala.collection.mutable.ArrayBuffer.empty[String]
+      try {
+        spark.sparkContext.getConf.getBoolean("spark.openivm.telemetry.queue.enabled", false) shouldBe false
+        OpenIvmGarbageCollector.setTelemetryOfferForTesting(line => { events += line; () })
+        OpenIvmGarbageCollector.prepare(spark)
+        events shouldBe empty
+      } finally OpenIvmGarbageCollector.resetTelemetryOfferForTesting()
+    }
+
+    it("defers an idle plan across the sweep deadline and lets a later refresh sweep with references") {
+      OpenIvmGarbageCollector.setSweepClockForTesting(System.currentTimeMillis())
+      OpenIvmGarbageCollector.prepareForRefresh(spark) shouldBe None
+      OpenIvmGarbageCollector.setSweepClockForTesting(0L)
+      val source = "default.gc_preflight"
+      val root   = new File(warehouse, "_ivm/staging/default_gc_preflight/INSERT")
+      val live   = new File(root, "live")
+      val orphan = new File(root, "orphan")
+      Seq(live, orphan).foreach { dir =>
+        dir.mkdirs() shouldBe true
+        dir.setLastModified(System.currentTimeMillis() - 2 * DayMs) shouldBe true
+      }
+      StagingCatalog.record(
+        spark,
+        StagingDelta(source, "INSERT", live.getAbsolutePath, new java.sql.Timestamp(0L), Seq.empty)
+      )
+      val telemetry = new File(warehouse, "gc-preflight-telemetry")
+      telemetry.mkdirs() shouldBe true
+      val expired = new File(telemetry, "old__span.jsonl")
+      Files.write(expired.toPath, Array.emptyByteArray)
+      expired.setLastModified(System.currentTimeMillis() - 8 * DayMs) shouldBe true
+      spark.conf.set(FeatureGate.OneLakeTelemetryDirKey, telemetry.toURI.toString)
+      try {
+        val idle = OpenIvmGarbageCollector.prepareForRefresh(spark, nowMs = 0L)
+        idle shouldBe None
+        OpenIvmGarbageCollector.prepare(spark).get.referenced should contain(live.getAbsolutePath)
+
+        // The real collection clock is already past the deadline. The delayed callback from the
+        // idle refresh must not claim the sweep, nor use an incomplete reference set.
+        OpenIvmGarbageCollector.collect(spark, idle)
+        val due = OpenIvmGarbageCollector.prepareForRefresh(spark).get
+        due.tombstoned shouldBe empty
+        due.referenced should contain(live.getAbsolutePath)
+        OpenIvmGarbageCollector.prepareForRefresh(spark) shouldBe Some(due)
+        OpenIvmGarbageCollector.collect(spark, Some(due))
+        eventually(timeout(Span(30, Seconds)), interval(Span(20, Millis))) {
+          orphan.exists() shouldBe false
+          expired.exists() shouldBe false
+        }
+        live.exists() shouldBe true
+        OpenIvmGarbageCollector.prepareForRefresh(spark) shouldBe None
+      } finally spark.conf.unset(FeatureGate.OneLakeTelemetryDirKey)
+    }
+
     it("deletes a staging location once every dependent consumed it") {
       spark.sql("CREATE TABLE gc_src (id INT, name STRING) USING delta")
       spark.sql("INSERT INTO gc_src VALUES (1, 'a')")
@@ -134,6 +188,23 @@ class StagingGarbageCollectionSpec extends AnyFunSpec with BeforeAndAfterAll wit
         .flatMap(dir => Option(dir.listFiles()).toSeq.flatten) shouldBe empty
       StagingCatalog.pendingGarbage(spark) shouldBe empty
       spark.table("gc_leaf").where("name = 'a'").select("n").head().getLong(0) shouldBe 2L
+    }
+
+    it("plans tombstoned and referenced staging paths from the same shard inventory") {
+      val timestamp    = new java.sql.Timestamp(System.currentTimeMillis())
+      val activePath   = s"${warehouse.getAbsolutePath}/_ivm/staging/gc_plan_active/${UUID.randomUUID()}"
+      val prunedPath   = s"${warehouse.getAbsolutePath}/_ivm/staging/gc_plan_pruned/${UUID.randomUUID()}"
+      val activeSource = "default.gc_plan_active"
+      val prunedSource = "default.gc_plan_pruned"
+      StagingCatalog.record(spark, StagingDelta(activeSource, "INSERT", activePath, timestamp, Seq.empty))
+      StagingCatalog.record(spark, StagingDelta(prunedSource, "INSERT", prunedPath, timestamp, Seq.empty))
+      StagingCatalog.pruneUnconsumed(spark, prunedSource)
+
+      val plan = OpenIvmGarbageCollector.prepareForRefresh(spark, nowMs = 0L).get
+      plan.referenced should contain(activePath)
+      plan.tombstoned should contain(prunedPath)
+      plan.referenced should not contain prunedPath
+      plan.tombstoned should not contain activePath
     }
 
     it("sweeps unreferenced staging locations only after the grace period") {

@@ -1,6 +1,7 @@
 package org.openivm.spark.common.rocksdb
 
 import org.rocksdb.{
+  Checkpoint,
   ColumnFamilyDescriptor,
   ColumnFamilyHandle,
   ColumnFamilyOptions,
@@ -15,6 +16,7 @@ import org.rocksdb.{
 import java.nio.channels.{FileChannel, FileLock, OverlappingFileLockException}
 import java.nio.ByteBuffer
 import java.nio.file.{Files, Paths, StandardCopyOption, StandardOpenOption}
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.TimeUnit
@@ -513,7 +515,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   private def readCurrentVersion(): Long =
     manifestVersions.lastOption.getOrElse(0L)
 
-  private[rocksdb] def withWriteLock[A](body: => A): A = {
+  private[rocksdb] def withWriteLock[A](body: => A): A = OpenIvmStateBarrier.withDbOperation(normalizedDbPath) {
     writeMutex.lock()
     try body
     finally writeMutex.unlock()
@@ -777,7 +779,14 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     * Always holds the in-JVM `writeMutex` so within one JVM concurrent
     * threads serialise; the external lock then mutexes other JVMs.
     */
-  private[rocksdb] def withNativeHandle[A](operation: String)(body: => A): A = {
+  private[rocksdb] def withNativeHandle[A](operation: String)(body: => A): A =
+    operation match {
+      case "with_batch" | "compact_range" =>
+        OpenIvmStateBarrier.withDbMutation(normalizedDbPath) { withNativeHandleUnderBarrier(operation)(body) }
+      case _ => OpenIvmStateBarrier.withDbOperation(normalizedDbPath) { withNativeHandleUnderBarrier(operation)(body) }
+    }
+
+  private def withNativeHandleUnderBarrier[A](operation: String)(body: => A): A = {
     if (!OpenIvmRocksDBTelemetry.isActive && !OpenIvmMetrics.enabled) {
       return withWriteLock {
         if (closed) {
@@ -918,11 +927,82 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     */
   def withSession[A](body: => A): A = withNativeHandle("session")(body)
 
+  private[rocksdb] def checkpointTo(destination: java.nio.file.Path): Unit = withNativeHandle("checkpoint") {
+    val checkpoint = Checkpoint.create(dbHandle)
+    try checkpoint.createCheckpoint(destination.toString)
+    finally checkpoint.close()
+
+    val target = destination.resolve("openivm-manifests")
+    Files.createDirectories(target)
+    val manifests = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
+    try
+      manifests.iterator().asScala.foreach { manifest =>
+        if (Files.isSymbolicLink(manifest) || !Files.isRegularFile(manifest))
+          throw new java.io.IOException(s"Invalid OpenIVM transaction manifest: $manifest")
+        Files.copy(manifest, target.resolve(manifest.getFileName))
+      }
+
+    finally manifests.close()
+  }
+
+  private[rocksdb] def withCheckpointIdentity[A](body: OpenIvmCheckpointReuse.Identity => A): Option[A] =
+    withWriteLock {
+      if (closed || conf.multiProcess || dbHandle == null) None
+      else
+        OpenIvmCheckpointReuse
+          .readIdentity {
+            val directoryKey = Files.readAttributes(dbDir, classOf[BasicFileAttributes]).fileKey()
+            val identityPath = dbDir.resolve("IDENTITY")
+            val currentPath  = dbDir.resolve("CURRENT")
+            val identityKey =
+              if (Files.isRegularFile(identityPath) && !Files.isSymbolicLink(identityPath))
+                Files.readAttributes(identityPath, classOf[BasicFileAttributes]).fileKey()
+              else null
+            val currentKey =
+              if (Files.isRegularFile(currentPath) && !Files.isSymbolicLink(currentPath))
+                Files.readAttributes(currentPath, classOf[BasicFileAttributes]).fileKey()
+              else null
+            if (directoryKey == null || identityKey == null || currentKey == null) None
+            else {
+              val identityDigest = OpenIvmSnapshotArchive.sha256(identityPath.toFile)
+              val manifests      = Files.newDirectoryStream(manifestsDir, s"$ManifestPrefix*")
+              val sidecars =
+                try
+                  manifests.iterator().asScala.toVector.sortBy(_.getFileName.toString).map { manifest =>
+                    if (Files.isSymbolicLink(manifest) || !Files.isRegularFile(manifest))
+                      throw new java.io.IOException(s"Invalid OpenIVM transaction manifest: $manifest")
+                    manifest.getFileName.toString -> OpenIvmSnapshotArchive.sha256(manifest.toFile)
+                  }
+                finally manifests.close()
+              Some(
+                OpenIvmCheckpointReuse.Identity(
+                  dbHandle,
+                  directoryKey,
+                  identityKey,
+                  currentKey,
+                  identityDigest,
+                  dbHandle.getLatestSequenceNumber,
+                  columnFamilyHandles.keySet,
+                  sidecars
+                )
+              )
+            }
+          }
+          .map(body)
+    }
+
   /** The write/session mutex protects both lifetime and cross-family coherence.
     * Check the cached handle under that mutex BEFORE entering withSession:
     * an ordinary session alone is allowed to open or recover an unloaded DB.
     */
   private[rocksdb] def captureMetadataIfOpen(
+      budget: OpenIvmMetadataSnapshot.Budget
+  ): Either[String, OpenIvmMetadataSnapshot.Captured] =
+    OpenIvmStateBarrier.withDbInspection(normalizedDbPath, budget) {
+      captureMetadataUnderBarrier(budget)
+    }
+
+  private def captureMetadataUnderBarrier(
       budget: OpenIvmMetadataSnapshot.Budget
   ): Either[String, OpenIvmMetadataSnapshot.Captured] = {
     import OpenIvmMetadataSnapshot.{Captured, Entry, Unavailable}
@@ -1022,6 +1102,24 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
       }
     }
 
+  /** Visit a prefix under one native handle, closing the iterator even if the visitor fails. */
+  private[common] def foreachPrefix(columnFamily: String, prefix: Array[Byte])(
+      visit: (Array[Byte], Array[Byte]) => Unit
+  ): Unit = withNativeHandle("prefix_scan") {
+    val iterator = dbHandle.newIterator(cf(columnFamily))
+    try {
+      iterator.seek(prefix)
+      while (iterator.isValid && startsWith(iterator.key(), prefix)) {
+        val key   = iterator.key()
+        val value = iterator.value()
+        OpenIvmMetrics.recordColumnFamilyRead(columnFamily, key.length.toLong + value.length.toLong)
+        visit(key, value)
+        iterator.next()
+      }
+      iterator.status()
+    } finally iterator.close()
+  }
+
   /** Materialize a bounded prefix scan. Exceeding either limit fails the entire
     * read rather than returning incomplete grouped state.
     */
@@ -1069,16 +1167,18 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
     versionValue
   }
 
-  def cleanup(minVersionsToRetain: Int): Unit = withWriteLock {
-    if (closed) return
-    require(minVersionsToRetain >= 0, s"minVersionsToRetain must be >= 0, found $minVersionsToRetain")
-    def body(): Unit = {
-      val threshold = readCurrentVersion() - minVersionsToRetain
-      manifestVersions.filter(_ < threshold).foreach { version =>
-        Files.deleteIfExists(manifestsDir.resolve(s"$ManifestPrefix$version"))
+  def cleanup(minVersionsToRetain: Int): Unit = OpenIvmStateBarrier.withDbMutation(normalizedDbPath) {
+    withWriteLock {
+      if (closed) return
+      require(minVersionsToRetain >= 0, s"minVersionsToRetain must be >= 0, found $minVersionsToRetain")
+      def body(): Unit = {
+        val threshold = readCurrentVersion() - minVersionsToRetain
+        manifestVersions.filter(_ < threshold).foreach { version =>
+          Files.deleteIfExists(manifestsDir.resolve(s"$ManifestPrefix$version"))
+        }
       }
+      if (conf.multiProcess) withExternalLock(measureWait = false)(_ => ())(body()) else body()
     }
-    if (conf.multiProcess) withExternalLock(measureWait = false)(_ => ())(body()) else body()
   }
 
   def compactRange(): Unit = withNativeHandle("compact_range") {
@@ -1090,6 +1190,7 @@ final class OpenIvmRocksDB(dbPath: String, val conf: OpenIvmRocksDBConf, columnF
   def close(): Unit = withWriteLock {
     if (closed) return
     closed = true
+    OpenIvmCheckpointReuse.evict(this)
 
     if (dbHandle != null) {
       closeInternal()

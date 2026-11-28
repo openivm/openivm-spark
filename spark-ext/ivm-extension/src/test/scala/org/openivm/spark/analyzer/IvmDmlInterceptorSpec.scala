@@ -279,7 +279,7 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
   // Test 6 — MERGE with dependent MV
   // -------------------------------------------------------------------------
   describe("Test 6: MERGE with dependent MV") {
-    it("captures MERGE_SRC rows in staging and applies the merge to the base table") {
+    it("captures signed target rows in staging and applies the merge to the base table") {
       val tbl = "merge_base"
       val qn  = createBaseWithMv(tbl)
       spark.sql(s"INSERT INTO $tbl VALUES (1, 'original')")
@@ -301,7 +301,12 @@ class IvmDmlInterceptorSpec extends AnyFunSpec with BeforeAndAfterAll with Match
       rows.head.getAs[String]("name") shouldBe "updated"
 
       val staged = stagingRows(qn)
-      staged.filter(_.opType == "MERGE_SRC") should not be empty
+      staged.map(_.opType) should not contain "MERGE_SRC"
+      val deleted = staged.filter(_.opType == "DELETE").map(d => spark.read.format("delta").load(d.stagingPath))
+      deleted should have size 1
+      val expected = spark.sql("SELECT 1 AS id, 'original' AS name")
+      deleted.head.exceptAll(expected).count() shouldBe 0L
+      expected.exceptAll(deleted.head).count() shouldBe 0L
     }
   }
 

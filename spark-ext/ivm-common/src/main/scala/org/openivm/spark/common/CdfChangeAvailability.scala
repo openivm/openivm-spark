@@ -31,6 +31,8 @@ object CdfChangeAvailability {
 
   private val ChangeDataFeedKey = "delta.enableChangeDataFeed"
 
+  val ParallelSourcesKey: String = "spark.openivm.cdf.preflight.parallelSources.enabled"
+
   private val ProbeParallelism = 16
 
   /** Error classes and message fragments Spark and Delta (3.x and 4.x) raise when change rows or
@@ -91,6 +93,73 @@ object CdfChangeAvailability {
         case NonFatal(failure) if isChangeDataUnavailable(failure) =>
           Some(s"change feed unreadable: ${describe(failure)}")
       }
+
+  /** Check independent source ranges before any refresh statement is applied. */
+  def unavailableReasons(
+      spark: SparkSession,
+      batches: Seq[CdfChangeBatch],
+      parallel: Boolean
+  ): Map[String, String] = {
+    val sources = batches.groupBy(_.baseTable).toSeq
+    def check(entry: (String, Seq[CdfChangeBatch])): Option[(String, String)] = {
+      val (source, sourceBatches) = entry
+      if (!sourceBatches.forall(_.hasBaseline)) Some(source -> "cdf_watermark_missing")
+      else
+        unavailableReason(
+          spark,
+          source,
+          sourceBatches.map(_.startVersionExclusive).min,
+          sourceBatches.map(_.endVersionInclusive).max
+        ).map(detail => source -> s"cdf_change_data_unavailable ($detail)")
+    }
+
+    mapSources(spark, sources, parallel)(check).flatten.toMap
+  }
+
+  private[spark] def mapSources[A, B](
+      spark: SparkSession,
+      sources: Seq[A],
+      parallel: Boolean
+  )(check: A => B): Seq[B] = {
+    if (!parallel || sources.size <= 1) sources.map(check)
+    else {
+      val pool = Executors.newFixedThreadPool(
+        2,
+        new ThreadFactory {
+          private val count = new AtomicInteger()
+          override def newThread(runnable: Runnable): Thread = {
+            val thread = new Thread(runnable, s"openivm-cdf-source-${count.incrementAndGet()}")
+            thread.setDaemon(true)
+            thread
+          }
+        }
+      )
+      val tasks = scala.collection.mutable.ArrayBuffer.empty[Future[B]]
+      try {
+        sources.foreach { entry =>
+          tasks += pool.submit(new Callable[B] {
+            override def call(): B = {
+              SparkSession.setActiveSession(spark)
+              try check(entry)
+              finally SparkSession.clearActiveSession()
+            }
+          })
+        }
+        tasks.map { task =>
+          try task.get()
+          catch {
+            case interrupted: InterruptedException =>
+              Thread.currentThread().interrupt()
+              throw interrupted
+            case failure: ExecutionException if failure.getCause != null => throw failure.getCause
+          }
+        }.toVector
+      } finally {
+        pool.shutdownNow()
+        tasks.foreach(_.cancel(true))
+      }
+    }
+  }
 
   /** Whether `failure`, or any of its causes, reports change rows or commits that no longer exist.
     *

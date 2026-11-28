@@ -1,5 +1,6 @@
 package org.openivm.spark.parity
 
+import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 /** MIN/MAX + edge-case slice of the SIMPLE_AGGREGATE parity coverage. Covers
@@ -66,6 +67,30 @@ abstract class SimpleAggregateMinMaxScenarios extends IvmParitySpecBase("simple-
       sql("INSERT INTO sa_sales_8 VALUES (1, 100), (2, 200)")
       refreshMv("mv_sa_8")
       assertMvCorrect("mv_sa_8", "SELECT SUM(amount) AS total FROM sa_sales_8")
+    }
+  }
+
+  describe("scalar SUM across null and empty transitions") {
+    it("preserves parity through delete-to-empty and reinsertion") {
+      val view = "SELECT SUM(amount) AS total FROM sa_sales_golden_edge"
+      sql("CREATE TABLE sa_sales_golden_edge (id INT, amount INT) USING DELTA")
+      sql(s"CREATE MATERIALIZED VIEW mv_sa_golden_edge AS $view")
+      val metadata = MvCatalog.lookup(spark, spark.sessionState.sqlParser.parseTableIdentifier("mv_sa_golden_edge"))
+      metadata.map(_.refreshType) shouldBe Some(RefreshTypeCode.SimpleAggregate)
+      assertMvCorrect("mv_sa_golden_edge", view)
+
+      sql("INSERT INTO sa_sales_golden_edge VALUES (1, NULL), (2, NULL)")
+      refreshMv("mv_sa_golden_edge")
+      assertMvCorrect("mv_sa_golden_edge", view)
+      sql("INSERT INTO sa_sales_golden_edge VALUES (3, 10)")
+      refreshMv("mv_sa_golden_edge")
+      assertMvCorrect("mv_sa_golden_edge", view)
+      sql("DELETE FROM sa_sales_golden_edge")
+      refreshMv("mv_sa_golden_edge")
+      assertMvCorrect("mv_sa_golden_edge", view)
+      sql("INSERT INTO sa_sales_golden_edge VALUES (4, 7)")
+      refreshMv("mv_sa_golden_edge")
+      assertMvCorrect("mv_sa_golden_edge", view)
     }
   }
 

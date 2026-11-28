@@ -1,5 +1,6 @@
 package org.openivm.spark.compiler
 
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -11,11 +12,20 @@ import org.scalatest.matchers.should.Matchers
   */
 class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
 
-  describe("quoted null cast types in native fallback queries") {
-    it("unquotes type names while preserving literals and quoted column aliases") {
-      val query    = "SELECT CAST(NULL AS \"DATE\"), CAST(NULL AS `TIMESTAMP`), 'CAST(NULL AS \"DATE\")' AS \"DATE\""
-      val expected = "SELECT CAST(NULL AS DATE), CAST(NULL AS TIMESTAMP), 'CAST(NULL AS \"DATE\")' AS `DATE`"
-      LptsSparkDialect.translate(query) shouldBe expected
+  describe("boolean WHERE predicates") {
+    it("protects a parenthesized column from being parsed as a table alias") {
+      val sql = """SELECT * FROM t WHERE (active);
+        |SELECT * FROM t WHERE (`enabled`);
+        |SELECT * FROM t WHERE ("quoted");
+        |SELECT 'WHERE (active)' -- WHERE (active)
+        |/* WHERE (active) */ FROM t WHERE ((active))""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("FROM t WHERE ((active))")
+      translated should include("FROM t WHERE ((`enabled`))")
+      translated should include("FROM t WHERE ((`quoted`))")
+      translated should include("'WHERE (active)' -- WHERE (active)")
+      translated should include("/* WHERE (active) */")
+      LptsSparkDialect.translate(translated) shouldBe translated
     }
   }
 
@@ -23,7 +33,7 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
     it("removes redundant parentheses that Spark misanalyzes in generated CTEs") {
       val sql        = "WITH r(flag) AS (SELECT flag FROM source WHERE   (flag)) SELECT * FROM r"
       val translated = LptsSparkDialect.translate(sql)
-      translated shouldBe "WITH r(flag) AS (SELECT flag FROM source WHERE flag) SELECT * FROM r"
+      translated shouldBe "WITH r(flag) AS (SELECT flag FROM source WHERE ((flag))) SELECT * FROM r"
       LptsSparkDialect.translate(translated) shouldBe translated
     }
 
@@ -41,12 +51,22 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
         |"system".main.to_months(0), "system".main.to_days(0)),
         |"system".main.to_microseconds(CAST(1000 AS BIGINT))) AS shifted FROM t""".stripMargin
       val translated = LptsSparkDialect.translate(sql)
-      translated should include("make_interval(0, 0, 0, 0, 0, 0,")
-      translated should include("/ 1000000.0)")
+      translated should include("INTERVAL '0.001000' SECOND")
       translated should not include "to_microseconds"
       translated should not include "system"
       translated should not include "add("
       noException should be thrownBy CatalystSqlParser.parsePlan(translated)
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+
+    it("translates nonzero qualified interval arithmetic without changing other catalogs") {
+      val sql = """SELECT "system".main."add"("system".main.to_months(2), "system".main.to_days(3)),
+        |other. "system".main.add(1, 2), `system.main.add`(1, 2)""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("make_interval(0, 2, 0, 0, 0, 0, 0)")
+      translated should include("make_interval(0, 0, 0, 3, 0, 0, 0)")
+      translated should include("other. `system`.main.add(1, 2)")
+      translated should include("`system.main.add`(1, 2)")
       LptsSparkDialect.translate(translated) shouldBe translated
     }
 
@@ -92,6 +112,11 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       noException should be thrownBy CatalystSqlParser.parsePlan(translated)
     }
 
+    it("leaves qualified window functions and their frames alone") {
+      val sql = "SELECT other.lead(x, CAST(1 AS BIGINT)) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"
+      LptsSparkDialect.translate(sql) shouldBe sql
+    }
+
     it("uses bare literal offsets for Spark LAG and LEAD analysis") {
       val sql = """SELECT lag(ts, CAST(1 AS BIGINT), CAST(NULL AS TIMESTAMP)) OVER (ORDER BY ts),
         |lead(ts, CAST(2 AS INTEGER)) OVER (ORDER BY ts),
@@ -103,6 +128,139 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       translated should include("lag(ts, CAST(n AS BIGINT))")
       translated should include("'lag(ts, CAST(1 AS BIGINT))'")
       LptsSparkDialect.translate(translated) shouldBe translated
+    }
+  }
+
+  describe("DuckDB system builtin qualification") {
+    it("unqualifies function calls without changing literals, comments, columns, or other catalogs") {
+      val sql = """SELECT "system".main.sum(x), system."main".count_star(),
+        |"system".main.__openivm_spark_expression('id', NULL, x),
+        |"system".main.col, other.system.main.sum(x), 'system.main.sum(x)',
+        |`system.main.sum`(x) -- system.main.sum(x)
+        |/* "system".main.sum(x) */ FROM t""".stripMargin
+      val unqualified = LptsSparkDialect.stripNativeBuiltinQualification(sql)
+      unqualified should include("SELECT sum(x), count_star()")
+      unqualified should include("__openivm_spark_expression('id', NULL, x)")
+      unqualified should include("\"system\".main.col, other.system.main.sum(x), 'system.main.sum(x)'")
+      unqualified should include("`system.main.sum`(x) -- system.main.sum(x)")
+      unqualified should include("/* \"system\".main.sum(x) */")
+      LptsSparkDialect.stripNativeBuiltinQualification(unqualified) shouldBe unqualified
+      LptsSparkDialect.translate(sql) should include("SELECT sum(x), COUNT(*)")
+    }
+  }
+
+  describe("native infinity and trim restoration") {
+    it("restores infinity literals without rewriting identifiers or protected text") {
+      val sql = """SELECT abs(q) != 1e1000, -1E1000, 1e10001, x1e1000, `1e1000`,
+        |'1e1000', 'main.trim(x)' -- 1e1000
+        |/* 1e1000 */ FROM t""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("abs(q) != CAST('Infinity' AS DOUBLE)")
+      translated should include("-CAST('Infinity' AS DOUBLE)")
+      translated should include("1e10001, x1e1000, `1e1000`")
+      translated should include("'1e1000', 'main.trim(x)' -- 1e1000")
+      translated should include("/* 1e1000 */")
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+
+    it("unqualifies native main trim calls only") {
+      val sql = """SELECT nullif(main."trim"(x), ''), main.trim(y), other.trim(z),
+        |catalog.main.trim(z), `main.trim`(z), 'main.trim(z)' -- main.trim(z)
+        |/* main.trim(z) */ FROM t""".stripMargin
+      val translated = LptsSparkDialect.translate(sql)
+      translated should include("nullif(`trim`(x), '')")
+      translated should include("trim(y)")
+      translated should include("other.trim(z)")
+      translated should include("catalog.main.trim(z)")
+      translated should include("`main.trim`(z), 'main.trim(z)' -- main.trim(z)")
+      translated should include("/* main.trim(z) */")
+      LptsSparkDialect.translate(translated) shouldBe translated
+    }
+  }
+
+  describe("window offset restoration") {
+    it("restores only int-range literal offsets of unqualified LEAD and LAG windows") {
+      val sql = """SELECT lead(coalesce(a, b), CAST(2 AS BIGINT), 0) OVER (ORDER BY a),
+        |lag(a, CAST(-3 AS BIGINT)) OVER (ORDER BY a),
+        |lead(a, CAST(2147483648 AS BIGINT)) OVER (ORDER BY a),
+        |lead(a, CAST(x AS BIGINT)) OVER (ORDER BY a),
+        |other.lead(a, CAST(2 AS BIGINT)) OVER (ORDER BY a),
+        |'lead(a, CAST(2 AS BIGINT)) OVER (ORDER BY a)' FROM t""".stripMargin
+      val restored = LptsSparkDialect.translate(sql)
+      restored should include("lead(coalesce(a, b), 2, 0) OVER")
+      restored should include("lag(a, -3) OVER")
+      restored should include("lead(a, CAST(2147483648 AS BIGINT)) OVER")
+      restored should include("lead(a, CAST(x AS BIGINT)) OVER")
+      restored should include("other.lead(a, CAST(2 AS BIGINT)) OVER")
+      restored should include("'lead(a, CAST(2 AS BIGINT)) OVER (ORDER BY a)'")
+      LptsSparkDialect.translate(restored) shouldBe restored
+    }
+  }
+
+  describe("struct max_by native translation") {
+    it("round-trips explicit field names without touching strings or unrelated structs") {
+      val sql = """SELECT max_by(struct(t.a AS f1, t.b AS "Mixed Name"), struct(t.k AS f1)),
+        |'max_by(struct(x AS f), struct(y AS f))', struct(other) FROM t""".stripMargin
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(sql)
+      native should include("""arg_max(struct_pack(f1 := t.a, "Mixed Name" := t.b), struct_pack(f1 := t.k))""")
+      native should include("'max_by(struct(x AS f), struct(y AS f))'")
+      native should include("struct(other)")
+      val restored = LptsSparkDialect.translate(native)
+      restored should include("max_by(named_struct(CAST(X'6631' AS STRING), t.a,")
+      restored should include("CAST(X'4d69786564204e616d65' AS STRING), t.b)")
+      restored should include("'max_by(struct(x AS f), struct(y AS f))'")
+      restored should include("struct(other)")
+    }
+
+    it("leaves unsupported struct field shapes unchanged") {
+      val sql = "SELECT max_by(struct(a + 1), struct(k AS f1)) FROM t"
+      SparkFunctionShimSql.rewriteStructMaxBy(sql) shouldBe sql
+    }
+
+    it("preserves inferred field names in bare-column struct aggregates") {
+      val sql    = """SELECT max_by(struct(t.id, t.name), struct(t.ts)) FROM t"""
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(sql)
+      native shouldBe "SELECT arg_max(struct_pack(id := t.id, name := t.name), struct_pack(ts := t.ts)) FROM t"
+      val restored = LptsSparkDialect.translate(native)
+      restored should include("max_by(named_struct(CAST(X'6964' AS STRING), t.id,")
+      restored should include("named_struct(CAST(X'7473' AS STRING), t.ts)")
+    }
+
+    it("round-trips nested named structs with scalar and structured ordering keys") {
+      val sql = """SELECT named_struct('Mixed "name"', named_struct('inner''s', x)) AS k,
+        |max_by(named_struct('Mixed "name"', x), score),
+        |max_by(named_struct('value', x), named_struct('outer', named_struct('timestamp', ts)))
+        |FROM t""".stripMargin
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(sql)
+      native should include("""named_struct('Mixed "name"', named_struct('inner''s', x))""")
+      native should include("arg_max(struct_pack(\"Mixed \"\"name\"\"\" := x), score)")
+      native should include(
+        """arg_max(struct_pack("value" := x), struct_pack("outer" := struct_pack("timestamp" := ts)))"""
+      )
+      val restored = LptsSparkDialect.translate(native)
+      restored should include("max_by(named_struct(CAST(X'4d6978656420226e616d6522' AS STRING), x), score)")
+      restored should include(
+        "named_struct(CAST(X'6f75746572' AS STRING), named_struct(CAST(X'74696d657374616d70' AS STRING), ts))"
+      )
+      restored should include("""named_struct('Mixed "name"', named_struct(concat('inner', chr(39), 's'), x))""")
+    }
+
+    it("does not translate named structs inside unrelated scalar expressions") {
+      val sql = """SELECT max_by(named_struct('value', x),
+        |CASE WHEN named_struct('k', NULL) > named_struct('k', 1) THEN 1 ELSE 0 END) FROM t""".stripMargin
+      val native = SparkFunctionShimSql.rewriteStructMaxBy(sql)
+      native should include("CASE WHEN named_struct('k', NULL) > named_struct('k', 1)")
+      val comparison = "SELECT named_struct('k', NULL) > named_struct('k', 1) FROM t"
+      SparkFunctionShimSql.rewriteStructMaxBy(comparison) shouldBe comparison
+    }
+  }
+
+  describe("quoted null cast types in native fallback queries") {
+    it("unquotes type names while preserving literals and quoted column aliases") {
+      val query    = "SELECT CAST(NULL AS \"DATE\"), CAST(NULL AS `TIMESTAMP`), 'CAST(NULL AS \"DATE\")' AS \"DATE\""
+      val expected = "SELECT CAST(NULL AS DATE), CAST(NULL AS TIMESTAMP), 'CAST(NULL AS \"DATE\")' AS `DATE`"
+      LptsSparkDialect.translate(query) shouldBe expected
+      LptsSparkDialect.translate(expected) shouldBe expected
     }
   }
 
@@ -491,10 +649,88 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
       ) shouldBe "t4_Customer.name.c_l_name"
     }
 
+    it("extracts fields from nested aggregate expressions and escaped identifiers") {
+      LptsSparkDialect.rewriteStructExtract(
+        "struct_extract(max_by(named_struct('a', `x,)`), named_struct('b', y)), 'odd`name')"
+      ) shouldBe "(max_by(named_struct('a', `x,)`), named_struct('b', y))).`odd``name`"
+      LptsSparkDialect.rewriteStructExtract("struct_extract(s, 'it''s')") shouldBe "s.`it's`"
+      LptsSparkDialect.rewriteStructExtract("struct_extract(NULL, 'key')") shouldBe "(NULL).key"
+      LptsSparkDialect.rewriteStructExtract("struct_extract(coalesce(s, t) -- comment\n, 'k')") shouldBe
+        "(coalesce(s, t) -- comment\n).k"
+    }
+
+    it("leaves qualified calls and protected text alone") {
+      val sql = """other.struct_extract(s, 'a'), other. /* comment */ struct_extract(s, 'a'),
+        |other. -- comment
+        |struct_extract(s, 'a'), 'struct_extract(s, ''a'')',
+        |`struct_extract(s, 'a')` -- struct_extract(s, 'a')
+        |/* struct_extract(s, 'a') */ struct_extract(s, dynamic_field)""".stripMargin
+      LptsSparkDialect.rewriteStructExtract(sql) shouldBe sql
+    }
+
     it("rewrites triple-nested struct_extract") {
       LptsSparkDialect.rewriteStructExtract(
         "struct_extract(struct_extract(struct_extract(c, 'contactinfo'), 'c_phone_1'), 'c_local')"
       ) shouldBe "c.contactinfo.c_phone_1.c_local"
+    }
+
+    describe("native microsecond interval") {
+      it("restores only the native zero-month zero-day interval constructor") {
+        val native   = """add(add(to_months(0), to_days(0)), to_microseconds(CAST(1000 AS BIGINT)))"""
+        val second   = native.replace("1000", "1000000")
+        val negative = native.replace("1000", "-1")
+        LptsSparkDialect.rewriteNativeMicrosecondInterval(native) shouldBe "INTERVAL '0.001000' SECOND"
+        LptsSparkDialect.rewriteNativeMicrosecondInterval(second) shouldBe "INTERVAL '1.000000' SECOND"
+        LptsSparkDialect.rewriteNativeMicrosecondInterval(negative) shouldBe "INTERVAL '-0.000001' SECOND"
+        val qualified =
+          """"system".main."add"("system".main."add"("system".main.to_months(0), "system".main.to_days(0)), "system".main.to_microseconds(CAST(1000 AS BIGINT)))"""
+        LptsSparkDialect.translate(qualified) shouldBe "INTERVAL '0.001000' SECOND"
+      }
+
+      describe("translated expression execution") {
+        it("preserves microsecond precision, interval type, and struct field values") {
+          val spark = SparkSession.builder().master("local[1]").appName("DialectExpressionSpec").getOrCreate()
+          try {
+            spark.conf.set("spark.sql.session.timeZone", "UTC")
+            val intervalType = spark.sql("SELECT INTERVAL '1' SECOND").schema.head.dataType
+            Seq(Long.MinValue, -1L, 0L, 1000L, 1000000L, 1000001L, Long.MaxValue).foreach { micros =>
+              val native   = s"add(add(to_months(0), to_days(0)), to_microseconds(CAST($micros AS BIGINT)))"
+              val interval = LptsSparkDialect.translate(native)
+              spark.sql(s"SELECT $interval").schema.head.dataType shouldBe intervalType
+              spark
+                .sql(s"SELECT unix_micros(TIMESTAMP '1970-01-01 00:00:00' + $interval)")
+                .head()
+                .getLong(0) shouldBe micros
+            }
+            val extract = LptsSparkDialect.rewriteStructExtract(
+              "struct_extract(named_struct('odd`name', CAST(NULL AS INT)), 'odd`name')"
+            )
+            val actual   = spark.sql(s"SELECT $extract AS field")
+            val expected = spark.sql("SELECT CAST(NULL AS INT) AS field")
+            actual.schema.head.dataType shouldBe expected.schema.head.dataType
+            actual.collect().toSeq shouldBe expected.collect().toSeq
+            val nested = LptsSparkDialect.rewriteStructExtract(
+              "struct_extract(coalesce(CAST(NULL AS STRUCT<k: INT>), named_struct('k', 7)), 'k')"
+            )
+            spark.sql(s"SELECT $nested").head().getInt(0) shouldBe 7
+          } finally spark.stop()
+        }
+      }
+
+      it("does not rewrite dynamic, null, nonzero-month, overflow, or qualified constructors") {
+        val base = "add(add(to_months(0), to_days(0)), to_microseconds(CAST(1000 AS BIGINT)))"
+        val inputs = Seq(
+          base.replace("1000", "x"),
+          base.replace("1000", "NULL"),
+          base.replace("to_months(0)", "to_months(1)"),
+          base.replace("1000", "9223372036854775808"),
+          "custom." + base,
+          "custom. /* comment */ " + base,
+          "custom. -- comment\n" + base,
+          s"'$base' -- $base\n/* $base */"
+        )
+        inputs.foreach(sql => LptsSparkDialect.rewriteNativeMicrosecondInterval(sql) shouldBe sql)
+      }
     }
 
     it("rewrites struct_extract embedded inside a CAST expression") {
@@ -875,6 +1111,15 @@ class LptsSparkDialectSpec extends AnyFunSpec with Matchers {
   }
 
   describe("rewriteBareBackslashLiterals") {
+    it("preserves quoted identifiers and comments while rewriting actual literals") {
+      val sql = """SELECT struct_pack("O'Brien\Name" := txt), `it's\name`, '\' -- 'comment\text'
+                  |/* 'comment\text' */ FROM src""".stripMargin
+      val expected = """SELECT struct_pack("O'Brien\Name" := txt), `it's\name`, concat(chr(92)) -- 'comment\text'
+                       |/* 'comment\text' */ FROM src""".stripMargin
+      LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe expected
+      LptsSparkDialect.translate(sql) shouldBe expected
+    }
+
     it("rewrites a bare backslash literal to a concat(chr(92)) expression") {
       val sql = "REPLACE(s, '\\', '_')"
       LptsSparkDialect.rewriteBareBackslashLiterals(sql) shouldBe

@@ -35,7 +35,7 @@ object RuntimeTarget {
     deltaArtifact = "delta-spark_4.1",
     moduleName = "ivmextension-spark-4.1",
     javaVersion = "21",
-    rocksDbVersion = "8.3.2",
+    rocksDbVersion = "9.8.4",
     antlrVersion = "4.13.1"
   )
 

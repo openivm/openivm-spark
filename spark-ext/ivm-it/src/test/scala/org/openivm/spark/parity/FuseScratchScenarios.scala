@@ -36,7 +36,7 @@ abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
        Map(
          "spark.openivm.fuseScratch.enabled"              -> "true",
          "spark.openivm.fuseScratch.cascadeCache.enabled" -> "true"
-       )) + (FeatureGate.QueryLogEnabledKey -> "true")
+       )) ++ Map(FeatureGate.QueryLogEnabledKey -> "true", FeatureGate.ProfileRefreshKey -> "true")
 
   private final class BufferingAppender(name: String)
       extends AbstractAppender(
@@ -92,6 +92,28 @@ abstract class FuseScratchScenarios extends IvmParitySpecBase("fuse-scratch") {
         } shouldBe true
       }
       assertMvCorrect("fuse_mv_leaf", "SELECT id, name FROM fuse_users_a WHERE age >= 25")
+      val attempts = sql("SHOW OPENIVM REFRESH PROFILE")
+        .collect()
+        .toSeq
+        .filter(row => row.getString(1).contains("fuse_mv_leaf") && row.getString(4) == "execute_refresh_sql_attempt")
+        .map(_.getString(6))
+      Seq("fused_analysis", "fused_action").foreach { segment =>
+        val matching = attempts.filter(_.contains(s"segment=$segment"))
+        matching should have size 1
+        matching.head should include("status=success")
+        matching.head should include("action_id=")
+        matching.head should include("credit_ns=0")
+        matching.head should include("query_log_order=")
+        matching.head should include("duration_ns=")
+        matching.head should include("compiler_program_digest=")
+        matching.head should include("source_ordinal=")
+        matching.head should include("source_digest=")
+        matching.head should include("rewrite_pipeline=")
+        matching.head should include("executed_digest=")
+      }
+      attempts.find(_.contains("segment=fused_action")).get should include(
+        "executed_digest_kind=action_descriptor_utf8"
+      )
     }
 
     it("coalesces a small fixed-width outer-join append and keeps the mixed-change path correct") {

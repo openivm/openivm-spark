@@ -14,7 +14,9 @@ spark-ext/
 ├── ivm-extension/     # SparkSessionExtensions entry + ANTLR grammar + commands + rules
 ├── ivm-it/            # integration tests + 100-spec parity suite vs openivm
 └── dev/
-    ├── dev            # single entry-point CLI wrapper (build, test, verify, shell, …)
+    ├── run.sh         # implementation behind the spark-ext Nx targets
+    ├── dev.sh         # retained legacy wrapper
+    ├── verify-native.sh # native binding smoke check used by verify
     ├── docker/        # multi-stage Dockerfile + docker-compose.yml
     ├── pins.env       # shared OpenIVM / LPTS / DuckDB pins
     └── targets/       # target-specific Spark / Delta / Scala / JDK pins
@@ -29,6 +31,14 @@ the pinned Node/npm launcher and locked Nx tooling:
 ./contrib/bootstrap-dev-env.sh
 npx --no-install nx run devcontainer:up
 ```
+
+Bootstrap pulls the pinned public image anonymously; it does not implicitly
+build a replacement image when a pull fails. The image supplies the per-target
+Python/Py4J dependencies, so runtime validation does not install them with pip.
+
+Topic guides in `spark-ext/docs/` and `experiments/darwin/docs/` use
+`SCREAMING_CASE.md` filenames. Both `spark-ext:lint` and `spark-ext:verify`
+enforce this naming convention before invoking sbt.
 
 Run the standard targets inside the devcontainer:
 
@@ -82,6 +92,17 @@ builds; Maven artifact metadata publishes the same bytes under the lowercase,
 Scala-suffixed filename shown above.
 Copy `.env.example` to `.env` and populate the private-feed values before use.
 
+For Linux x86-64 glibc deployments with an upload size limit, an opt-in
+assembly omits RocksDB JNI libraries for other platforms while retaining
+`librocksdbjni-linux64.so` and all other assembly entries:
+
+```bash
+OPENIVM_ASSEMBLY_LINUX_AMD64=1 npx --no-install nx run spark-ext:assembly --configuration=spark-4.1
+```
+
+This artifact is not suitable for other architectures, operating systems, or
+musl-based Linux. The default assembly remains multi-platform.
+
 Every SBT publication entrypoint (`publish`, `publishLocal`, and `publishM2`)
 first builds the final shaded assembly and initializes
 `org.openivm.spark.parser.gen.IvmSqlBaseLexer` in an isolated classloader whose
@@ -118,8 +139,16 @@ fetching origin, and aligning each to its pinned branch, plus shallow-cloning
 the read-only `.temp/{spark,delta}` upstream references at their pinned release
 tags), then lints, compiles, assembles the fat jar, runs the packaged-assembly
 guard plus its incompatible-ATN regression, and runs every unit, integration,
-and parity suite in one sbt JVM. `spark-ext:verify-all` runs that pipeline for
+and parity suite in one sbt JVM. The existing verify path also invokes
+`dev/verify-native.sh` for native binding validation; use Nx rather than
+running that helper directly. `spark-ext:verify-all` runs that pipeline for
 both targets and fails if they discover different tests.
+
+For the local state-guard experiment, run the existing
+`spark-ext:state-guard-perf` target in the devcontainer; there is no separate
+workflow dispatch. See the [Darwin running guide](../../experiments/darwin/docs/RUNNING_LANES.md)
+for trusted evaluator setup and the distinction between a suite run and a
+scored, interleaved candidate evaluation.
 
 `pins-sync` exits non-zero only when a pinned repo or branch is missing on
 GitHub (or `.temp/` is corrupt). Drift between the local HEAD and the pinned
@@ -155,6 +184,7 @@ The normal development and CI image is
 `ghcr.io/openivm/openivm-spark-devcontainer:<content-hash>`. The tag
 covers the devcontainer definition, npm lockfile, SBT build definitions, native
 pins, and target pins. `DUCKDB_REF` and `DUCKDB_COMMIT` in `pins.env`
-select DuckDB v2.0.0 for both the CLI and native extension, matching OpenIVM's
-submodule. JDBC stays on 2.0.0.1. `NATIVE_BUILD_JOBS` bounds native build parallelism (default
-8); lower it on shared builders.
+explicitly select the DuckDB v2.0.0 ABI for the official CLI and native
+extension. The compiler dynamically loads the extension through the CLI; the
+project does not use DuckDB JDBC. `NATIVE_BUILD_JOBS` bounds native build
+parallelism (default 16); lower it on shared builders.

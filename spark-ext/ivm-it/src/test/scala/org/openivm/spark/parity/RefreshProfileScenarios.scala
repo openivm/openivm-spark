@@ -3,7 +3,14 @@ package org.openivm.spark.parity
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 import org.apache.spark.sql.Row
-import org.openivm.spark.common.{ChangeFeedMode, FeatureGate, RefreshProfileCatalog}
+import org.openivm.spark.common.{
+  ChangeFeedMode,
+  FeatureGate,
+  RefreshProfileCatalog,
+  RefreshSqlLogAsyncFlusher,
+  RefreshSqlLogCatalog,
+  RewriteLineage
+}
 import org.openivm.spark.common.rocksdb.OpenIvmStateSync
 import org.openivm.spark.telemetry.OpenIvmExecutionSpan
 import java.util.concurrent.{CountDownLatch, TimeUnit}
@@ -20,6 +27,7 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
   override protected def extraSparkConf: Map[String, String] =
     Map(
       "spark.openivm.profile.refresh"      -> "true",
+      FeatureGate.QueryLogEnabledKey       -> "true",
       FeatureGate.StateSyncAsyncEnabledKey -> "false"
     )
 
@@ -64,6 +72,11 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       span should include("start_epoch_ms=")
       span should include("end_epoch_ms=")
       span should include("outcome=")
+      clearProfile()
+      sql("CREATE MATERIALIZED VIEW IF NOT EXISTS profile_mv1 AS SELECT k, SUM(v) AS s FROM profile_t1 GROUP BY k")
+      val details = detailsForStep(showProfile(), "create_guard_discovery")
+      details should have size 1
+      details.head should include("start_monotonic_ns=")
     }
   }
 
@@ -86,6 +99,13 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       names should contain("total_refresh")
       names should contain("query_span")
       names should not contain "execute_refresh_sql_stmt"
+      val skips = detailsForStep(rows, "execute_refresh_sql_attempt")
+      skips should have size 1
+      skips.head should include("status=skipped")
+      skips.head should include("duration_ns=0")
+      skips.head should include("origin_class=unknown")
+      skips.head should include("credit_ns=0")
+      skips.head should include("reason=no_pending_deltas")
       names should contain("profile_persist")
       names should contain("state_backup")
       names should contain("after_query_span")
@@ -160,11 +180,51 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
       after.getLong(5) should be >= backup.getLong(5)
       rows.count(_.getString(4) == "query_span") shouldBe 1
       rows.count(_.getString(4) == "command_span") shouldBe 1
+      val commonFinalization = Seq(
+        "gc_prepare",
+        "sql_log_handoff",
+        "state_lag_check",
+        "finalize_consume_frozen_sources",
+        "finalize_data_version",
+        "finalize_catalog_advance",
+        "finalize_mark_consumed"
+      )
+      val interceptOnly = Seq("finalize_dependency_inventory", "finalize_prune_consumed")
+      if (changeFeedMode == ChangeFeedMode.Cdf) {
+        interceptOnly.foreach(step => detailsForStep(rows, step) shouldBe empty)
+      }
+      (commonFinalization ++ (if (changeFeedMode == ChangeFeedMode.Cdf) Seq.empty else interceptOnly)).foreach { step =>
+        val details = detailsForStep(rows, step)
+        details should have size 1
+        details.head should include("clock_domain_id=")
+        details.head should include("start_monotonic_ns=")
+        details.head should include("duration_ns=")
+      }
       val stmtDetails = detailsForStep(rows, "execute_refresh_sql_stmt")
       stmtDetails should not be empty
       stmtDetails.exists(_.contains("stmt_kind=")) shouldBe true
       stmtDetails.exists(_.contains("bytes=")) shouldBe true
 
+      val attempts = detailsForStep(rows, "execute_refresh_sql_attempt")
+      attempts should not be empty
+      attempts.exists(_.contains("work_class=incremental_sql")) shouldBe true
+      attempts.foreach { detail =>
+        detail should include("clock_domain_id=")
+        detail should include("start_epoch_ms=")
+        detail should include("start_monotonic_ns=")
+        detail should include("duration_ns=")
+        detail should include("work_class=incremental_")
+        if (detail.contains("status=skipped")) {
+          detail should include("duration_ns=0")
+          detail should include("credit_ns=0")
+        } else {
+          detail should include("status=success")
+          detail should include("action_id=")
+          detail should include("credit_ns=0")
+          detail should include("query_log_order=")
+          detail should include("attempt=0")
+        }
+      }
       val dispatchDetails = detailsForStep(rows, "generate_refresh_sql.dispatch")
       dispatchDetails should not be empty
       dispatchDetails.head should include("refresh_type=")
@@ -184,6 +244,131 @@ abstract class RefreshProfileScenarios extends IvmParitySpecBase("refresh-profil
         detail should include("body_ns=")
         detail should not include spark.conf.get("spark.sql.warehouse.dir")
       }
+    }
+
+    it("links ordinary dispatched statements to their exact captured origin without credit") {
+      sql("CREATE TABLE profile_lineage_src (k INT, v INT) USING DELTA")
+      sql("INSERT INTO profile_lineage_src VALUES (1, 10), (1, 20), (2, 30)")
+      sql("CREATE MATERIALIZED VIEW profile_lineage_mv AS SELECT k, SUM(v) AS s FROM profile_lineage_src GROUP BY k")
+      sql("DELETE FROM profile_lineage_src WHERE v = 10")
+      clearProfile()
+      sql("REFRESH MATERIALIZED VIEW profile_lineage_mv").collect()
+      assertMvCorrect("profile_lineage_mv", "SELECT k, SUM(v) AS s FROM profile_lineage_src GROUP BY k")
+      val rows      = showProfile()
+      val refreshId = rows.find(_.getString(4) == "query_span").get.getString(0)
+      RefreshSqlLogAsyncFlusher.awaitQuiescence(30000) shouldBe true
+      val logs = RefreshSqlLogCatalog.scanAll(spark).filter(_.refreshId == refreshId)
+      val attempts = detailsForStep(rows, "execute_refresh_sql_attempt")
+        .filter(_.contains("compiler_program_digest="))
+      attempts should not be empty
+      attempts.foreach { detail =>
+        val fields = detail
+          .split(";")
+          .iterator
+          .map(_.split("=", 2))
+          .collect { case Array(key, value) =>
+            key -> value
+          }
+          .toMap
+        val log = logs
+          .find(r =>
+            r.category == "rewritten_stmt" && r.stmtOrder == fields("query_log_order").toInt &&
+              r.attemptIdx == fields("attempt").toInt
+          )
+          .get
+        fields("executed_digest") shouldBe RewriteLineage.sha256Utf8(log.sqlText)
+        fields("compiler_program_digest") should fullyMatch regex "[0-9a-f]{64}"
+        fields("source_digest") should fullyMatch regex "[0-9a-f]{64}"
+        fields("compiler_program_digest_kind") shouldBe "native_program_utf8"
+        fields("source_ordinal_basis") shouldBe "zero_based_compiler_program_split"
+        fields("source_digest_basis") shouldBe "split_statement_utf8_without_delimiter"
+        val native     = logs.find(_.category == "compiler_program_native").get.sqlText
+        val normalized = logs.find(_.category == "compiler_program_normalized").get.sqlText
+        fields("compiler_program_digest") shouldBe RewriteLineage.sha256Utf8(native)
+        fields("normalized_program_digest") shouldBe RewriteLineage.sha256Utf8(normalized)
+        fields("source_digest") shouldBe RewriteLineage.sha256Utf8(
+          org.openivm.spark.common.SparkRefreshRewriter
+            .splitStatements(native)
+            .filter(_.trim.nonEmpty)(fields("source_ordinal").toInt)
+        )
+        fields("rewrite_pipeline") should include("lpts-spark-dialect@1")
+        fields("rewrite_pipeline") should include("expression-marker-restore@1")
+        fields("rewrite_pipeline") should not include "caller-post-process@unidentified"
+        fields("origin_class") shouldBe "unknown"
+        fields("credit_ns") shouldBe "0"
+      }
+    }
+
+    it("profiles the compiled empty-group delete without reporting a second cleanup") {
+      sql("CREATE TABLE profile_cleanup_src (k INT, v INT) USING DELTA")
+      sql("INSERT INTO profile_cleanup_src VALUES (1, 10), (2, 20)")
+      sql("CREATE MATERIALIZED VIEW profile_cleanup_mv AS SELECT k, COUNT(*) AS n FROM profile_cleanup_src GROUP BY k")
+      sql("DELETE FROM profile_cleanup_src WHERE k = 1")
+      clearProfile()
+      sql("REFRESH MATERIALIZED VIEW profile_cleanup_mv").collect()
+      assertMvCorrect("profile_cleanup_mv", "SELECT k, COUNT(*) AS n FROM profile_cleanup_src GROUP BY k")
+      val rows      = showProfile()
+      val refreshId = rows.find(_.getString(4) == "query_span").get.getString(0)
+      RefreshSqlLogAsyncFlusher.awaitQuiescence(30000) shouldBe true
+      val logs    = RefreshSqlLogCatalog.scanAll(spark).filter(_.refreshId == refreshId)
+      val deletes = logs.filter(r => r.category == "rewritten_stmt" && r.stmtKind == "delete")
+      deletes should have size 1
+      val emptyGroupDelete = """(?i)delete from (?:\w+\.)*profile_cleanup_mv where COALESCE\(n, 0\) = 0;?"""
+      deletes.head.sqlText.replace("`", "").trim should fullyMatch regex emptyGroupDelete
+      logs.map(_.category) should not contain "count_monoid_cleanup"
+      val attempts = detailsForStep(rows, "execute_refresh_sql_attempt")
+      val compiled = attempts.filter(_.contains(s"query_log_order=${deletes.head.stmtOrder};"))
+      compiled should have size 1
+      compiled.head should include("work_class=incremental_sql;")
+      compiled.head should include("status=success")
+      attempts.filter(_.contains("work_class=incremental_cleanup;")) shouldBe empty
+      detailsForStep(rows, "execute_refresh_cleanup_retry") shouldBe empty
+    }
+
+    it("separates incremental cleanup attempts from their retry wrapper") {
+      sql("CREATE TABLE profile_having_cleanup_src (k INT, v INT) USING DELTA")
+      sql("INSERT INTO profile_having_cleanup_src VALUES (1, 10), (1, 11), (2, 20), (2, 21)")
+      val query = "SELECT k, COUNT(*) AS n FROM profile_having_cleanup_src GROUP BY k HAVING COUNT(*) > 1"
+      sql(s"CREATE MATERIALIZED VIEW profile_having_cleanup_mv AS $query")
+      sql("DELETE FROM profile_having_cleanup_src WHERE v = 10")
+      clearProfile()
+      sql("REFRESH MATERIALIZED VIEW profile_having_cleanup_mv").collect()
+      assertMvCorrect("profile_having_cleanup_mv", query)
+      val rows = showProfile()
+      val attempts = detailsForStep(rows, "execute_refresh_sql_attempt")
+        .filter(_.contains("work_class=incremental_cleanup"))
+      attempts should have size 1
+      attempts.head should include("status=success")
+      attempts.head should include("attempt=0")
+      attempts.head should include("origin_class=executor_helper")
+      attempts.head should include("credit_reason=cleanup")
+      attempts.head should include("duration_ns=")
+      val wrappers = detailsForStep(rows, "execute_refresh_cleanup_retry")
+      wrappers should have size 1
+      wrappers.head should include("work_class=incremental_cleanup_retry")
+      wrappers.head should include("duration_ns=")
+    }
+
+    it("records full writers separately from incremental SQL") {
+      sql("CREATE TABLE profile_full_src (k INT) USING DELTA")
+      sql("INSERT INTO profile_full_src VALUES (1), (2)")
+      val query = "SELECT k FROM profile_full_src INTERSECT ALL SELECT k FROM profile_full_src"
+      sql(s"CREATE MATERIALIZED VIEW profile_full_mv AS $query")
+      sql("INSERT INTO profile_full_src VALUES (3)")
+      clearProfile()
+      sql("REFRESH MATERIALIZED VIEW profile_full_mv").collect()
+      assertMvCorrect("profile_full_mv", query)
+      val rows     = showProfile()
+      val attempts = detailsForStep(rows, "execute_full_refresh_attempt")
+      attempts should have size 1
+      attempts.head should include("work_class=full_refresh_writer")
+      attempts.head should include("status=success")
+      attempts.head should include("origin_class=executor_helper")
+      attempts.head should include("credit_ns=0")
+      attempts.head should include("attempt=0")
+      attempts.head should include("duration_ns=")
+      detailsForStep(rows, "execute_full_refresh_retry") should have size 1
+      detailsForStep(rows, "execute_refresh_sql_attempt") shouldBe empty
     }
   }
 

@@ -1,5 +1,6 @@
 package org.openivm.spark.parity
 
+import org.apache.spark.sql.AnalysisException
 import org.openivm.spark.common.{MvCatalog, RefreshTypeCode}
 import org.openivm.spark.parity.base.{IvmParityMode, IvmParitySpecBase}
 
@@ -26,18 +27,21 @@ abstract class NonDeterministicCreateScenarios extends IvmParitySpecBase("non-de
 
   describe("CREATE MATERIALIZED VIEW determinism guard") {
 
-    it("fully refreshes a view with a time-dependent date expression") {
+    it("fully recomputes a grouped current_date expression") {
       sql("CREATE TABLE nd_date_src (k INT, d DATE, v BIGINT) USING DELTA")
-      sql("INSERT INTO nd_date_src VALUES (1, current_date(), 10), (1, DATE '2020-01-01', 20), (2, current_date(), 5)")
+      sql(
+        "INSERT INTO nd_date_src VALUES (1, current_date(), 10), " +
+          "(1, DATE '2020-01-01', 20), (2, current_date(), 5)"
+      )
       assertRecomputed(
         "nd_date_mv",
         "SELECT k, SUM(CASE WHEN d >= current_date() THEN v ELSE 0 END) AS today_total, COUNT(*) AS n " +
           "FROM nd_date_src GROUP BY k",
-        "INSERT INTO nd_date_src VALUES (3, current_date(), 7)"
+        "INSERT INTO nd_date_src VALUES (3, DATE '2000-01-01', 2)"
       )
     }
 
-    it("fully refreshes a view with a time-dependent timestamp expression") {
+    it("fully recomputes a grouped current_timestamp expression") {
       sql("CREATE TABLE nd_ts_src (k INT, ts TIMESTAMP, v BIGINT) USING DELTA")
       sql(
         "INSERT INTO nd_ts_src VALUES (1, TIMESTAMP '2020-01-01 00:00:00', 10), (2, TIMESTAMP '2999-01-01 00:00:00', 5)"
@@ -46,8 +50,29 @@ abstract class NonDeterministicCreateScenarios extends IvmParitySpecBase("non-de
         "nd_ts_mv",
         "SELECT k, SUM(CASE WHEN ts <= current_timestamp() THEN v ELSE 0 END) AS elapsed_total, COUNT(*) AS n " +
           "FROM nd_ts_src GROUP BY k",
-        "INSERT INTO nd_ts_src VALUES (3, TIMESTAMP '2020-01-01 00:00:00', 7)"
+        "INSERT INTO nd_ts_src VALUES (3, TIMESTAMP '2000-01-01 00:00:00', 2)"
       )
+    }
+
+    it("does not accept an incremental aggregate with now or localtimestamp by default") {
+      sql("CREATE TABLE nd_alt_clock_src (k INT, ts TIMESTAMP, v BIGINT) USING DELTA")
+      Seq(("now", "now()"), ("localtimestamp", "localtimestamp()"), ("localtimestamp_bare", "localtimestamp"))
+        .foreach { case (name, expression) =>
+          val mv = s"nd_${name}_mv"
+          val query =
+            s"SELECT k, SUM(CASE WHEN ts <= $expression THEN v ELSE 0 END) AS total, COUNT(*) AS n " +
+              "FROM nd_alt_clock_src GROUP BY k"
+          val failure =
+            try {
+              sql(s"CREATE MATERIALIZED VIEW $mv AS $query")
+              None
+            } catch { case e: AnalysisException => Some(e) }
+          failure match {
+            case Some(error) =>
+              error.getMessage.toLowerCase(java.util.Locale.ROOT) should include(expression.takeWhile(_ != '('))
+            case None => refreshType(mv) shouldBe RefreshTypeCode.FullRefresh
+          }
+        }
     }
 
     it("accepts a random expression in a view that is recomputed on every refresh") {

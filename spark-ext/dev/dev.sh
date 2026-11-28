@@ -100,7 +100,9 @@ load_pin_files() {
     # shellcheck disable=SC1090
     source "$RUNTIME_PINS_FILE"
     export OPENIVM_SPARK_TARGET
-    export SPARK_EXT_IMAGE_TAG="${OPENIVM_SPARK_TARGET//./-}-${SPARK_COMMIT:0:12}-${DELTA_COMMIT:0:12}-${OPENIVM_COMMIT:0:12}-${LPTS_COMMIT:0:12}-${DUCKDB_COMMIT:0:12}"
+    local native_image_inputs_hash
+    native_image_inputs_hash="$(sha256sum "$DEV_DIR/docker/Dockerfile" "$DEV_DIR/docker/docker-compose.yml" "$PINS_FILE" | sha256sum | cut -c1-12)"
+    export SPARK_EXT_IMAGE_TAG="${OPENIVM_SPARK_TARGET//./-}-${SPARK_COMMIT:0:12}-${DELTA_COMMIT:0:12}-${OPENIVM_COMMIT:0:12}-${LPTS_COMMIT:0:12}-${DUCKDB_COMMIT:0:12}-${native_image_inputs_hash}"
     set +a
 }
 

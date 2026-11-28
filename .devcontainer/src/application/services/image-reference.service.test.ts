@@ -302,6 +302,7 @@ test('Spark workspace is flattened and pins the IDE JDKs', () => {
     '**/.bloop/**': true,
     '**/.metals/**': true,
     '**/target/**': true,
+    '**/target': true,
   });
 });
 
@@ -316,7 +317,7 @@ test('cleanup target is typed and smoke uses the stale-container label', () => {
     'utf8',
   );
   assert.equal('cleanup' in (project.targets ?? {}), true);
-  assert.equal(smokeSource.includes('this.cleanup();'), true);
+  assert.equal(smokeSource.includes('this.cleanup();'), false);
   assert.equal(smokeSource.includes("'--label'"), true);
   assert.equal(smokeSource.includes('this.settings.containerLabel'), true);
   assert.equal(smokeContainerLabel, 'org.openivm.spark.devcontainer.smoke=true');
@@ -347,6 +348,8 @@ test('runtime smoke suite covers tools, native artifacts, lifecycle, SBT, and Do
     'lifecycle hook',
     'warmed Spark 3.5 and Spark 4.1 dependency caches',
     'Metals Bloop import',
+    'locked Python bridge (spark-3.5)',
+    'locked Python bridge (spark-4.1)',
     'host Docker socket access',
   ]);
   const scripts = checks.map((check) => check.script).join('\n');

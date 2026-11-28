@@ -31,6 +31,44 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
   private val mvLocation      = "dbfs:/delta/mv_r"
   private val viewDeltaPath   = "dbfs:/delta/_tmp/mv_r_delta_uuid"
 
+  describe("scalar aggregate CTE aliases") {
+    it("inlines the native prefixed quoted COUNT alias alongside SUM") {
+      val sql =
+        """WITH openivm_delta AS (
+          |SELECT SUM(openivm_multiplicity * n) AS d_n,
+          |SUM(openivm_multiplicity * `days`) AS d_`days`
+          |FROM openivm_delta_mv_r)
+          |UPDATE openivm_data_mv_r SET
+          |n = COALESCE(n, 0) + COALESCE((SELECT d_n FROM openivm_delta), 0),
+          |`days` = COALESCE(`days`, 0) + COALESCE((SELECT d_`days` FROM openivm_delta), 0);""".stripMargin
+      val rewritten = SparkRefreshRewriter
+        .rewrite(sql, mvName, mvLocation, viewLogicalName, Map.empty, viewDeltaPath)
+        .statements
+        .mkString("\n")
+      rewritten should include(s"(SELECT SUM(openivm_multiplicity * n) FROM delta.`$viewDeltaPath`)")
+      rewritten should include(s"(SELECT SUM(openivm_multiplicity * `days`) FROM delta.`$viewDeltaPath`)")
+      rewritten should not include "FROM openivm_delta"
+      rewritten should not include "d_`days`"
+    }
+
+    it("preserves escaped, mixed-case and delimited scalar alias tokens") {
+      for (
+        column <- Seq("MiXeD", "`from value`", "`a,b)`", "`a``b$`", "\"a\"\"b$\"");
+        alias  <- Seq(s"d_$column", s"`d_${column.replace("`", "``")}`")
+      ) {
+        val expression = s"SUM(openivm_multiplicity * $column)"
+        val sql =
+          s"""WITH openivm_delta AS (SELECT $expression AS $alias FROM openivm_delta_mv_r)
+             |UPDATE openivm_data_mv_r SET $column = COALESCE((SELECT $alias FROM openivm_delta), 0);""".stripMargin
+        val rewritten = SparkRefreshRewriter
+          .rewrite(sql, mvName, mvLocation, viewLogicalName, Map.empty, viewDeltaPath)
+          .statements
+          .mkString("\n")
+        rewritten shouldBe s"UPDATE `mydb`.`mv_r` SET $column = COALESCE((SELECT $expression FROM delta.`$viewDeltaPath`), 0)"
+      }
+    }
+  }
+
   describe("current native source and outer-join contracts") {
     it("preserves source-column exclusion in affected-key reconstruction UNIONs") {
       val input = """CREATE OR REPLACE TEMP TABLE openivm_affected_mv_r AS
@@ -970,6 +1008,112 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         |UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'mv_trh';
         |""".stripMargin
 
+    it("captures exact native digests and maps suppressed and one-to-many statements structurally") {
+      val sourceBytes = windowDeleteInput.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      def rewrite(capture: Option[RewriteLineage.Capture] = None) =
+        SparkRefreshRewriter.rewrite(
+          compiledSql = windowDeleteInput,
+          mvName = TableIdentifier("mv_trh", Some("silver")),
+          mvLocation = "dbfs:/delta/mv_trh",
+          viewLogicalName = "mv_trh",
+          sourceTempViews = Map.empty,
+          viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid",
+          lineageCapture = capture
+        )
+
+      val disabled = rewrite()
+      disabled.lineage shouldBe None
+      val captured     = rewrite(Some(RewriteLineage.captureNativeProgramBytes(sourceBytes)))
+      val snapshot     = captured.lineage.get
+      val splitSources = SparkRefreshRewriter.splitStatements(windowDeleteInput)
+
+      captured.statements shouldBe disabled.statements
+      snapshot.compilerProgramDigest shouldBe RewriteLineage.sha256Utf8(windowDeleteInput)
+      snapshot.sourceStatements.map(_.ordinal) shouldBe Seq(0, 1, 2, 3)
+      snapshot.sourceStatements.map(_.sourceStatementDigest) shouldBe splitSources.map(RewriteLineage.sha256Utf8)
+      snapshot.sourceStatements.map(_.outputIndices) shouldBe Seq(Seq.empty, Seq(0, 1), Seq(2), Seq.empty)
+      snapshot.outputs.map(_.outputIndex) shouldBe Seq(0, 1, 2)
+      snapshot.outputs.map(_.sourceOrdinal) shouldBe Seq(1, 1, 2)
+      snapshot.outputs.map(_.rewriteRuleName) shouldBe
+        Seq("partition-scoped-delete", "partition-scoped-delete", "partition-scoped-insert")
+      snapshot.outputs.forall(_.classification == RewriteLineage.Unknown) shouldBe true
+      snapshot.outputs.forall(output => !output.timingCreditAllowed) shouldBe true
+      snapshot.outputs.head.additionalRewriteRules.last shouldBe RewriteLineage.RewriteRule(
+        "caller-post-process",
+        "unidentified",
+        RewriteLineage.Unknown
+      )
+      RewriteLineage.sha256Utf8("abc") shouldBe "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+      val repeated = rewrite(Some(RewriteLineage.captureNativeProgramBytes(sourceBytes))).lineage.get
+      repeated shouldBe snapshot
+    }
+
+    it("distinguishes native compiler input from normalized-only or ambiguous cached output") {
+      val normalized = windowDeleteInput
+      val native     = normalized.replace("openivm_data_mv_trh", "memory.main.openivm_data_mv_trh")
+      def lineage(raw: Option[String]) = SparkRefreshRewriter
+        .rewrite(
+          compiledSql = normalized,
+          mvName = TableIdentifier("mv_trh", Some("silver")),
+          mvLocation = "dbfs:/delta/mv_trh",
+          viewLogicalName = "mv_trh",
+          sourceTempViews = Map.empty,
+          viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid",
+          lineageCapture = Some(RewriteLineage.captureCompilerOutput(normalized, raw))
+        )
+        .lineage
+        .get
+
+      val fresh = lineage(Some(native))
+      fresh.compilerProgramDigestKind shouldBe "native_program_utf8"
+      fresh.compilerProgramDigest shouldBe RewriteLineage.sha256Utf8(native)
+      fresh.normalizedProgramDigest shouldBe RewriteLineage.sha256Utf8(normalized)
+      fresh.sourceStatements.map(_.sourceStatementDigest) shouldBe
+        SparkRefreshRewriter.splitStatements(native).map(RewriteLineage.sha256Utf8)
+      val cached    = lineage(None)
+      val ambiguous = lineage(Some(native + "SELECT 1;"))
+      Seq(cached, ambiguous).foreach { result =>
+        result.compilerProgramDigestKind shouldBe "normalized_compiler_output_utf8"
+        result.compilerProgramDigest shouldBe RewriteLineage.sha256Utf8(normalized)
+        result.outputs.forall(output => !output.timingCreditAllowed) shouldBe true
+      }
+    }
+
+    it("labels generated snapshot scratch statements as executor helpers without timing credit") {
+      val input = "CREATE OR REPLACE TEMP TABLE openivm_current_mv_trh AS SELECT 1 AS id;"
+      val result = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = TableIdentifier("mv_trh", Some("silver")),
+        mvLocation = "dbfs:/delta/mv_trh",
+        viewLogicalName = "mv_trh",
+        sourceTempViews = Map.empty,
+        viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid",
+        lineageCapture = Some(
+          RewriteLineage.captureNativeProgramBytes(input.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+        )
+      )
+
+      result.lineage.get.outputs.map(_.classification) shouldBe Seq(RewriteLineage.ExecutorHelper)
+      result.lineage.get.outputs.forall(output => !output.timingCreditAllowed) shouldBe true
+    }
+
+    it("keeps opt-in lineage absent and output ordering unchanged by default") {
+      val result = SparkRefreshRewriter.rewrite(
+        compiledSql = windowDeleteInput,
+        mvName = TableIdentifier("mv_trh", Some("silver")),
+        mvLocation = "dbfs:/delta/mv_trh",
+        viewLogicalName = "mv_trh",
+        sourceTempViews = Map.empty,
+        viewDeltaPath = "dbfs:/delta/_tmp/mv_trh_delta_uuid"
+      )
+
+      result.lineage shouldBe None
+      result.statements should have size 3
+      result.statements.head should include("WHEN MATCHED THEN DELETE")
+      result.statements(1) should include("WHEN MATCHED THEN DELETE")
+    }
+
     it("keeps the legacy one-MERGE-per-IN-clause shape when the gate is off") {
       val rewritten = SparkRefreshRewriter
         .rewrite(
@@ -1160,6 +1304,30 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
   }
 
   describe("outer-join projection partial recompute rewrites") {
+    it("preserves explicit and implicit subquery aliases in full recompute inserts") {
+      Seq("openivm_tgt", "`openivm_tgt`", "\"openivm_tgt\"").foreach { alias =>
+        Seq("", "AS ").foreach { modifier =>
+          val input =
+            s"""INSERT INTO openivm_data_mv_r
+               |SELECT * FROM (SELECT region, MAX(amount) AS total FROM memory.main.sales GROUP BY region) $modifier$alias
+               |WHERE $alias.region IS NOT NULL;""".stripMargin
+          val rewritten = SparkRefreshRewriter.rewrite(
+            compiledSql = input,
+            mvName = mvName,
+            mvLocation = mvLocation,
+            viewLogicalName = viewLogicalName,
+            sourceTempViews = Map.empty,
+            viewDeltaPath = viewDeltaPath
+          )
+          rewritten.statements should have size 1
+          val merge = rewritten.statements.head
+          merge should include(s"SELECT $alias.`region`, $alias.`total` FROM")
+          merge should include(s") $alias\nWHERE $alias.region IS NOT NULL")
+          CatalystSqlParser.parsePlan(merge.replace("\"openivm_tgt\"", "`openivm_tgt`"))
+        }
+      }
+    }
+
     it("rewrites FULL OUTER CTE-prefixed IN deletes into key-safe delete MERGEs") {
       val input =
         """UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_r';
@@ -1471,16 +1639,18 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
           |  WHERE EXISTS (SELECT 1 FROM openivm_old_affected_mv_r a WHERE a.region <=> d.region);
           |DROP TABLE openivm_old_snapshot_mv_r;
           |DROP TABLE openivm_old_affected_mv_r;""".stripMargin
-      val rewritten = SparkRefreshRewriter.rewrite(
+      def rewrite(capture: Option[RewriteLineage.Capture]) = SparkRefreshRewriter.rewrite(
         compiledSql = input,
         mvName = mvName,
         mvLocation = mvLocation,
         viewLogicalName = viewLogicalName,
         sourceTempViews = Map.empty,
         viewDeltaPath = viewDeltaPath,
-        mvVersionBeforeRefresh = Some(7L)
+        mvVersionBeforeRefresh = Some(7L),
+        lineageCapture = capture
       )
-      val raw = s"delta.`$viewDeltaPath-input`"
+      val rewritten = rewrite(None)
+      val raw       = s"delta.`$viewDeltaPath-input`"
       rewritten.aggregateInputPath shouldBe Some(s"$viewDeltaPath-input")
       rewritten.statements should have size 3
       rewritten.statements(0) should startWith(s"CREATE OR REPLACE TABLE $raw")
@@ -1491,6 +1661,15 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       publication should include(s"delta.`$mvLocation` VERSION AS OF 7")
       publication should include("UNION ALL SELECT d.region, d.total, 1 FROM `mydb`.`mv_r`")
       publication should not include "openivm_timestamp"
+
+      val captured = rewrite(Some(RewriteLineage.captureCompilerOutput(input, None)))
+      captured.statements shouldBe rewritten.statements
+      captured.aggregateInputPath shouldBe rewritten.aggregateInputPath
+      val outputs = captured.lineage.get.outputs
+      outputs.map(_.sourceOrdinal) shouldBe Seq(0, 5, 8)
+      outputs.last.rewriteRuleName shouldBe "affected-group-cascade"
+      outputs.last.classification shouldBe RewriteLineage.Unknown
+      outputs.last.timingCreditAllowed shouldBe false
     }
 
     it("reads the published target for a full replacement cascade, without changing partial replacement") {
@@ -1525,6 +1704,24 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       cascade should include("FROM `mydb`.`mv_r`")
       cascade should not include "FROM openivm_new_mv_r"
       full should contain("INSERT INTO `mydb`.`mv_r` SELECT * FROM openivm_new_mv_r")
+
+      val guarded = SparkRefreshRewriter.rewrite(
+        compiledSql = input,
+        mvName = mvName,
+        mvLocation = mvLocation,
+        viewLogicalName = viewLogicalName,
+        sourceTempViews = Map.empty,
+        viewDeltaPath = viewDeltaPath,
+        mvVersionBeforeRefresh = Some(7L),
+        lineageCapture = Some(RewriteLineage.captureCompilerOutput(input, None)),
+        reusePublishedSnapshotForCascade = false
+      )
+      val guardedCascade = guarded.statements(full.indexOf(cascade))
+      guardedCascade should include("FROM openivm_old_mv_r")
+      guardedCascade should include("FROM openivm_new_mv_r")
+      guardedCascade should not include "FROM `mydb`.`mv_r`"
+      val ruleNames = guarded.lineage.get.outputs.flatMap(_.additionalRewriteRules).map(_.name)
+      ruleNames should not contain "reuse-published-snapshot-in-cascade"
 
       val partial = rewrite(
         input.replace(
@@ -1831,20 +2028,24 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
         )
         .statements
       tagged.count(_.contains(SparkRefreshRewriter.RunningWindowSuffixMarker)) shouldBe 4
-      val rewritten = tagged.map(SparkRefreshRewriter.stripExecutionMarker)
-      val dataInsert = rewritten
-        .find(_.startsWith("INSERT INTO `default`.`wradm_mv`"))
+      def findInsert(prefix: String): Option[String] =
+        tagged.find(s => SparkRefreshRewriter.stripExecutionMarker(s).startsWith(prefix))
+      val markedDataInsert = findInsert("INSERT INTO `default`.`wradm_mv`")
         .getOrElse(fail("materialized suffix data insert missing"))
+      markedDataInsert should include(SparkRefreshRewriter.RunningWindowSuffixMarker)
+      val dataInsert = SparkRefreshRewriter.stripExecutionMarker(markedDataInsert)
       dataInsert should include("(dm_s_symb, dm_date, dm_close, run_sum)")
       dataInsert should include("SELECT * FROM openivm_run_result_wradm_mv")
-      val append = rewritten
-        .find(_.startsWith("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`"))
+      val markedAppend = findInsert("INSERT INTO delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")
         .getOrElse(fail("materialized suffix cascade append missing"))
+      markedAppend should include(SparkRefreshRewriter.RunningWindowSuffixMarker)
+      val append = SparkRefreshRewriter.stripExecutionMarker(markedAppend)
       append should include("FROM openivm_run_result_wradm_mv")
       append should not include "openivm_timestamp"
       append should include("CURRENT_TIMESTAMP")
-      rewritten.count(_.startsWith("CACHE TABLE `openivm_run_result_wradm_mv`")) shouldBe 1
-      rewritten.count(_.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
+      val executable = tagged.map(SparkRefreshRewriter.stripExecutionMarker)
+      executable.count(_.startsWith("CACHE TABLE `openivm_run_result_wradm_mv`")) shouldBe 1
+      executable.count(_.startsWith("CREATE OR REPLACE TABLE delta.`dbfs:/delta/_tmp/wradm_mv_delta_uuid`")) shouldBe 1
     }
 
     it("drops running-window helper objects as views") {
@@ -2996,6 +3197,28 @@ class SparkRefreshRewriterSpec extends AnyFunSpec with Matchers {
       SparkRefreshRewriter.stripTimestampPredicate(
         "SELECT * FROM t WHERE (openivm_timestamp >= '2024-01-01'::TIMESTAMP) AND region = 'r'"
       ) shouldBe "SELECT * FROM t WHERE region = 'r'"
+    }
+
+    it("strips DuckDB 2 parenthesized timestamp horizons without removing adjacent filters") {
+      val horizon = "((openivm_timestamp) >= (TIMESTAMP '2026-11-21 18:06:28.082538'))"
+      SparkRefreshRewriter.stripTimestampPredicate(s"SELECT * FROM t WHERE $horizon") shouldBe "SELECT * FROM t"
+      SparkRefreshRewriter.stripTimestampPredicate(s"SELECT * FROM t WHERE $horizon AND region = 'r'") shouldBe
+        "SELECT * FROM t WHERE region = 'r'"
+      SparkRefreshRewriter.stripTimestampPredicate(s"SELECT * FROM t WHERE region = 'r' AND $horizon") shouldBe
+        "SELECT * FROM t WHERE region = 'r'"
+      SparkRefreshRewriter.stripTimestampPredicate(
+        "SELECT * FROM t WHERE (event_time) >= (TIMESTAMP '2026-01-01')"
+      ) shouldBe
+        "SELECT * FROM t WHERE (event_time) >= (TIMESTAMP '2026-01-01')"
+    }
+
+    it("preserves timestamp-like text inside quoted identifiers and comments") {
+      val sql =
+        "SELECT `x WHERE ((openivm_timestamp) >= (TIMESTAMP '2026-01-01'))` FROM t " +
+          "/* nested /* comment */ WHERE ((openivm_timestamp) >= (TIMESTAMP '2026-01-01')) */"
+      SparkRefreshRewriter.stripTimestampPredicate(sql) shouldBe sql
+      val predicate = "((`d`.`openivm_timestamp`) >= (TIMESTAMP '2026-01-01'))"
+      SparkRefreshRewriter.stripTimestampPredicate(s"$sql WHERE $predicate") shouldBe sql
     }
 
     it("does NOT hang on a long identifier before a timestamp predicate (ReDoS guard)") {

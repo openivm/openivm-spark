@@ -35,9 +35,10 @@ Commands:
   test-inventory [sbt-args] Write the selected target's discovered tests.
   compare-test-inventory    Compare Spark 3.5 and Spark 4.1 inventories.
   assembly [sbt-args]       Build the ivmExtension assembly JAR.
-  verify [sbt-args]         pins-sync, lint, compile, inventory, assembly, test.
+  verify [sbt-args]         pins-sync, native-pin check, lint, compile, inventory, assembly, test.
   verify-all [sbt-args]     Verify both targets and compare inventories.
   window-benchmark          Run the WindowNoopWriteHarness micro-benchmark.
+  state-guard-perf          Run the opt-in state-guard concurrent-refresh perf and crash-recovery suite.
   openivm-test [make-args]  Run upstream tests from a baked or mounted source.
   pins-sync                 Align pinned dependency worktrees.
   help                      Print this message.
@@ -53,6 +54,7 @@ Environment:
   OPENIVM_TEST_FORKS         Fork cap forwarded as openivm.test.forks.
   OPENIVM_TEST_LOG_ROOT      Log root (default repo-root .logs).
   OPENIVM_SOURCE_DIR         OpenIVM source tree for openivm-test.
+  OPENIVM_STATE_GUARD_SUITE  state-guard-perf: all (default), perf or crash.
 EOF
 }
 
@@ -188,6 +190,8 @@ setup_test_log_dir() {
 }
 
 run_sbt() {
+    # shellcheck source=python-env.sh
+    source "$SCRIPT_DIR/python-env.sh" "$OPENIVM_SPARK_TARGET"
     local sbt_bin="${OPENIVM_SBT_BIN:-sbt}"
     if [[ "$sbt_bin" == */* ]]; then
         [[ -x "$sbt_bin" ]] || die "SBT executable not found at $sbt_bin"
@@ -258,6 +262,7 @@ cmd_fmt() {
 }
 
 cmd_lint() {
+    bash "$SCRIPT_DIR/check-doc-names.sh"
     prepare_sbt 0
     run_sbt "$@" scalafmtCheckAll scalafmtSbtCheck
 }
@@ -318,8 +323,10 @@ cmd_assembly() {
 }
 
 cmd_verify() {
+    bash "$SCRIPT_DIR/check-doc-names.sh"
     cmd_pins_sync
     prepare_sbt 1
+    bash "$SCRIPT_DIR/verify-native.sh"
     setup_test_log_dir
     run_sbt "$@" \
         ivmExtension/clean \
@@ -341,6 +348,33 @@ cmd_verify_all() {
     "$0" --target spark-3.5 "${pin_args[@]}" verify "$@"
     "$0" --target spark-4.1 "${pin_args[@]}" verify "$@"
     "$0" compare-test-inventory
+}
+
+cmd_state_guard_perf() {
+    local perf="ivmIt/testOnly org.openivm.spark.perf.StateGuardConcurrentRefreshPerfSpec -- -n org.openivm.spark.tags.StateGuardPerf"
+    local rocks="org.openivm.spark.common.rocksdb"
+    local crash="ivmIt/testOnly $rocks.StateGuardCrashRecoverySpec $rocks.InterceptStaleSnapshotCrashSpec $rocks.InterceptStaleSnapshotDeltaSpec $rocks.InterceptStaleSnapshotRocksSpec $rocks.LegacyInterceptWitnessSpec"
+    local suites=()
+
+    if [[ -n "${OPENIVM_STATE_GUARD_REPORT_DIR:-}" ]]; then
+        mkdir -p "$OPENIVM_STATE_GUARD_REPORT_DIR/junit"
+        crash+=" -- -u $OPENIVM_STATE_GUARD_REPORT_DIR/junit"
+    fi
+
+    case "${OPENIVM_STATE_GUARD_SUITE:-all}" in
+        all)   suites=("$perf" "$crash") ;;
+        perf)  suites=("$perf") ;;
+        crash) suites=("$crash") ;;
+        *)
+            echo "[spark-ext/run] OPENIVM_STATE_GUARD_SUITE must be all, perf or crash" >&2
+            exit 2
+            ;;
+    esac
+    # The crash cases start many JVMs and time out under contention, so the specs run one after another.
+    export OPENIVM_TEST_FORKS="${OPENIVM_TEST_FORKS:-1}"
+    prepare_sbt 1
+    setup_test_log_dir
+    run_sbt "$@" "${suites[@]}"
 }
 
 cmd_window_benchmark() {
@@ -396,6 +430,8 @@ case "$COMMAND" in
     verify-all|verify_all)          cmd_verify_all "$@" ;;
     window-benchmark|window_benchmark)
                                     cmd_window_benchmark "$@" ;;
+    state-guard-perf|state_guard_perf)
+                                    cmd_state_guard_perf "$@" ;;
     openivm-test|openivm_test)      cmd_openivm_test "$@" ;;
     pins-sync|pins_sync)            cmd_pins_sync "$@" ;;
     help)                           usage ;;

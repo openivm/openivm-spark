@@ -77,7 +77,7 @@ private[commands] object GroupedWindowStatePlan extends Logging {
   }
   private def frames(spark: SparkSession, sources: Vector[Source]): Map[String, DataFrame] = sources.map { s =>
     val raw = spark.read.format("delta").option("versionAsOf", s.version).load(s.path)
-    s.name -> MvProjectionSource.project(raw, s.schema)
+    s.name -> MvProjectionSource.project(raw, s.schema, names = MvProjectionSource.outputNames(spark, s.name))
   }.toMap
   private def align(df: DataFrame, schema: StructType): DataFrame = {
     require(

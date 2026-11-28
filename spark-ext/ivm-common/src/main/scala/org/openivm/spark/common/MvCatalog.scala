@@ -1,13 +1,16 @@
 package org.openivm.spark.common
 
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.UTF8String
 import org.openivm.spark.common.rocksdb.{
   OpenIvmRocksDB,
   OpenIvmRocksDBBatchOps,
   OpenIvmRocksDBRegistry,
+  OpenIvmStateBarrier,
   OpenIvmStateSync,
   RocksDBCodec
 }
@@ -250,6 +253,7 @@ object MvMetadata {
     * change to downstream materialized views.
     */
   val DefinitionIdentityKey: String = "_ivm_definition_identity"
+  val TargetDeltaTableIdKey: String = "_ivm_target_delta_table_id"
 
   /** Crash-recovery journal for an in-flight source-version advancement. The
     * user query/pin/watermark fields remain unchanged while these keys exist.
@@ -711,6 +715,23 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
     readMetadataAtPath(spark, perMvDbPath(spark, serializedName))
   }
 
+  override def lookupReadOnly(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
+    OpenIvmStateSync.maybeRestore(spark)
+    val path = perMvDbPath(spark, serializeName(name))
+    val exists =
+      try {
+        Files.readAttributes(Paths.get(path), classOf[BasicFileAttributes])
+        true
+      } catch {
+        case _: java.nio.file.NoSuchFileException => false
+      }
+    if (!exists) None
+    else
+      Some(readMetadataAtPath(spark, path).getOrElse {
+        throw new IllegalStateException(s"Incomplete MV registration for ${serializeName(name)}")
+      })
+  }
+
   def list(spark: SparkSession): Seq[MvMetadata] = {
     OpenIvmStateSync.maybeRestore(spark)
     OpenIvmStatePaths.existingMvDbPaths(spark).flatMap(readMetadataAtPath(spark, _)).sortBy(m => serializeName(m.name))
@@ -746,6 +767,31 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
           }
         }
       }
+  }
+
+  def advanceWithCdfWatermarks(
+      spark: SparkSession,
+      name: TableIdentifier,
+      newVersion: Long,
+      watermarks: Map[String, Long]
+  ): Unit = {
+    val serializedName = serializeName(name)
+    openExistingPerMvDbAt(spark, perMvDbPath(spark, serializedName)).foreach { perMvDb =>
+      perMvDb.withBatch { batch =>
+        val latest = getLong(perMvDb, MetaCf, LastVersionMetaKey).getOrElse(-1L)
+        if (newVersion > latest) {
+          OpenIvmRocksDBBatchOps.put(perMvDb, batch, MetaCf, LastVersionMetaKey, RocksDBCodec.utf8(newVersion.toString))
+          watermarks.foreach { case (source, version) =>
+            val key = RocksDBCodec.utf8(s"${MvMetadata.WatermarkKeyPrefix}$source")
+            val previous = getUtf8(perMvDb, PropertiesCf, key)
+              .flatMap(ChangeWatermark.decodeDeltaVersion)
+              .map(_.version)
+            val value = ChangeWatermark.DeltaVersion(previous.fold(version)(math.max(_, version))).encode
+            OpenIvmRocksDBBatchOps.put(perMvDb, batch, PropertiesCf, key, RocksDBCodec.utf8(value))
+          }
+        }
+      }
+    }
   }
 
   def updateProperties(
@@ -851,30 +897,224 @@ private[common] object RocksDbMvCatalogBackend extends MvCatalogBackend {
 object MvCatalog {
   private def backend(spark: SparkSession): MvCatalogBackend = MvCatalogBackend.forSession(spark)
 
+  def qualifiedName(spark: SparkSession, name: TableIdentifier): TableIdentifier =
+    if (name.database.isDefined) name
+    else TableIdentifier(name.table, Some(spark.catalog.currentDatabase), name.catalog)
+
+  private def tableSql(name: TableIdentifier): String =
+    (name.catalog.toSeq ++ name.database.toSeq :+ name.table)
+      .map(part => s"`${part.replace("`", "``")}`")
+      .mkString(".")
+
+  private def legacyMatches(spark: SparkSession, name: TableIdentifier, meta: MvMetadata): Option[Boolean] = {
+    val target  = tableSql(name)
+    val backing = tableSql(TableIdentifier(s"${name.table}__ivm_data", name.database, name.catalog))
+    val log =
+      if (spark.catalog.tableExists(target)) DeltaTableVersion.analyzedDeltaLogOption(spark, target)
+      else if (meta.usesBackingDataTable && spark.catalog.tableExists(backing))
+        DeltaTableVersion.registeredDeltaLogOption(spark, backing)
+      else return None
+    val hconf = spark.sessionState.newHadoopConf()
+    def qualified(path: org.apache.hadoop.fs.Path): java.net.URI =
+      path.getFileSystem(hconf).makeQualified(path).toUri.normalize()
+    Some(
+      log.exists { deltaLog =>
+        val matches = qualified(deltaLog.dataPath) == qualified(new org.apache.hadoop.fs.Path(meta.location))
+        if (
+          matches && !meta.properties.get(MvMetadata.TargetDeltaTableIdKey).forall(_ == deltaLog.update().metadata.id)
+        )
+          throw new IllegalStateException(s"Materialized view $target has a mismatched Delta table ID")
+        matches
+      }
+    )
+  }
+
+  private def resolveLookup(
+      spark: SparkSession,
+      name: TableIdentifier,
+      read: TableIdentifier => Option[MvMetadata],
+      allowUnresolvedLegacy: Boolean
+  ): Option[MvMetadata] = {
+    val qualified = qualifiedName(spark, name)
+    read(qualified).orElse {
+      val legacy = TableIdentifier(name.table)
+      read(legacy).filter { meta =>
+        legacyMatches(spark, qualified, meta).getOrElse(allowUnresolvedLegacy && name.database.isEmpty)
+      }
+    }
+  }
+
+  /** The rows of one committed Delta catalog version. A Delta version is immutable, so the rows stay exact for the
+    * (table id, version) they were read at; callers revalidate that key against `DeltaLog.update()` on every read.
+    */
+  private final class CatalogVersion(val tableId: String, val version: Long, rows: Array[Row]) {
+    private val byName = rows.reverseIterator.map(row => row.getAs[String]("name") -> row).toMap
+
+    def lookup(name: TableIdentifier): Option[MvMetadata] =
+      byName.get(name.database.fold(name.identifier)(db => s"$db.${name.identifier}")).map(decodeCatalogRow)
+
+    def views: Seq[MvMetadata] =
+      rows.toSeq
+        .sortWith((a, b) =>
+          UTF8String.fromString(a.getAs[String]("name")).compareTo(UTF8String.fromString(b.getAs[String]("name"))) < 0
+        )
+        .map(decodeCatalogRow)
+  }
+
+  private val catalogVersions = new java.util.concurrent.ConcurrentHashMap[String, CatalogVersion]()
+  private val catalogLoads    = new java.util.concurrent.ConcurrentHashMap[String, Object]()
+
+  private def decodeCatalogRow(row: Row): MvMetadata = {
+    import scala.jdk.CollectionConverters._
+    MvMetadata(
+      name = CatalystSqlParser.parseTableIdentifier(row.getAs[String]("name")),
+      querySql = row.getAs[String]("query_sql"),
+      refreshType = row.getAs[Int]("refresh_type"),
+      refreshTypeName = row.getAs[String]("refresh_type_name"),
+      lastVersion = row.getAs[Long]("last_version"),
+      sourceTables = row.getSeq[String](row.fieldIndex("source_tables")).toSeq,
+      sourceSchemaFingerprint = row.getAs[String]("source_schema_fingerprint"),
+      location = row.getAs[String]("location"),
+      createdAt = row.getAs[Timestamp]("created_at"),
+      properties = row.getJavaMap[String, String](row.fieldIndex("properties")).asScala.toMap
+    )
+  }
+
+  /** The shared Delta catalog at its latest committed version. Every call lists the Delta log, so a commit by any
+    * driver is visible to the next read; only the row scan is shared between reads of the same (table id, version).
+    * `None` sends the caller down the backend path, which also creates a missing catalog table.
+    */
+  private def committedCatalog(spark: SparkSession): Option[CatalogVersion] =
+    if (!FeatureGate.deltaCatalogEnabled(spark)) None
+    else
+      try {
+        val path = FeatureGate.catalogPath(spark).stripSuffix("/") + "/mv_metadata"
+        val log  = DeltaLog.forTable(spark, new org.apache.hadoop.fs.Path(path))
+        def latest(): Option[(String, Long)] = {
+          val snapshot = log.update()
+          if (snapshot.version < 0L) None else Some(snapshot.metadata.id -> snapshot.version)
+        }
+        def cached(key: (String, Long)): Option[CatalogVersion] =
+          Option(catalogVersions.get(path)).filter(entry => entry.tableId == key._1 && entry.version == key._2)
+        latest().flatMap { key =>
+          cached(key).orElse {
+            catalogLoads.computeIfAbsent(path, _ => new Object).synchronized {
+              latest().map { current =>
+                cached(current).getOrElse {
+                  val rows  = spark.read.format("delta").load(path).collect()
+                  val entry = new CatalogVersion(current._1, current._2, rows)
+                  if (latest().contains(current)) catalogVersions.put(path, entry)
+                  entry
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        case scala.util.control.NonFatal(_) => None
+      }
+
+  private def storedReader(spark: SparkSession): TableIdentifier => Option[MvMetadata] =
+    committedCatalog(spark) match {
+      case Some(catalog) => catalog.lookup
+      case None =>
+        val selected = backend(spark)
+        selected.lookup(spark, _)
+    }
+
   def ensureTables(spark: SparkSession): Unit = backend(spark).ensureTables(spark)
 
-  def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit =
-    backend(spark).prepareCreate(spark, name)
+  def prepareCreate(spark: SparkSession, name: TableIdentifier): Unit = {
+    val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
+    if (FeatureGate.deltaCatalogEnabled(spark))
+      OpenIvmStateBarrier.withMutation(spark) {
+        StagingCatalog.consumptionLifecycleLock(spark, viewName).synchronized {
+          if (backend(spark).lookup(spark, name).isEmpty)
+            StagingCatalog.removeConsumedForView(spark, viewName)
+          backend(spark).prepareCreate(spark, name)
+        }
+      }
+    else backend(spark).prepareCreate(spark, name)
+  }
 
-  def upsert(spark: SparkSession, meta: MvMetadata): Unit = backend(spark).upsert(spark, meta)
+  def upsert(spark: SparkSession, meta: MvMetadata): Unit =
+    OpenIvmStateBarrier.withMutation(spark) { backend(spark).upsert(spark, meta) }
 
-  def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = backend(spark).lookup(spark, name)
+  def lookup(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
+    resolveLookup(spark, name, storedReader(spark), allowUnresolvedLegacy = true)
 
-  def list(spark: SparkSession): Seq[MvMetadata] = backend(spark).list(spark)
+  private[spark] def lookupForRelation(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
+    resolveLookup(spark, name, storedReader(spark), allowUnresolvedLegacy = false)
+
+  private[spark] def lookupStored(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] =
+    storedReader(spark)(name)
+
+  def lookupReadOnly(spark: SparkSession, name: TableIdentifier): Option[MvMetadata] = {
+    val selected = backend(spark)
+    resolveLookup(spark, name, selected.lookupReadOnly(spark, _), allowUnresolvedLegacy = false)
+  }
+
+  def list(spark: SparkSession): Seq[MvMetadata] =
+    committedCatalog(spark).fold(backend(spark).list(spark))(_.views)
 
   def viewsForSource(spark: SparkSession, table: String): Seq[MvMetadata] =
-    backend(spark).viewsForSource(spark, table)
+    OpenIvmStateBarrier.withMutation(spark) { backend(spark).viewsForSource(spark, table) }
 
   def advance(spark: SparkSession, name: TableIdentifier, newVersion: Long): Unit =
-    backend(spark).advance(spark, name, newVersion)
+    backend(spark).advance(spark, lookup(spark, name).map(_.name).getOrElse(name), newVersion)
+
+  private[spark] def advanceWithInterceptWitness(
+      spark: SparkSession,
+      name: TableIdentifier,
+      newVersion: Long,
+      token: String
+  ): Unit =
+    DeltaMvCatalogBackend.advanceWithInterceptWitness(spark, name, newVersion, token)
+
+  def advanceWithCdfWatermarks(
+      spark: SparkSession,
+      name: TableIdentifier,
+      newVersion: Long,
+      watermarks: Map[String, Long]
+  ): Unit =
+    backend(spark).advanceWithCdfWatermarks(
+      spark,
+      lookup(spark, name).map(_.name).getOrElse(name),
+      newVersion,
+      watermarks
+    )
+
+  /** Advances the catalog row stored under `storedName`, which must come from a catalog read. */
+  private[spark] def advanceStoredWithCdfWatermarks(
+      spark: SparkSession,
+      storedName: TableIdentifier,
+      newVersion: Long,
+      watermarks: Map[String, Long]
+  ): Unit = backend(spark).advanceWithCdfWatermarks(spark, storedName, newVersion, watermarks)
 
   def updateProperties(
       spark: SparkSession,
       name: TableIdentifier,
       properties: Map[String, String]
-  ): Unit = backend(spark).updateProperties(spark, name, properties)
+  ): Unit = backend(spark).updateProperties(spark, lookup(spark, name).map(_.name).getOrElse(name), properties)
 
-  def remove(spark: SparkSession, name: TableIdentifier): Unit = backend(spark).remove(spark, name)
+  def remove(spark: SparkSession, name: TableIdentifier): Unit =
+    OpenIvmStateBarrier.withMutation(spark) {
+      removeUnderBarrier(spark, lookup(spark, name).map(_.name).getOrElse(name))
+    }
+
+  private[spark] def removeStored(spark: SparkSession, name: TableIdentifier): Unit =
+    OpenIvmStateBarrier.withMutation(spark) { removeUnderBarrier(spark, name) }
+
+  private def removeUnderBarrier(spark: SparkSession, name: TableIdentifier): Unit = {
+    if (FeatureGate.deltaCatalogEnabled(spark)) {
+      val viewName = name.database.fold(name.table)(db => s"$db.${name.table}")
+      StagingCatalog.consumptionLifecycleLock(spark, viewName).synchronized {
+        backend(spark).remove(spark, name)
+        StagingCatalog.removeConsumedForView(spark, viewName)
+      }
+    } else backend(spark).remove(spark, name)
+  }
 
   def schemaFingerprint(
       sources: Map[String, StructType],
