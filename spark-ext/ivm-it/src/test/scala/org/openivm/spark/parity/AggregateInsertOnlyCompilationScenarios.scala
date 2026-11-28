@@ -1,6 +1,8 @@
 package org.openivm.spark.parity
 
-import org.openivm.spark.common.{DeltaTableVersion, MvCatalog, RefreshSqlLogCatalog}
+import org.apache.hadoop.fs.Path
+import org.apache.spark.sql.delta.DeltaLog
+import org.openivm.spark.common.{DeltaTableVersion, MvCatalog, RefreshSqlLogCatalog, RewriteLineage}
 import org.openivm.spark.parity.base.IvmParitySpecBase
 
 /** Generic coverage for runtime selection of OpenIVM's insert-only aggregate
@@ -11,7 +13,7 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
   self: org.openivm.spark.parity.base.IvmParityMode =>
 
   override protected def extraSparkConf: Map[String, String] =
-    super.extraSparkConf + ("spark.openivm.queryLog.enabled" -> "true")
+    super.extraSparkConf ++ Map("spark.openivm.queryLog.enabled" -> "true", "spark.openivm.profile.refresh" -> "true")
 
   private def rewrittenSql(view: String): Seq[String] =
     sql("SHOW OPENIVM QUERY LOG")
@@ -50,6 +52,28 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
       statements.head.toUpperCase should include("MERGE INTO")
       statements.head.toUpperCase should not include "CREATE OR REPLACE TABLE"
       statements.head should include("__openivm_direct_delta")
+      val attempts = sql("SHOW OPENIVM REFRESH PROFILE")
+        .collect()
+        .toSeq
+        .filter(row => row.getString(1).contains("aio_rollup") && row.getString(4) == "execute_refresh_sql_attempt")
+        .map(_.getString(6))
+        .filter(_.contains("source_output_indices=0,1"))
+      attempts should have size 1
+      val fields = attempts.head
+        .split(";")
+        .iterator
+        .map(_.split("=", 2))
+        .collect { case Array(key, value) =>
+          key -> value
+        }
+        .toMap
+      fields("source_ordinals").split(",") should have length 2
+      fields("source_digests").split(",").foreach(_ should fullyMatch regex "[0-9a-f]{64}")
+      fields("source_rewrite_rules").split(",") should have length 2
+      fields("rewrite_pipeline") should include("inline-view-delta-ctas-into-merge@1")
+      fields("executed_digest") shouldBe RewriteLineage.sha256Utf8(statements.head)
+      fields("origin_class") shouldBe "unknown"
+      fields("credit_ns") shouldBe "0"
     }
 
     itCdf("executes one direct MERGE for MIN/MAX with a derived projection") {
@@ -121,30 +145,37 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
   }
 
   describe("downstream identity") {
-    itCdf("publishes the complete change feed for a downstream consumer with one MERGE") {
+    itCdf("uses one direct MERGE and publishes both images to a real downstream consumer") {
       sql("CREATE TABLE aio_real_cascade_source (grp INT, value INT) USING DELTA")
-      sql("INSERT INTO aio_real_cascade_source VALUES (1, 10)")
+      sql("INSERT INTO aio_real_cascade_source VALUES (1, 10), (2, 20), (4, 40)")
       val upstreamBody   = "SELECT grp, SUM(value) AS total FROM aio_real_cascade_source GROUP BY grp"
       val downstreamBody = "SELECT grp, total FROM aio_real_cascade_rollup"
       sql(s"CREATE MATERIALIZED VIEW aio_real_cascade_rollup AS $upstreamBody")
+      val log               = DeltaLog.forTable(spark, new Path(mvDataLocation("aio_real_cascade_rollup")))
+      def liveDvFiles: Long = log.update().allFiles.filter("deletionVector IS NOT NULL").count()
+
+      sql("UPDATE aio_real_cascade_source SET value = 21 WHERE grp = 2")
+      refreshMv("aio_real_cascade_rollup")
+      liveDvFiles shouldBe 1L
       sql(s"CREATE MATERIALIZED VIEW aio_rollup_consumer AS $downstreamBody")
 
       RefreshSqlLogCatalog.removeAll(spark)
       sql("INSERT INTO aio_real_cascade_source VALUES (1, 2), (3, 30)")
       refreshMv("aio_real_cascade_rollup")
+      liveDvFiles shouldBe 0L
       refreshMv("aio_rollup_consumer")
       assertMvCorrect("aio_real_cascade_rollup", upstreamBody)
       assertMvCorrect("aio_rollup_consumer", downstreamBody)
 
-      val statements = rewrittenSql("aio_real_cascade_rollup")
-      statements should have size 1
-      val merge = statements.head.toUpperCase
-      merge should include("MERGE INTO")
-      merge should include("__OPENIVM_DIRECT_DELTA")
-      merge should not include "WHEN MATCHED THEN DELETE"
+      val cascadingSql = rewrittenSql("aio_real_cascade_rollup").map(_.toUpperCase)
+      cascadingSql should have size 1
+      cascadingSql.head should include("MERGE INTO")
+      cascadingSql.head should include("__OPENIVM_DIRECT_DELTA")
+      cascadingSql.head should not include "CREATE OR REPLACE TABLE"
+      cascadingSql.head should not include "WHEN MATCHED THEN DELETE"
 
       val id       = spark.sessionState.sqlParser.parseTableIdentifier("aio_real_cascade_rollup")
-      val location = MvCatalog.lookup(spark, id).getOrElse(fail("missing upstream metadata")).location
+      val location = MvCatalog.lookup(spark, id).getOrElse(fail("missing rollup metadata")).location
       val version  = DeltaTableVersion.requireLatest(spark, location)
       val changes = spark.read
         .format("delta")
@@ -154,7 +185,10 @@ abstract class AggregateInsertOnlyCompilationScenarios extends IvmParitySpecBase
         .load(location)
         .select("grp", "total", "_change_type")
       val expected = sql(
-        """SELECT * FROM VALUES (1, 10L, 'update_preimage'), (1, 12L, 'update_postimage'), (3, 30L, 'insert')
+        """SELECT * FROM VALUES
+          |  (1, CAST(10 AS BIGINT), 'update_preimage'),
+          |  (1, CAST(12 AS BIGINT), 'update_postimage'),
+          |  (3, CAST(30 AS BIGINT), 'insert')
           |AS changes(grp, total, _change_type)""".stripMargin
       )
       changes.exceptAll(expected).count() shouldBe 0L

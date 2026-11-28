@@ -112,6 +112,36 @@ class SourceChangeLedgerSpec extends AnyFunSpec with BeforeAndAfterAll with Matc
       assertDependentsMatch("ledger_mixed")
     }
 
+    it("publishes an exact committed MERGE interval only for the original table identity") {
+      fixture("ledger_merge_interval")
+      val table  = "default.ledger_merge_interval"
+      val before = SourceChangeLedger.reconcileLocked(spark, table).get
+      uninterceptedWrite(s"""
+        MERGE INTO $table t USING (SELECT 1 AS id) s ON t.id = s.id
+        WHEN MATCHED THEN UPDATE SET t.name = NULL
+        WHEN NOT MATCHED BY SOURCE AND t.id = 2 THEN DELETE
+      """)
+      uninterceptedWrite(s"INSERT INTO $table VALUES (4, 'concurrent')")
+      StagedDmlNode.withBaseTableMutationLock(table) {
+        intercept[IllegalStateException] {
+          SourceChangeLedger.publishWrite(
+            spark,
+            table,
+            Some(before.copy(tableId = "different-table")),
+            Seq.empty,
+            captureCommittedChanges = true
+          )
+        }
+        StagingCatalog.ledger(spark, table) shouldBe Some(before)
+        StagingCatalog.collectFor(spark, "__probe__", Seq(table)) shouldBe empty
+        val deltas =
+          SourceChangeLedger.publishWrite(spark, table, Some(before), Seq.empty, captureCommittedChanges = true)
+        deltas.map(_.opType).toSet shouldBe Set(StagingDelta.OpTypes.Delete, StagingDelta.OpTypes.Insert)
+        StagingCatalog.ledger(spark, table) shouldBe Some(before.copy(version = before.version + 2L))
+      }
+      assertDependentsMatch("ledger_merge_interval")
+    }
+
     it("records nothing for commits that change no rows") {
       fixture("ledger_optimize")
       uninterceptedWrite("INSERT INTO ledger_optimize VALUES (8, 'd')")

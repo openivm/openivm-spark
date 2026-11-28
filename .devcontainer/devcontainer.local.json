@@ -5,12 +5,16 @@
     "dockerfile": "Dockerfile",
     "options": ["--platform=linux/amd64"],
     "args": {
+      "DUCKDB_CLI_SHA256": "${localEnv:DUCKDB_CLI_SHA256}",
+      "DUCKDB_CLI_VERSION": "${localEnv:DUCKDB_CLI_VERSION}",
       "DUCKDB_COMMIT": "${localEnv:DUCKDB_COMMIT}",
       "DUCKDB_REF": "${localEnv:DUCKDB_REF}",
+      "EXTENSION_CI_TOOLS_COMMIT": "${localEnv:EXTENSION_CI_TOOLS_COMMIT}",
       "GH_CLI_SHA256": "${localEnv:GH_CLI_SHA256}",
       "GH_CLI_VERSION": "${localEnv:GH_CLI_VERSION}",
       "LPTS_BRANCH": "${localEnv:LPTS_BRANCH}",
       "LPTS_COMMIT": "${localEnv:LPTS_COMMIT}",
+      "LPTS_DUCKLAKE_COMMIT": "${localEnv:LPTS_DUCKLAKE_COMMIT}",
       "LPTS_REPO": "${localEnv:LPTS_REPO}",
       "NATIVE_BUILD_JOBS": "${localEnv:NATIVE_BUILD_JOBS}",
       "NODE_VERSION": "${localEnv:OPENIVM_NODE_VERSION}",
@@ -19,7 +23,9 @@
       "OPENIVM_COMMIT": "${localEnv:OPENIVM_COMMIT}",
       "OPENIVM_REPO": "${localEnv:OPENIVM_REPO}",
       "SBT_VERSION": "${localEnv:SBT_VERSION}",
-      "UBUNTU_MIRROR": "${localEnv:UBUNTU_MIRROR}"
+      "UBUNTU_MIRROR": "${localEnv:UBUNTU_MIRROR}",
+      "VCPKG_COMMIT": "${localEnv:VCPKG_COMMIT}",
+      "VCPKG_REPO": "${localEnv:VCPKG_REPO}"
     }
   },
   "containerUser": "vscode",

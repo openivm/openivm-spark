@@ -188,6 +188,10 @@ object Settings {
   val assemblySettings: Seq[Def.Setting[_]] = Seq(
     assembly / assemblyJarName := s"${name.value}-${version.value}-assembly.jar",
     assembly / assemblyMergeStrategy := {
+      case name
+          if sys.env.get("OPENIVM_ASSEMBLY_LINUX_AMD64").contains("1") &&
+            name.startsWith("librocksdbjni-") && name != "librocksdbjni-linux64.so" =>
+        MergeStrategy.discard
       case PathList("META-INF", "MANIFEST.MF")     => MergeStrategy.discard
       case PathList("META-INF", "services", _ @_*) => MergeStrategy.concat
       case PathList("META-INF", _ @_*)             => MergeStrategy.discard
@@ -199,11 +203,13 @@ object Settings {
     // JNI symbol names like `Java_org_rocksdb_RocksDB_version`. Renaming
     // the Java classes via sbt-assembly does not rewrite those symbols,
     // so any shaded callsite would fail at runtime with
-    // `UnsatisfiedLinkError`. We pin the same `rocksdbjni` version Spark
-    // 3.5 ships (8.3.2) so the unshaded classpath is consistent.
+    // `UnsatisfiedLinkError`. Each Spark target pins the `rocksdbjni` version
+    // shipped by that Spark release so the unshaded classpath is consistent.
+    // Scope shading to project code and ANTLR so RocksDB class bytes remain intact.
     assembly / assemblyShadeRules := Seq(
-      ShadeRule.rename("org.duckdb.**" -> "org.openivm.shaded.duckdb.@1").inAll,
-      ShadeRule.rename("org.antlr.v4.runtime.**" -> "org.openivm.shaded.antlr.@1").inAll
+      ShadeRule.rename("org.duckdb.**" -> "org.openivm.shaded.duckdb.@1").inProject,
+      ShadeRule.rename("org.antlr.v4.runtime.**" -> "org.openivm.shaded.antlr.@1").inProject,
+      ShadeRule.rename("org.antlr.v4.runtime.**" -> "org.openivm.shaded.antlr.@1").inLibrary(Dependencies.antlr)
     ),
     assembly / test := {}
   )

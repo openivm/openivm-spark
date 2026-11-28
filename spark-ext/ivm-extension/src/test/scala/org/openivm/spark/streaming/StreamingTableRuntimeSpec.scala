@@ -1,6 +1,8 @@
 package org.openivm.spark.streaming
 
 import org.apache.hadoop.fs.Path
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.openivm.SparkSessionAccess
 import org.apache.spark.sql.delta.DeltaLog
 import org.openivm.spark.common.{FeatureGate, LifecycleLockTimeoutException, StreamingDependencyCatalog}
 import org.scalatest.funspec.AnyFunSpec
@@ -45,6 +47,36 @@ class StreamingTableRuntimeSpec extends AnyFunSpec with StreamingTableTestFixtur
   }
 
   describe("native streaming-table runtime") {
+    it("binds Delta lifecycle work to the caller session and restores the worker session") {
+      val source = "strt_worker_session_source"
+      val target = "strt_worker_session_target"
+      createSource(source)
+      val definition    = streamingSpec(source, target)
+      val workerSession = spark.newSession()
+      StreamingTableMetadata.setAfterTargetBoundHookForTesting { _ =>
+        SparkSession.getActiveSession.get should be theSameInstanceAs spark
+      }
+
+      try {
+        SparkSessionAccess.withActiveSession(workerSession) {
+          val status = StreamingTableManager.create(spark, definition)
+          SparkSession.getActiveSession.get should be theSameInstanceAs workerSession
+          process(status)
+          StreamingTableManager.show(spark, None).flatMap(_.queryId) should contain(status.queryId.get)
+          StreamingTableManager.stop(spark, Seq(target)).status shouldBe "stopped"
+          StreamingTableManager.drop(spark, Seq(target), ifExists = false).status shouldBe "dropped"
+          SparkSession.getActiveSession.get should be theSameInstanceAs workerSession
+          intercept[Exception] {
+            StreamingTableManager.create(spark, definition.copy(query = spark.range(1).queryExecution.logical))
+          }
+          SparkSession.getActiveSession.get should be theSameInstanceAs workerSession
+        }
+      } finally {
+        StreamingTableMetadata.setAfterTargetBoundHookForTesting((_: Seq[String]) => ())
+        cleanupStreamingTarget(target)
+      }
+    }
+
     it("writes a Delta projection/filter in the caller session without changing caller configuration") {
       val source = "strt_projection_source"
       val target = "strt_projection_target"

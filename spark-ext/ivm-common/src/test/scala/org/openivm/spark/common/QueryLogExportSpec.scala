@@ -185,6 +185,10 @@ class QueryLogExportSpec extends QueryLogExportTestBase("query-log-export") {
         actual.path("duration_ms").asLong() shouldBe expected.durationMs
         actual.path("sql_text").asText() shouldBe expected.sqlText
       }
+      RefreshSqlLogCatalog.scanAll(spark).filter(_.refreshId == capture.refreshId).toSet shouldBe input.toSet
+      RefreshSqlLogCatalog.record(spark, input)
+      RefreshSqlLogCatalog.record(spark, input)
+      RefreshSqlLogCatalog.scanAll(spark).filter(_.refreshId == capture.refreshId) should have size input.size
       records(result).map(_.path("representation_kind").asText()) shouldBe Vector(
         "original_query",
         "submitted_sql",

@@ -23,6 +23,8 @@ const rootImageInputs = [
   'spark-ext/build.sbt',
   'spark-ext/dev/docker/entrypoint.sh',
   'spark-ext/dev/pins.env',
+  'spark-ext/dev/requirements-py4j-spark-3.5.txt',
+  'spark-ext/dev/requirements-py4j-spark-4.1.txt',
   'spark-ext/project',
 ] as const;
 
@@ -38,6 +40,8 @@ const requiredImageFiles = [
   'spark-ext/build.sbt',
   'spark-ext/dev/docker/entrypoint.sh',
   'spark-ext/dev/pins.env',
+  'spark-ext/dev/requirements-py4j-spark-3.5.txt',
+  'spark-ext/dev/requirements-py4j-spark-4.1.txt',
   'spark-ext/project/Dependencies.scala',
   'spark-ext/project/RuntimeTarget.scala',
   'spark-ext/project/Settings.scala',

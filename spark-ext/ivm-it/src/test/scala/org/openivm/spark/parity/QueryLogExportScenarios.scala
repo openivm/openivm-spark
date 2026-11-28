@@ -2,6 +2,8 @@ package org.openivm.spark.parity
 
 import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.openivm.spark.commands.CreateMaterializedViewCommand
 import org.openivm.spark.common.{FeatureGate, QueryLogExport, RefreshSqlLogAsyncFlusher}
 import org.openivm.spark.parity.base.{IvmParityMode, IvmParitySpecBase}
 import org.scalatest.BeforeAndAfterEach
@@ -155,6 +157,41 @@ abstract class QueryLogExportScenarios
           }
         }
       } finally pool.shutdownNow()
+    }
+
+    it("exports the original query when CREATE fails before acquiring its publication lock") {
+      val request = "lookup-failure"
+      val body    = "SELECT 1 AS id"
+      val command = CreateMaterializedViewCommand(
+        TableIdentifier("qexport_lookup_error_mv"),
+        spark.sessionState.sqlParser.parsePlan(body),
+        Map.empty,
+        ifNotExists = false,
+        provider = None,
+        originalQueryText = body
+      )
+      val context         = spark.sparkContext
+      val previousRequest = context.getLocalProperty(QueryLogExport.RequestIdProperty)
+      val previousBackend = spark.conf.getOption(FeatureGate.CatalogBackendKey)
+      context.setLocalProperty(QueryLogExport.RequestIdProperty, request)
+      QueryLogExport.begin(spark, request)
+      requests.synchronized { requests += request }
+      try {
+        spark.conf.set(FeatureGate.CatalogBackendKey, "invalid")
+        val error = intercept[IllegalArgumentException] { command.run(spark) }
+        error.getMessage should include(FeatureGate.CatalogBackendKey)
+      } finally {
+        previousBackend match {
+          case Some(value) => spark.conf.set(FeatureGate.CatalogBackendKey, value)
+          case None        => spark.conf.unset(FeatureGate.CatalogBackendKey)
+        }
+        QueryLogExport.end(spark, request, sqlSucceeded = false)
+        context.setLocalProperty(QueryLogExport.RequestIdProperty, previousRequest)
+      }
+      val result = terminal(request, "failed")
+      result.path("capture_complete").asBoolean() shouldBe true
+      result.path("invocations").get(0).path("outcome").asText() shouldBe "create_failed"
+      records(result).find(_.path("category").asText() == "original_query").get.path("sql_text").asText() shouldBe body
     }
 
     it("preserves SQL analysis and parse errors while distinguishing native failure from missing lifecycle") {

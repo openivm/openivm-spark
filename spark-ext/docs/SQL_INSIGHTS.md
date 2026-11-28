@@ -1,6 +1,6 @@
 # Request-scoped SQL insights (SQL API v1)
 
-The insight broker exposes OpenIVM behavior through SQL only. It retains
+The insight broker exposes OpenIVM behavior through SQL. It retains
 bounded request captures in driver memory; it writes no insight files, does not
 use Spark UI state, and `SHOW OPENIVM INSIGHTS` is a driver-only
 `LeafRunnableCommand` that submits no Spark job.
@@ -49,7 +49,28 @@ Spark local properties `openivm.request_id`, `openivm.run_id`, and
 wrapped SQL, and END executing on the same driver thread, as they do for a
 synchronous sequence of `SparkSession.sql(...).collect()` calls. Servers that
 dispatch consecutive SQL statements to different driver threads must
-preserve/propagate these local properties themselves.
+use a same-thread bridge or preserve/propagate these local properties.
+
+For Py4J `JavaGateway` hosts, including Fabric, execute the entire action in
+one JVM call rather than assuming separate Python calls use the same thread:
+
+```python
+bridge = spark._jvm.org.openivm.spark.common.FabricCommandBridge
+result = bridge.executeCommand(
+    spark._jsparkSession, request_id, run_id, campaign_id, node_id,
+    "materialized_view", target_relation, phase, title, sql, job_group_id, True
+)
+```
+
+The bridge sets the job group and request properties, begins the insight and
+optional query-log captures, collects the SQL result, ends both captures with
+the actual outcome, and restores the caller's prior properties. It propagates
+failures. The result exposes Spark schema JSON via `getSchemaJson()` and a
+Java list of materialized Spark rows via `getRows()`. Pass both
+`materialization` and `target_relation` as null to omit them. Captures remain
+available to a separate polling thread until explicitly released; collect
+results only when their size is appropriate for driver memory. For query-log
+capture, set `spark.openivm.queryLog.enabled=true` at application startup.
 
 An active materialized-view request can record the dbt query-hash decision
 before its existing DROP/CREATE behavior through the typed annotation command:
@@ -190,3 +211,13 @@ request is idempotent.
 The public constants and row/page types live in
 `org.openivm.spark.insights.OpenIvmInsightsContract`; the broker entry point is
 `OpenIvmInsightsBroker`.
+
+## Cross-thread query-hash annotations
+
+When an event callback began capture on a different Java thread, append
+`FOR REQUEST '<existing-request-id>'` to `OPENIVM INSIGHTS ANNOTATE MATERIALIZED VIEW
+QUERY HASH ...`. The exact application-scoped request must already be active and
+have matching materialized-view model context. Missing, ended, mismatched, or
+conflicting bound requests fail closed. No new request, global/session binding or
+thread-local rebinding occurs; the lifecycle owner still ENDs, exports and RELEASEs
+the original capture. Omitting FOR REQUEST retains thread-bound behavior.

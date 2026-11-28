@@ -42,9 +42,8 @@ import org.openivm.spark.compiler.{CompileRequest, OpenIvmCompiler}
   *     for downstream `compile` calls.
   *   - openivm Test 4 (`target_dialect="spark"` in the CompileFacts JSON) →
   *     `OpenIvmCompiler` always emits SPARK-dialect SQL; verified for a
-  *     SIMPLE_PROJECTION view by asserting the generated SQL contains the
-  *     fully-qualified `memory.main.` prefix that the lpts SPARK pipeline
-  *     emits.
+  *     SIMPLE_PROJECTION view by checking that the initial load reads the
+  *     qualified Spark source and the refresh SQL names canonical delta helpers.
   *   - openivm Test 5 (AGGREGATE_GROUP compile returns non-empty SQL) →
   *     duplicate of Test 1 with a deliberately different shape, retained for
   *     1:1 parity.

@@ -2,10 +2,13 @@
 
 ARG NODE_VERSION
 
-FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS openivm-builder
+FROM ubuntu:22.04@sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f7667021c0e6 AS openivm-builder
 
+ARG DUCKDB_CLI_SHA256
+ARG DUCKDB_CLI_VERSION
 ARG DUCKDB_COMMIT
 ARG DUCKDB_REF
+ARG EXTENSION_CI_TOOLS_COMMIT
 ARG LPTS_BRANCH
 ARG LPTS_COMMIT
 ARG LPTS_REPO
@@ -13,19 +16,31 @@ ARG NATIVE_BUILD_JOBS
 ARG OPENIVM_BRANCH
 ARG OPENIVM_COMMIT
 ARG OPENIVM_REPO
+ARG LPTS_DUCKLAKE_COMMIT
 ARG UBUNTU_MIRROR
+ARG VCPKG_COMMIT
+ARG VCPKG_REPO
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN if [ "${UBUNTU_MIRROR}" != "http://archive.ubuntu.com/ubuntu" ]; then \
       sed -i \
         "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g; s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
-        /etc/apt/sources.list.d/ubuntu.sources; \
+        /etc/apt/sources.list; \
     fi \
+    && apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=60 \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xC8EC952E2A0E1FBDC5090F6A2C277A0A352154E5' -o /tmp/toolchain-key \
+    && test "$(gpg --show-keys --with-colons /tmp/toolchain-key | awk -F: '$1 == "fpr" { print $10; exit }')" = C8EC952E2A0E1FBDC5090F6A2C277A0A352154E5 \
+    && gpg --dearmor -o /usr/share/keyrings/ubuntu-toolchain.gpg /tmp/toolchain-key \
+    && rm /tmp/toolchain-key \
+    && echo 'deb [signed-by=/usr/share/keyrings/ubuntu-toolchain.gpg] https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu jammy main' > /etc/apt/sources.list.d/ubuntu-toolchain.list \
     && apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=60 \
     && apt-get install -y --no-install-recommends \
       build-essential \
       ca-certificates \
+      gcc-13 \
+      g++-13 \
       cmake \
       curl \
       git \
@@ -44,6 +59,7 @@ RUN --mount=type=cache,target=/root/.gitcache \
     git clone --branch "${OPENIVM_BRANCH}" --depth 50 "${OPENIVM_REPO}" . \
     && git fetch --depth 1 origin "${OPENIVM_COMMIT}" \
     && git checkout --detach "${OPENIVM_COMMIT}" \
+    && test "$(git rev-parse HEAD)" = "${OPENIVM_COMMIT}" \
     && git config --global url."https://github.com/".insteadOf "git@github.com:" \
     && git config -f .gitmodules submodule.third_party/lpts.url "${LPTS_REPO}" \
     && git submodule sync --recursive \
@@ -51,21 +67,53 @@ RUN --mount=type=cache,target=/root/.gitcache \
     && git -C duckdb fetch --depth 1 origin tag "${DUCKDB_REF}" \
     && git -C duckdb checkout --detach "${DUCKDB_COMMIT}" \
     && test "$(git -C duckdb rev-parse HEAD)" = "${DUCKDB_COMMIT}" \
+    && git -C duckdb submodule update --init --recursive --depth 1 \
+    && test "$(git -C extension-ci-tools rev-parse HEAD)" = "${EXTENSION_CI_TOOLS_COMMIT}" \
     && cd third_party/lpts \
     && git init -q \
     && (git remote add origin "${LPTS_REPO}" 2>/dev/null || git remote set-url origin "${LPTS_REPO}") \
     && git fetch --depth 50 origin "${LPTS_BRANCH}" \
-    && git checkout "${LPTS_COMMIT}" \
-    && git submodule update --init --recursive --depth 1
+    && git checkout --detach "${LPTS_COMMIT}" \
+    && test "$(git rev-parse HEAD)" = "${LPTS_COMMIT}" \
+    && git submodule update --init --recursive --depth 1 \
+    && test "$(git -C third_party/ducklake rev-parse HEAD)" = "${LPTS_DUCKLAKE_COMMIT}" \
+    && git clone --filter=blob:none --no-checkout "${VCPKG_REPO}" /opt/vcpkg \
+    && git -C /opt/vcpkg fetch --depth 1 origin "${VCPKG_COMMIT}" \
+    && git -C /opt/vcpkg checkout --detach "${VCPKG_COMMIT}" \
+    && test "$(git -C /opt/vcpkg rev-parse HEAD)" = "${VCPKG_COMMIT}" \
+    && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
-RUN CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS}" GEN=ninja make
+RUN test "$(gcc-13 -dumpversion | cut -d. -f1)" = 13 \
+    && CC=gcc-13 CXX=g++-13 VCPKG_ROOT=/opt/vcpkg \
+       VCPKG_TOOLCHAIN_PATH=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
+       USE_MERGED_VCPKG_MANIFEST=1 CMAKE_BUILD_PARALLEL_LEVEL="${NATIVE_BUILD_JOBS}" \
+       GEN=ninja make release
 
-RUN mkdir -p /artifacts \
+RUN mkdir -p /artifacts /opt/downloads \
+    && curl -fsSL \
+       "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_CLI_VERSION}/duckdb-cli-linux-amd64.tar.gz" \
+       -o /opt/downloads/duckdb-cli-linux-amd64.tar.gz \
+    && printf '%s  %s\n' "${DUCKDB_CLI_SHA256}" /opt/downloads/duckdb-cli-linux-amd64.tar.gz \
+       | sha256sum -c - \
+    && tar -xzf /opt/downloads/duckdb-cli-linux-amd64.tar.gz -C /opt/downloads \
+    && install -m 0755 /opt/downloads/duckdb /artifacts/duckdb \
     && cp build/release/extension/openivm/openivm.duckdb_extension /artifacts/ \
-    && cp build/release/duckdb /artifacts/duckdb \
-    && chmod +x /artifacts/duckdb \
     && cd /artifacts \
-    && sha256sum openivm.duckdb_extension duckdb > SHA256SUMS
+    && sha256sum openivm.duckdb_extension duckdb > SHA256SUMS \
+    && rm -rf /opt/downloads
+
+FROM ubuntu:22.04@sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f7667021c0e6 AS native-runtime-check
+COPY --from=openivm-builder /artifacts/ /artifacts/
+RUN glibc_version="$(getconf GNU_LIBC_VERSION | cut -d" " -f2)" \
+    && test "${glibc_version}" = 2.35 \
+    && grep -aq 'GLIBCXX_3.4.30' /usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
+    && /artifacts/duckdb --version | grep -E '^v2\.0\.0([[:space:]]|$)' \
+    && mkdir -p /artifacts/runtime \
+    && /artifacts/duckdb -unsigned -noheader -csv -c "LOAD '/artifacts/openivm.duckdb_extension'; \
+       SET openivm_files_path='/artifacts/runtime'; CREATE TABLE openivm_runtime_source(id INTEGER); \
+       CREATE OR REPLACE MATERIALIZED VIEW openivm_runtime_probe AS SELECT id FROM openivm_runtime_source; \
+       SELECT DISTINCT refresh_type_name FROM openivm_compile_with_facts('openivm_runtime_probe', \
+       '{\"target_dialect\":\"spark\",\"compile_only\":true}');" | grep -Fx SIMPLE_PROJECTION
 
 FROM eclipse-temurin:17-jdk-noble@sha256:b73c483fd77e77ad71b25cc146de5172bf9cf34339ccd8aad4996e1878280810 AS jdk17
 
@@ -136,7 +184,14 @@ COPY --from=jdk17 /opt/java/openjdk /opt/java/jdk-17
 COPY --from=node-runtime /usr/local/ /usr/local/
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/ /usr/local/libexec/docker/cli-plugins/
-COPY --from=openivm-builder /artifacts/ /opt/openivm/
+COPY --from=native-runtime-check /artifacts/ /opt/openivm/
+
+COPY spark-ext/dev/requirements-py4j-spark-3.5.txt spark-ext/dev/requirements-py4j-spark-4.1.txt /opt/openivm-python/
+RUN set -eu; for target in spark-3.5 spark-4.1; do \
+      python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes \
+        --target "/opt/openivm-python/${target}" \
+        -r "/opt/openivm-python/requirements-py4j-${target}.txt"; \
+    done
 
 RUN ln -s /opt/java/openjdk /opt/java/jdk-21 \
     && ln -s /opt/java/jdk-17 /opt/java/openjdk-17 \

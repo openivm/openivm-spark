@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
 import { SmokeAutomation } from '../ports/automation.js';
@@ -38,9 +39,9 @@ export class SmokeTestService implements SmokeAutomation {
       '@devcontainers/cli',
     );
     const typescriptVersion = this.environment.readPinnedDevDependency(root, 'typescript');
-    const sbtVersion = this.environment.readEnvFile(
-      join(root, 'spark-ext/dev/pins.env'),
-    ).SBT_VERSION;
+    const pins = this.environment.readEnvFile(join(root, 'spark-ext/dev/pins.env'));
+    const sbtVersion = pins.SBT_VERSION;
+    const duckdbCliVersion = pins.DUCKDB_CLI_VERSION;
     const ghVersion = this.environment.readEnvFile(
       join(root, '.devcontainer/toolchain.env'),
     ).GH_CLI_VERSION;
@@ -51,6 +52,9 @@ export class SmokeTestService implements SmokeAutomation {
     }
     if (!ghVersion) {
       throw new Error('.devcontainer/toolchain.env must define GH_CLI_VERSION.');
+    }
+    if (!duckdbCliVersion || !/^v\d+\.\d+\.\d+$/u.test(duckdbCliVersion)) {
+      throw new Error('spark-ext/dev/pins.env must define a valid DUCKDB_CLI_VERSION.');
     }
     if (!spark35.SCALA_VERSION || !spark35.JDK_VERSION) {
       throw new Error(
@@ -96,7 +100,9 @@ export class SmokeTestService implements SmokeAutomation {
           `test "$(sbt --script-version)" = "${sbtVersion}"`,
           'cd /opt/openivm',
           'sha256sum -c SHA256SUMS',
-          './duckdb --version',
+          `./duckdb --version | grep -F '${duckdbCliVersion}'`,
+          'mkdir -p "$HOME/.cache/openivm-smoke"',
+          `./duckdb -unsigned -noheader -csv -c "LOAD '/opt/openivm/openivm.duckdb_extension'; SET openivm_files_path='$HOME/.cache/openivm-smoke'; CREATE TABLE openivm_smoke_source(id INTEGER); CREATE OR REPLACE MATERIALIZED VIEW openivm_smoke_probe AS SELECT id FROM openivm_smoke_source; SELECT DISTINCT refresh_type_name FROM openivm_compile_with_facts('openivm_smoke_probe', '{\\\"target_dialect\\\":\\\"spark\\\",\\\"compile_only\\\":true}');" | grep -Fx SIMPLE_PROJECTION`,
         ].join(' && '),
       },
       {
@@ -117,6 +123,10 @@ export class SmokeTestService implements SmokeAutomation {
         name: 'Metals Bloop import',
         script: 'bash .devcontainer/scripts/validate-metals.sh',
       },
+      ...['spark-3.5', 'spark-4.1'].map((target) => ({
+        name: `locked Python bridge (${target})`,
+        script: `bash spark-ext/dev/python-env.sh ${target}`,
+      })),
       {
         name: 'host Docker socket access',
         script: "docker version --format '{{.Client.Version}}/{{.Server.Version}}'",
@@ -168,8 +178,6 @@ export class SmokeTestService implements SmokeAutomation {
       throw new Error(`Docker socket is unavailable: ${dockerSocket}`);
     }
 
-    this.cleanup();
-
     const platform = this.runner
       .run({
         args: ['image', 'inspect', '--format', '{{.Os}}/{{.Architecture}}', reference],
@@ -204,7 +212,7 @@ export class SmokeTestService implements SmokeAutomation {
       throw new Error(`Unexpected OCI source label on ${reference}: ${label}`);
     }
 
-    const containerName = `openivm-spark-devcontainer-smoke-${process.pid}`;
+    const containerName = `openivm-spark-devcontainer-smoke-${randomUUID()}`;
     const runArgs = [
       'run',
       '--detach',

@@ -36,6 +36,17 @@ class CompilerRuntimeProbeSpec extends AnyFunSuite with Matchers {
     }
   }
 
+  test("the CLI permits loading the bundled unsigned extension") {
+    withCli(
+      """case " $* " in
+        |  *" -unsigned "*) echo '{"refresh_type":2,"refresh_type_name":"SIMPLE_PROJECTION","sql":"SELECT id FROM delta_source"}' ;;
+        |  *) echo 'unsigned extensions disabled' >&2; exit 1 ;;
+        |esac""".stripMargin
+    ) {
+      _.verifyRuntime()
+    }
+  }
+
   test("a compiler returning full refresh for the projection fails the probe") {
     withCli("""echo '{"refresh_type":4,"refresh_type_name":"FULL_REFRESH","sql":"SELECT id FROM source"}'""") {
       compiler =>

@@ -1,0 +1,184 @@
+{
+  "schema": "openivm.darwin-manifest/v1",
+  "evidence_class": "local-relative-modeled-latency",
+  "report_schemas": {
+    "perf": "openivm.state-guard-perf/v1",
+    "crash": "openivm.state-guard-crash/v1"
+  },
+  "nx": {
+    "project": "spark-ext",
+    "target": "state-guard-perf",
+    "spark_targets": ["spark-3.5", "spark-4.1"],
+    "default_spark_target": "spark-3.5",
+    "report_dir_env": "OPENIVM_STATE_GUARD_REPORT_DIR",
+    "run_label_env": "OPENIVM_STATE_GUARD_RUN_LABEL",
+    "suite_env": "OPENIVM_STATE_GUARD_SUITE",
+    "perf_report": "state-guard-perf.json",
+    "crash_report": "state-guard-crash.json"
+  },
+  "expected": {
+    "views": 6,
+    "incremental_count": 6,
+    "full_refresh_count": 0,
+    "min_crash_points": 8,
+    "crash_modes": ["intercept", "cdf"],
+    "max_report_value": 1000000000000.0
+  },
+  "witness_cases": [
+    {"name": "fresh_jvm_delta_pre_input_snapshot", "spec": "InterceptStaleSnapshotCrashSpec", "test": "recovers delta after a pre-input snapshot"},
+    {"name": "fresh_jvm_delta_post_input_snapshot", "spec": "InterceptStaleSnapshotCrashSpec", "test": "recovers delta after a post-input snapshot"},
+    {"name": "fresh_jvm_rocksdb_pre_input_snapshot", "spec": "InterceptStaleSnapshotCrashSpec", "test": "recovers rocksdb after a pre-input snapshot"},
+    {"name": "fresh_jvm_rocksdb_post_input_snapshot", "spec": "InterceptStaleSnapshotCrashSpec", "test": "recovers rocksdb after a post-input snapshot"},
+    {"name": "stale_snapshot_delta_snapshot_has_input", "spec": "InterceptStaleSnapshotDeltaSpec", "test": "recovers when the last snapshot contains the staged input"},
+    {"name": "stale_snapshot_delta_snapshot_predates_input", "spec": "InterceptStaleSnapshotDeltaSpec", "test": "recovers when the last snapshot predates the staged input"},
+    {"name": "stale_snapshot_delta_downstream_cascade", "spec": "InterceptStaleSnapshotDeltaSpec", "test": "recovers the upstream delta for a downstream materialized view"},
+    {"name": "stale_snapshot_rocksdb_snapshot_has_input", "spec": "InterceptStaleSnapshotRocksSpec", "test": "recovers when the last snapshot contains the staged input"},
+    {"name": "stale_snapshot_rocksdb_snapshot_predates_input", "spec": "InterceptStaleSnapshotRocksSpec", "test": "recovers when the last snapshot predates the staged input"},
+    {"name": "legacy_intercept_bootstrap_stays_incremental", "spec": "LegacyInterceptWitnessSpec", "test": "bootstraps an existing view without changing its incremental refresh path"},
+    {"name": "legacy_intercept_unreadable_identity_fails", "spec": "LegacyInterceptWitnessSpec", "test": "fails explicitly if a legacy view's target identity cannot be read"}
+  ],
+  "acceptance": {
+    "min_wait_reduction": 0.8,
+    "min_e2e_improvement": 0.1,
+    "default_pairs": 3,
+    "min_pairs": 3,
+    "concurrency_slack": 1,
+    "min_serial_sum_ratio": 0.5
+  },
+  "scoring": {
+    "e2e_weight": 100.0,
+    "wait_weight": 50.0,
+    "accepted_bonus": 25.0,
+    "valid_floor": 0.001,
+    "ratio_clamp": 1.0
+  },
+  "budget": {
+    "max_iterations": 18,
+    "max_iterations_without_improvement": 8,
+    "metric": "combined_score",
+    "min_improvement": 0.5,
+    "improvement_type": "absolute",
+    "model": "claude-haiku-4.5",
+    "agent_timeout_s": 3600,
+    "iteration_timeout_s": 7200,
+    "run_timeout_s": 1200,
+    "crash_timeout_s": 2400,
+    "deadline_s": 6600
+  },
+  "frozen": {
+    "globs": [
+      "experiments/**",
+      "spark-ext/**/src/test/**",
+      "spark-ext/build.sbt",
+      "spark-ext/project/**",
+      "spark-ext/dev/**",
+      "spark-ext/project.json",
+      ".github/**",
+      "project.json",
+      "nx.json",
+      "package.json",
+      "package-lock.json",
+      ".devcontainer/**",
+      "contrib/**",
+      "**/telemetry/**",
+      "**/OpenIvmExecutionSpan.scala",
+      "**/RefreshProfile.scala",
+      "**/PhaseTimeline.scala"
+    ],
+    "basename_globs": ["*Perf*Spec*", "state-guard*", ".gitattributes"]
+  },
+  "protocol_files": ["output/*.json", "output/*.md"],
+  "known_gap": {
+    "name": "MV-version/CDF-watermark",
+    "point": "mv_version_and_cdf_watermark_gap",
+    "text": "documented known gap: MV-version/CDF-watermark (crash between the MV-version write and the CDF-watermark write); documentation-only, never a pass and never an excuse for any other crash point; only exercised when a candidate changes that path (lanes B, D)",
+    "lanes_that_may_touch": ["b", "d"]
+  },
+  "reference_evidence": {
+    "evidence_class": "local-relative-modeled-latency",
+    "note": "Modeled latency; spans are nested and non-additive; NOT OneLake proof; never used for scoring.",
+    "mv6_capture_wait_s": 5.509,
+    "mv5_catalog_finalization_span_s": 12.439,
+    "mv1_publication_queue_wait_s": 5.817,
+    "mv6_publication_s": 6.119,
+    "engine_execution_overlap_s": 31.809
+  },
+  "lanes": {
+    "a": {
+      "name": "shared barrier/lock scope",
+      "targeted": {"kind": "view_fields", "fields": ["state_barrier_wait_ms", "capture_wait_ms"]},
+      "informational": [],
+      "owned": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateBarrier.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmRocksDBRegistry.scala"
+      ],
+      "shared": [
+        "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala"
+      ],
+      "new_files": []
+    },
+    "b": {
+      "name": "catalog finalization",
+      "targeted": {"kind": "view_fields", "fields": ["catalog_finalize_ms"]},
+      "informational": [],
+      "owned": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/CdfWatermarkBackend.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/StagingCatalog.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaPathTable.scala"
+      ],
+      "shared": [
+        "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaMvCatalogBackend.scala"
+      ],
+      "new_files": []
+    },
+    "c": {
+      "name": "per-MV publication/queue",
+      "targeted": {"kind": "view_fields", "fields": ["publication_queue_wait_ms", "publication_ms"]},
+      "informational": [],
+      "owned": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateSync.scala"
+      ],
+      "shared": [
+        "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateBarrier.scala"
+      ],
+      "new_files": []
+    },
+    "d": {
+      "name": "whole-path efficiency and catalog backend",
+      "targeted": {"kind": "view_fields", "fields": ["wall_ms"]},
+      "informational": [
+        {"name": "catalog_fs_ops_total", "path": "counts.fs_ops.catalog"}
+      ],
+      "owned": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalogBackend.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/FeatureGate.scala"
+      ],
+      "shared": [
+        "spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaMvCatalogBackend.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaPathTable.scala"
+      ],
+      "new_files": []
+    },
+    "e": {
+      "name": "incremental state shipping",
+      "targeted": {"kind": "path", "path": "counts.state_sync.bytes_uploaded"},
+      "informational": [
+        {"name": "state_sync_write_ops", "path": "counts.fs_ops.state_sync.write"}
+      ],
+      "owned": [],
+      "shared": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateSync.scala"
+      ],
+      "new_files": [
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateDelta*.scala",
+        "spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateSyncCodec*.scala"
+      ]
+    }
+  }
+}

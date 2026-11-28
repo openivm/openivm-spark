@@ -1,10 +1,11 @@
 package org.openivm.spark.commands
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.{FeatureGate, RefreshProfileCatalog, RefreshProfileRow}
+import org.openivm.spark.common.{FeatureGate, MonotonicClockDomain, RefreshProfileCatalog, RefreshProfileRow}
 import org.openivm.spark.common.rocksdb.OpenIvmRocksDBTelemetry
+import org.openivm.spark.compiler.CompileTraceContext
 import org.openivm.spark.insights.{OpenIvmInsightJson, OpenIvmInsightsBroker, OpenIvmInsightsContract}
-import org.openivm.spark.telemetry.OpenIvmExecutionSpan
+import org.openivm.spark.telemetry.{BoundedTelemetryQueue, OpenIvmExecutionSpan}
 import org.openivm.spark.telemetry.metrics.OpenIvmMetrics
 
 import java.sql.Timestamp
@@ -39,12 +40,61 @@ final class RefreshProfile private (
     private val executionSpan: OpenIvmExecutionSpan
 ) {
 
-  private val stepOrder     = new AtomicInteger(0)
-  private val buffer        = scala.collection.mutable.ArrayBuffer.empty[RefreshProfileRow]
+  private val stepOrder = new AtomicInteger(0)
+  private val buffer    = scala.collection.mutable.ArrayBuffer.empty[RefreshProfileRow]
+  private val phaseTimeline =
+    if (spark != null && spark.sparkContext.getConf.getBoolean(BoundedTelemetryQueue.EnabledKey, false))
+      Some(
+        new PhaseTimeline(
+          refreshId,
+          viewName,
+          if (mode == RefreshProfile.Mode.Create) "create" else "refresh",
+          requestId = OpenIvmInsightsBroker.currentRequestId(spark)
+        )
+      )
+    else None
+  private val previousTraceOperationId =
+    if (phaseTimeline.nonEmpty)
+      Option(spark.sparkContext.getLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty))
+    else None
   private var spanCompleted = false
   private var spanOutcome   = "failed_before_end"
   private var spanEndNanos  = 0L
   private var finished      = false
+
+  private[commands] def compilerTrace: Option[CompileTraceContext] =
+    phaseTimeline.map(_ =>
+      CompileTraceContext(
+        operationId = refreshId,
+        requestId = OpenIvmInsightsBroker.currentRequestId(spark),
+        materializedView = viewName,
+        enabled = true,
+        sqlExecutionId = Option(spark.sparkContext.getLocalProperty("spark.sql.execution.id"))
+      )
+    )
+
+  private[commands] def activateTraceContext(): Unit =
+    phaseTimeline.foreach(_ =>
+      spark.sparkContext.setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, refreshId)
+    )
+
+  private[commands] def clearTraceContext(): Unit =
+    phaseTimeline.foreach(_ =>
+      spark.sparkContext
+        .setLocalProperty(OpenIvmExecutionSpan.TraceOperationIdProperty, previousTraceOperationId.orNull)
+    )
+
+  private[commands] def recordStateBarrier(
+      requestedEpochMs: Long,
+      requestedNs: Long,
+      acquiredEpochMs: Long,
+      acquiredNs: Long,
+      releasedNs: Long,
+      succeeded: Boolean
+  ): Unit = phaseTimeline.foreach { timeline =>
+    timeline.external("state_barrier_wait", requestedEpochMs, requestedNs, acquiredNs, succeeded)
+    timeline.external("state_barrier_hold", acquiredEpochMs, acquiredNs, releasedNs, succeeded)
+  }
 
   /** True when this profile is wired to a real RocksDB sink. False instances
     * pay zero allocation per step.
@@ -59,11 +109,11 @@ final class RefreshProfile private (
     val needsTiming =
       active || OpenIvmMetrics.enabled || OpenIvmExecutionSpan.needsProfileStepTiming(stepName) ||
         OpenIvmInsightsBroker.hasActiveCapture(spark)
-    if (!needsTiming) return body
+    if (!needsTiming && phaseTimeline.isEmpty) return body
     val t0        = System.nanoTime()
     var succeeded = false
     try {
-      val result = body
+      val result = phaseTimeline.fold(body)(_.time(stepName, detail)(body))
       succeeded = true
       result
     } finally {
@@ -80,6 +130,42 @@ final class RefreshProfile private (
         )
         emitStepInsight(stepName, detail, elapsedMs, succeeded)
       }
+    }
+  }
+
+  def timeObservedStep[A](stepName: String, detail: String = "")(body: => A): A = {
+    val needsTiming =
+      active || OpenIvmMetrics.enabled || OpenIvmInsightsBroker.hasActiveCapture(spark)
+    if (!needsTiming && phaseTimeline.isEmpty) return body
+    val startedEpochMs = System.currentTimeMillis()
+    val startedNanos   = System.nanoTime()
+    var succeeded      = false
+    try {
+      val result = phaseTimeline.fold(body)(_.time(stepName, detail)(body))
+      succeeded = true
+      result
+    } finally {
+      val durationNanos = System.nanoTime() - startedNanos
+      val observedDetail =
+        s"clock_domain_id=${RefreshProfile.clockDomainId};start_epoch_ms=$startedEpochMs;" +
+          s"start_monotonic_ns=$startedNanos;duration_ns=$durationNanos;status=${if (succeeded) "success" else "failed"}" +
+          (if (detail.isEmpty) "" else s";$detail")
+      appendStepInternal(stepName, observedDetail, durationNanos / 1000000L, succeeded)
+    }
+  }
+
+  def appendObservedSkip(stepName: String, detail: String): Unit = {
+    val needsTiming = active || OpenIvmMetrics.enabled || OpenIvmInsightsBroker.hasActiveCapture(spark)
+    if (needsTiming) {
+      val epochMs = System.currentTimeMillis()
+      val nanos   = System.nanoTime()
+      appendStepInternal(
+        stepName,
+        s"clock_domain_id=${RefreshProfile.clockDomainId};start_epoch_ms=$epochMs;" +
+          s"start_monotonic_ns=$nanos;duration_ns=0;status=skipped;$detail",
+        0L,
+        succeeded = true
+      )
     }
   }
 
@@ -180,7 +266,10 @@ final class RefreshProfile private (
   /** End the whole command, including work after the historical query span.
     * The final diagnostic write and telemetry publication are outside command_span.
     */
-  def flush(outcomeOverride: Option[String] = None): Unit = {
+  def flush(
+      outcomeOverride: Option[String] = None,
+      deferExecutionSpanEmission: Boolean = false
+  ): Unit = {
     if (finished) return
     finished = true
     val threadName = Thread.currentThread().getName
@@ -199,8 +288,10 @@ final class RefreshProfile private (
     try persist()
     finally {
       executionSpan.complete(outcome, threadName)
-      try executionSpan.emitIfNeeded("failed_before_end", threadName)
-      finally RefreshProfile.clearActive(this)
+      if (deferExecutionSpanEmission) RefreshProfile.clearActive(this, clearExecutionSpan = false)
+      else
+        try executionSpan.emitIfNeeded("failed_before_end", threadName)
+        finally RefreshProfile.clearActive(this)
     }
   }
 
@@ -257,11 +348,15 @@ final class RefreshProfile private (
 
 object RefreshProfile {
 
-  private val current = new ThreadLocal[RefreshProfile]()
+  private val current                 = new ThreadLocal[RefreshProfile]()
+  private[commands] val clockDomainId = MonotonicClockDomain.id
 
-  private[commands] def clearActive(profile: RefreshProfile): Unit = {
-    if (current.get() eq profile) current.remove()
-    OpenIvmExecutionSpan.clearCurrent(profile.executionSpan)
+  private[commands] def clearActive(profile: RefreshProfile, clearExecutionSpan: Boolean = true): Unit = {
+    if (current.get() eq profile) {
+      profile.clearTraceContext()
+      current.remove()
+    }
+    if (clearExecutionSpan) OpenIvmExecutionSpan.clearCurrent(profile.executionSpan)
   }
 
   def flushActive(outcomeOverride: Option[String] = None): Unit =
@@ -272,6 +367,24 @@ object RefreshProfile {
       case Some(profile) => profile.timeStep(stepName)(body)
       case None          => body
     }
+
+  def timeObservedActiveStep[A](stepName: String)(body: => A): A =
+    Option(current.get()) match {
+      case Some(profile) => profile.timeObservedStep(stepName)(body)
+      case None          => body
+    }
+
+  private[commands] def recordActiveStateBarrier(
+      requestedEpochMs: Long,
+      requestedNs: Long,
+      acquiredEpochMs: Long,
+      acquiredNs: Long,
+      releasedNs: Long,
+      succeeded: Boolean
+  ): Unit =
+    Option(current.get()).foreach(
+      _.recordStateBarrier(requestedEpochMs, requestedNs, acquiredEpochMs, acquiredNs, releasedNs, succeeded)
+    )
 
   /** Lifecycle mode — drives the `refresh_id` shape so the chart's
     * `_create_mv_` substring discriminator routes CREATE-phase rows to the
@@ -340,6 +453,7 @@ object RefreshProfile {
       System.nanoTime(),
       executionSpan
     )
+    profile.activateTraceContext()
     current.set(profile)
     profile
   }

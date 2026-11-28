@@ -7,6 +7,10 @@ import java.security.MessageDigest
 import java.util.{Comparator, Locale, UUID}
 import java.util.concurrent.{ExecutionException, TimeUnit, TimeoutException}
 
+import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
+import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, UnresolvedWith}
 import org.apache.spark.sql.types._
 import org.openivm.spark.common.{
   DeltaShape,
@@ -25,7 +29,8 @@ final case class CompiledRefresh(
     refreshType: Int,        // RefreshType enum ordinal (0 = AGGREGATE_GROUP, 2 = SIMPLE_PROJECTION, …)
     refreshTypeName: String, // e.g. "AGGREGATE_GROUP"
     sql: String,             // full refresh SQL program in the target dialect
-    initialLoadSql: String   // Spark SQL for initial MV load including hidden columns; empty if unavailable
+    initialLoadSql: String,  // Spark SQL for initial MV load including hidden columns; empty if unavailable
+    nativeSql: Option[String] = None
 )
 
 /** Sources: Spark table name → resolved StructType.  Used by the bridge to
@@ -159,7 +164,15 @@ class OpenIvmCompiler private (
     * @throws NotImplementedError     if a source schema column has an unsupported Spark type.
     * @throws IllegalStateException   if called after [[close]].
     */
-  def compile(req: CompileRequest): CompiledRefresh = {
+  def compile(req: CompileRequest): CompiledRefresh = compile(req, None)
+
+  def compile(req: CompileRequest, trace: Option[CompileTraceContext]): CompiledRefresh =
+    compileWithTrace(req, new CompilerTrace(trace))
+
+  private[compiler] def compileWithTrace(req: CompileRequest, trace: CompilerTrace): CompiledRefresh =
+    trace.time("compile_total", 0) { compileImpl(req, trace) }
+
+  private def compileImpl(req: CompileRequest, trace: CompilerTrace): CompiledRefresh = {
     if (closed) throw new IllegalStateException("OpenIvmCompiler has been closed")
 
     // Spark/Delta snapshot pins (`… VERSION AS OF <v>`) are a storage concern
@@ -225,21 +238,56 @@ class OpenIvmCompiler private (
     try {
       val script = buildScript(req, tableDdls, tmpDir, normalizedViewSql)
       val (stdout, stderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
-        runCli(script, tmpDir)
+        trace.time("attempt_cli", 1) { runCli(script, tmpDir, trace, 1) }
       }
       lastStdout = stdout
       lastStderr = stderr
-      val nativeViewName = stdout.linesIterator
+      var resultStdout                                               = stdout
+      var resultDir                                                  = tmpDir
+      var markers: Option[SparkFunctionShimSql.ScalarDialectMarkers] = None
+      val partial =
+        try {
+          parseCompileResult(stdout, req.viewName, stderr)
+        } catch {
+          case first: OpenIvmCompileException if {
+                val error = stderr.toLowerCase(Locale.ROOT)
+                error.contains("unix_timestamp") || error.contains("timestampdiff") || error.contains("lower(boolean)")
+              } =>
+            trace.time("scalar_retry", 2) {
+              val candidate = new SparkFunctionShimSql.ScalarDialectMarkers
+              val rewritten = candidate.rewrite(normalizedViewSql)
+              if (!candidate.nonEmpty || candidate.hasUnsafeArguments) throw first
+              resultDir = Files.createTempDirectory(tmpDir, "scalar_retry_")
+              val retry = buildScript(req, tableDdls, resultDir, rewritten, preserveScalarMarkers = true)
+              val (retryStdout, retryStderr) = OpenIvmMetrics.time("compiler.duckdb_subprocess") {
+                trace.time("attempt_cli", 2) { runCli(retry, resultDir, trace, 2) }
+              }
+              resultStdout = retryStdout
+              lastStdout = retryStdout
+              lastStderr = retryStderr
+              markers = Some(candidate)
+              parseCompileResult(retryStdout, req.viewName, retryStderr)
+            }
+        }
+      val nativeViewName = resultStdout.linesIterator
         .find(_.contains("\"openivm_bridge_view_key\""))
         .map { line =>
           val key = "\"openivm_bridge_view_key\""
           decodeJsonString(line, nextStringStart(line, line.indexOf(key) + key.length))._1
         }
         .getOrElse(req.viewName)
-      val partial  = parseCompileResult(stdout, req.viewName, stderr)
-      val initLoad = parseInitialLoadSql(tmpDir, req, nativeViewName)
+      val restore: String => String = sql => {
+        val unqualified = LptsSparkDialect.stripNativeBuiltinQualification(sql)
+        markers.fold(unqualified)(_.restore(unqualified))
+      }
+      val initLoad = parseInitialLoadSql(resultDir, req, nativeViewName, restore)
+      if (initLoad.nonEmpty && partial.refreshTypeName != "FULL_REFRESH") markers.foreach(_.requireAllSeen())
+      markers.foreach(_.clearSeen())
+      val resultSql = restore(OpenIvmCompiler.normalizeNativeViewObjects(partial.sql, nativeViewName, req.viewName))
+      if (partial.refreshTypeName != "FULL_REFRESH") markers.foreach(_.requireAllSeen())
       partial.copy(
-        sql = OpenIvmCompiler.normalizeNativeViewObjects(partial.sql, nativeViewName, req.viewName),
+        sql = resultSql,
+        nativeSql = Some(partial.sql),
         initialLoadSql = initLoad
       )
     } catch {
@@ -259,7 +307,7 @@ class OpenIvmCompiler private (
     } finally {
       OpenIvmMetrics.updateTimer("compiler.compile", System.nanoTime() - compileStarted)
       OpenIvmMetrics.CompilerInflight.decrementAndGet()
-      if (!retainControl) deleteDirRecursively(tmpDir)
+      if (!retainControl) trace.time("control_cleanup", 0) { deleteDirRecursively(tmpDir) }
     }
   }
 
@@ -319,10 +367,14 @@ class OpenIvmCompiler private (
       req: CompileRequest,
       tableDdls: Seq[(String, String)],
       tmpDir: Path,
-      normalizedViewSql: String
+      normalizedViewSql: String,
+      preserveScalarMarkers: Boolean = false
   ): String = {
     val sb = new StringBuilder
     sb ++= s"LOAD '${escapeSql(extensionPath)}';\n"
+    if (preserveScalarMarkers)
+      sb ++= "SET disabled_optimizers='expression_rewriter,common_subexpressions';\n"
+    sb ++= "SET GLOBAL openivm_spark_expression_markers=true;\n"
     // Bind omitted NULL ordering with Spark's defaults before serializing refresh SQL.
     sb ++= "SET default_null_order='NULLS_FIRST_ON_ASC_LAST_ON_DESC';\n"
     // Force grouped MIN/MAX to always emit the affected-groups DELETE+recompute SQL
@@ -361,7 +413,8 @@ class OpenIvmCompiler private (
     sb ++= "SELECT view_name AS openivm_bridge_view_key FROM openivm_views " +
       s"WHERE view_sql_name='${escapeSql(req.viewName)}' AND view_catalog=current_database() AND view_schema=current_schema();\n"
     // Spark owns the public Delta view; the private DuckDB instance only binds maintenance state.
-    sb ++= s"UPDATE openivm_views SET published_query=NULL WHERE view_sql_name='${escapeSql(req.viewName)}';\n"
+    sb ++= "UPDATE openivm_views SET published_query=NULL " +
+      s"WHERE view_sql_name='${escapeSql(req.viewName)}' AND view_catalog=current_database() AND view_schema=current_schema();\n"
     // openivm_compile_with_facts is the per-call compile entry point. It
     // takes the view name plus a JSON CompileFacts payload and returns one
     // row per top-level refresh statement without mutating openivm aux
@@ -560,7 +613,9 @@ class OpenIvmCompiler private (
     val leftSemi          = """(?i)\bLEFT\s+SEMI\s+JOIN\b""".r
     val leftAnti          = """(?i)\bLEFT\s+ANTI\s+JOIN\b""".r
     val literalsRewritten = SparkFunctionShimSql.translateSparkStringLiteralEscapes(sql)
-    val renamedFns        = OpenIvmCompiler.renameSparkFunctionShimCalls(literalsRewritten)
+    val tokensRewritten   = SparkFunctionShimSql.rewriteDuckdbIncompatibleTokens(literalsRewritten)
+    val renamedFns =
+      SparkFunctionShimSql.rewriteStructMaxBy(OpenIvmCompiler.renameSparkFunctionShimCalls(tokensRewritten))
     leftAnti.replaceAllIn(
       leftSemi.replaceAllIn(renamedFns, "SEMI JOIN"),
       "ANTI JOIN"
@@ -645,7 +700,10 @@ class OpenIvmCompiler private (
     * process inherits read-only input and pipes, never writable capture files.
     * A stuck pipe reader is confined to the helper JVM, not the Spark driver.
     */
-  private[compiler] def runCli(script: String, tmpDir: Path): (String, String) = {
+  private[compiler] def runCli(script: String, tmpDir: Path): (String, String) =
+    runCli(script, tmpDir, new CompilerTrace(None), 1)
+
+  private def runCli(script: String, tmpDir: Path, trace: CompilerTrace, attempt: Int): (String, String) = {
     val stdinPath  = tmpDir.resolve("cli.sql")
     val stdoutPath = tmpDir.resolve("cli.stdout")
     val stderrPath = tmpDir.resolve("cli.stderr")
@@ -674,12 +732,23 @@ class OpenIvmCompiler private (
       .redirectInput(stdinPath.toFile)
       .redirectOutput(ProcessBuilder.Redirect.DISCARD)
       .redirectError(ProcessBuilder.Redirect.DISCARD)
-    val process     = pb.start()
-    var interrupted = false
+    if (trace.enabled) {
+      pb.command().add("trace-v1")
+      pb.redirectOutput(ProcessBuilder.Redirect.PIPE)
+    }
+    val process          = trace.time("helper_start", attempt) { pb.start() }
+    var interrupted      = false
+    var workerReportRead = false
     try {
       lifecycle.acknowledgeHelper(process.toHandle())
-      if (!process.waitFor(OpenIvmCliWorker.PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-        throw new OpenIvmCompileException("DuckDB CLI timed out after 120 seconds", null)
+      trace.time("helper_wait", attempt) {
+        if (!process.waitFor(OpenIvmCliWorker.PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+          throw new OpenIvmCompileException("DuckDB CLI timed out after 120 seconds", null)
+      }
+      if (trace.enabled) {
+        workerReportRead = true
+        try trace.readWorkerOutput(process.getInputStream, attempt)
+        catch { case scala.util.control.NonFatal(_) => trace.workerMissing() }
       }
       process.exitValue() match {
         case 0 =>
@@ -691,18 +760,21 @@ class OpenIvmCompiler private (
           val detail = if (Files.exists(errorPath)) s": ${readCliOutput(errorPath)}" else ""
           throw new OpenIvmCompileException(s"DuckDB CLI I/O helper failed (exit $status)$detail", null)
       }
-      (readCliOutput(stdoutPath), readCliOutput(stderrPath))
+      trace.time("driver_output_read", attempt) { (readCliOutput(stdoutPath), readCliOutput(stderrPath)) }
     } catch {
       case e: InterruptedException =>
         interrupted = true
         throw e
     } finally {
+      if (!workerReportRead) trace.workerMissing()
       try {
-        terminateCliProcess(
-          process,
-          lifecycle,
-          System.nanoTime() + TimeUnit.SECONDS.toNanos(OpenIvmCliWorker.CLEANUP_TIMEOUT_SECONDS)
-        )
+        trace.time("driver_cleanup", attempt) {
+          terminateCliProcess(
+            process,
+            lifecycle,
+            System.nanoTime() + TimeUnit.SECONDS.toNanos(OpenIvmCliWorker.CLEANUP_TIMEOUT_SECONDS)
+          )
+        }
       } catch {
         case e: InterruptedException =>
           interrupted = true
@@ -823,7 +895,12 @@ class OpenIvmCompiler private (
     * `req.sourceQualifiedNames`), and is run through [[LptsSparkDialect.translate]]
     * to handle DuckDB-isms (e.g. `count_star()`, `::TIMESTAMP` casts).
     */
-  private[compiler] def parseInitialLoadSql(tmpDir: Path, req: CompileRequest, nativeViewName: String = ""): String = {
+  private[compiler] def parseInitialLoadSql(
+      tmpDir: Path,
+      req: CompileRequest,
+      nativeViewName: String = "",
+      restore: String => String = identity
+  ): String = {
     import java.util.regex.Pattern
     val nativeName = if (nativeViewName.isEmpty) req.viewName else nativeViewName
     val file       = tmpDir.resolve(s"openivm_compiled_queries_$nativeName.sql")
@@ -835,13 +912,22 @@ class OpenIvmCompiler private (
     )
 
     val pat = Pattern.compile(
-      s"(?is)create\\s+table\\s+openivm_data_${Pattern.quote(req.viewName)}\\s+as\\s+((?:WITH\\b|SELECT\\b).+?);",
+      s"(?is)create\\s+table\\s+openivm_data_${Pattern.quote(req.viewName)}\\s+as\\s+(?=WITH\\b|SELECT\\b)",
       Pattern.DOTALL
     )
     val m = pat.matcher(content)
     if (!m.find()) return ""
 
-    val extracted = m.group(1).trim
+    val body       = content.substring(m.end())
+    var terminated = false
+    val statement = SparkFunctionShimSql.rewriteOutsideProtected(body, protectBackticks = true) { i =>
+      if (body.charAt(i) == ';') {
+        terminated = true
+        Some(body.length -> "")
+      } else None
+    }
+    if (!terminated) return ""
+    val extracted = restore(statement.trim)
 
     // openivm uses `rowid` (a DuckDB-internal hidden column) in the initial-load
     // plan for COUNT(*) aggregates. That column does not exist in Spark/Delta
@@ -984,7 +1070,7 @@ object OpenIvmCompiler {
   private[compiler] def normalizeNativeViewObjects(sql: String, nativeKey: String, viewName: String): String = {
     val objects = java.util.regex.Pattern
       .compile(
-        """(?i)(?<![A-Za-z0-9_`"])(?:(?:`memory`|"memory"|memory)\.(?:`main`|"main"|main)\.)?(?:`(openivm_[A-Za-z0-9_]+)`|"(openivm_[A-Za-z0-9_]+)"|(openivm_[A-Za-z0-9_]+))(?![A-Za-z0-9_`"])|(`(?:``|[^`])*`)"""
+        """(?i)(?<![A-Za-z0-9_.`"])(?:(?:`memory`|"memory"|memory)\.(?:`main`|"main"|main)\.)?(?:`(openivm_[A-Za-z0-9_]+)`|"(openivm_[A-Za-z0-9_]+)"|(openivm_[A-Za-z0-9_]+))(?![A-Za-z0-9_`"])|(`(?:``|[^`])*`)"""
       )
       .matcher(sql)
       .useTransparentBounds(true)
@@ -993,7 +1079,9 @@ object OpenIvmCompiler {
       if (objects.lookingAt()) {
         val replacement = Option(objects.group(4)).getOrElse {
           val name = Option(objects.group(1)).orElse(Option(objects.group(2))).getOrElse(objects.group(3))
-          if (nativeKey.nonEmpty && name.endsWith(nativeKey)) name.stripSuffix(nativeKey) + viewName else name
+          if (nativeKey.nonEmpty && nativeKey != viewName && name.endsWith(nativeKey))
+            name.stripSuffix(nativeKey) + viewName
+          else name
         }
         Some(objects.end() -> replacement)
       } else None
@@ -1171,6 +1259,76 @@ object OpenIvmCompiler {
     }
   }
 
+  /** Native fallback CTAS bodies can retain bare source names instead of
+    * memory.main references. Bind only parsed relation nodes, never aliases,
+    * expressions, literals or CTE references.
+    */
+  private[spark] def reattachBareInitialLoadSources(sql: String, req: CompileRequest): String = {
+    val qualified = req.sourceQualifiedNames.map { case (short, full) => short.toLowerCase(Locale.ROOT) -> full }
+    val pins =
+      SparkTimeTravelSql.split(req.viewSql).pins.map(pin => pin.shortName.toLowerCase(Locale.ROOT) -> pin.clause).toMap
+    val paths = req.sourceSnapshotPinnedPaths.map { case (short, path) => short.toLowerCase(Locale.ROOT) -> path }
+    if (qualified.isEmpty && pins.isEmpty) return sql
+
+    val edits = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, String)]
+    def sourceName(short: String): Option[String] = pins.get(short) match {
+      case Some(clause) =>
+        val path = paths.getOrElse(
+          short,
+          throw new PinnedSourcePathMissingException(
+            s"initial-load emission for view '${req.viewName}' has no verified Delta path for snapshot-pinned source '$short'"
+          )
+        )
+        Some(s"delta.`${path.replace("`", "``")}` $clause")
+      case None => qualified.get(short)
+    }
+    def visit(plan: LogicalPlan, visibleCtes: Set[String]): Unit = plan match {
+      case withCtes: UnresolvedWith =>
+        var scope = visibleCtes
+        withCtes.cteRelations.foreach { cte =>
+          val name = cte._1
+          val body = cte._2
+          visit(body, scope)
+          scope += name.toLowerCase(Locale.ROOT)
+        }
+        visit(withCtes.child, scope)
+      case relation: UnresolvedRelation if relation.multipartIdentifier.size == 1 =>
+        val name = relation.multipartIdentifier.head
+        val key  = name.toLowerCase(Locale.ROOT)
+        if (visibleCtes.contains(key) && (qualified.contains(key) || pins.contains(key))) {
+          throw new IllegalStateException(
+            s"initial-load source '$name' in view '${req.viewName}' is ambiguous with a CTE; refusing to bind it"
+          )
+        }
+        if (!visibleCtes.contains(key)) sourceName(key).foreach { bound =>
+          val start = relation.origin.startIndex.getOrElse(
+            throw new IllegalStateException(s"initial-load source '$name' has no source span")
+          )
+          val stop = relation.origin.stopIndex.getOrElse(
+            throw new IllegalStateException(s"initial-load source '$name' has no source span")
+          ) + 1
+          val original = sql.substring(start, stop)
+          if (
+            !(original.equalsIgnoreCase(name) || original.equalsIgnoreCase(s"`$name`") ||
+              original.equalsIgnoreCase("\"" + name + "\""))
+          ) {
+            throw new IllegalStateException(s"initial-load source '$name' has an unexpected source span: $original")
+          }
+          edits += ((start, stop, bound))
+        }
+      case other =>
+        other.children.foreach(visit(_, visibleCtes))
+        other.expressions.foreach(_.foreach {
+          case subquery: SubqueryExpression => visit(subquery.plan, visibleCtes)
+          case _                            => ()
+        })
+    }
+    visit(CatalystSqlParser.parsePlan(sql), Set.empty)
+    edits.sortBy(-_._1).iterator.foldLeft(sql) { case (text, (start, end, bound)) =>
+      text.substring(0, start) + bound + text.substring(end)
+    }
+  }
+
   /** Prologue of `CREATE OR REPLACE MACRO` statements that register
     * type-correct stubs for Spark-only functions which DuckDB's binder would
     * otherwise reject. The set is driven by the dbt-server corpus (TPC-DI
@@ -1222,6 +1380,8 @@ object OpenIvmCompiler {
       "CREATE OR REPLACE MACRO __sparkfn_to_timestamp(s, fmt) AS strptime(s, fmt);",
       "CREATE OR REPLACE MACRO __sparkfn_try_to_timestamp(s, fmt) AS try_strptime(s, fmt);",
       "CREATE OR REPLACE MACRO __sparkfn_date_format(d, fmt) AS strftime(d, fmt);",
+      "CREATE OR REPLACE MACRO __sparkfn_date_add(d, days) AS CAST(d AS DATE) + CAST(days AS INTEGER);",
+      "CREATE OR REPLACE MACRO __sparkfn_date_sub(d, days) AS CAST(d AS DATE) - CAST(days AS INTEGER);",
       // The nonnumeric marker branch is always NULL, but keeps all seven
       // arguments visible to LPTS for exact scanner-based recovery. The
       // interval fallback keeps the DuckDB macro type- and value-correct.

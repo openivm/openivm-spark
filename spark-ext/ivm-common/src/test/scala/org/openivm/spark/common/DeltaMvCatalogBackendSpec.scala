@@ -37,6 +37,16 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       .config(FeatureGate.CatalogBackendKey, "delta")
       .config(FeatureGate.CatalogPathKey, s"$root/catalog")
       .config("spark.ui.enabled", "false")
+      .withExtensions { extensions =>
+        extensions.injectCheckRule { session => plan =>
+          if (session.conf.getOption("spark.openivm.test.rejectCreateTable").contains("true")) {
+            plan.foreach { node =>
+              if (node.nodeName.contains("CreateTable"))
+                throw new IllegalStateException("CREATE TABLE is unavailable for path-backed catalogs")
+            }
+          }
+        }
+      }
       .getOrCreate()
   }
 
@@ -79,6 +89,82 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
     )
 
   describe("Delta MV catalog backend") {
+    it("recreates an initialized catalog path after it is deleted") {
+      val path   = s"$root/recreated-catalog"
+      val schema = StructType(Seq(StructField("key", IntegerType), StructField("value", IntegerType)))
+
+      DeltaPathTable.createIfAbsent(spark, path, schema, "key")
+      val initialId = DeltaTable.forPath(spark, path).detail().select("id").head().getString(0)
+      deleteDir(new File(path))
+      DeltaPathTable.createIfAbsent(spark, path, schema, "key")
+
+      val replacement = DeltaTable.forPath(spark, path).detail().head()
+      replacement.getAs[String]("id") should not be initialId
+      replacement.getAs[Seq[String]]("partitionColumns") shouldBe Seq("key")
+    }
+
+    it("does not mistake an ancestor Delta table for the requested catalog path") {
+      val parent = s"$root/parent-catalog"
+      val child  = s"$parent/child-catalog"
+      val schema = StructType(Seq(StructField("key", IntegerType), StructField("value", IntegerType)))
+
+      DeltaPathTable.createIfAbsent(spark, parent, schema, "key")
+      DeltaPathTable.createIfAbsent(spark, child, schema, "key")
+
+      new File(s"$child/_delta_log").isDirectory shouldBe true
+    }
+
+    it("initializes both catalog paths concurrently and preserves data when reinitialized from another schema") {
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val catalogPath                                 = s"$root/concurrent-initialization"
+      val barrier                                     = new CyclicBarrier(2)
+      spark.sql("CREATE DATABASE IF NOT EXISTS delta_init_context")
+
+      def inContext[A](f: SparkSession => A): A = withNewSession { session =>
+        session.conf.set(FeatureGate.CatalogPathKey, catalogPath)
+        session.catalog.setCurrentDatabase("delta_init_context")
+        session.conf.set("spark.openivm.test.rejectCreateTable", "true")
+        f(session)
+      }
+
+      Await.result(
+        Future.sequence(
+          (1 to 2).map(_ =>
+            Future {
+              inContext { session =>
+                barrier.await()
+                MvCatalog.ensureTables(session)
+                CdfWatermarkCatalog.ensureTables(session)
+              }
+            }
+          )
+        ),
+        5.minutes
+      )
+
+      inContext { session =>
+        val entry = metadata("db.mv_init", "db.source_init")
+        MvCatalog.upsert(session, entry)
+        CdfWatermarkCatalog.put(session, "db.mv_init", "db.source_init", 7L)
+        MvCatalog.ensureTables(session)
+        CdfWatermarkCatalog.ensureTables(session)
+        MvCatalog.lookup(session, entry.name) shouldBe Some(entry)
+        CdfWatermarkCatalog.get(session, "db.mv_init", "db.source_init") shouldBe Some(7L)
+        DeltaTable
+          .forPath(session, s"$catalogPath/mv_metadata")
+          .detail()
+          .select("partitionColumns")
+          .head()
+          .getSeq[String](0) shouldBe Seq("name")
+        DeltaTable
+          .forPath(session, s"$catalogPath/cdf_watermarks")
+          .detail()
+          .select("partitionColumns")
+          .head()
+          .getSeq[String](0) shouldBe Seq("view_name")
+      }
+    }
+
     it("round-trips, indexes dependencies, advances, updates, and removes metadata") {
       val orders   = metadata("db.mv_orders", "db.orders")
       val customer = metadata("db.mv_customer", "db.customer")
@@ -113,6 +199,102 @@ class DeltaMvCatalogBackendSpec extends AnyFunSpec with BeforeAndAfterAll with M
       CdfWatermarkCatalog.get(spark, "db.mv_orders", "db.lineitem") shouldBe None
       CdfWatermarkCatalog.removeForView(spark, "db.mv_orders")
       CdfWatermarkCatalog.get(spark, "db.mv_orders", "db.orders") shouldBe None
+    }
+
+    it("atomically advances the MV version and retains monotonic CDF watermarks") {
+      val entry = metadata("db.mv_atomic_cdf", "db.atomic_source")
+      MvCatalog.upsert(spark, entry)
+      MvCatalog.advanceWithCdfWatermarks(spark, entry.name, 5L, Map("db.atomic_source" -> 9L))
+      MvCatalog.advanceWithCdfWatermarks(spark, entry.name, 4L, Map("db.atomic_source" -> 20L))
+      MvCatalog.advanceWithCdfWatermarks(spark, entry.name, 6L, Map("db.atomic_source" -> 7L))
+
+      val updated = MvCatalog.lookup(spark, entry.name).get
+      updated.lastVersion shouldBe 6L
+      updated.properties("owner") shouldBe "openivm"
+      updated.changeWatermarks("db.atomic_source") shouldBe ChangeWatermark.DeltaVersion(9L)
+    }
+
+    it("reloads cached lookups and lists after grouped CDF metadata commits") {
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val catalogPath                                 = s"$root/cached-batch"
+      val entries = (1 to 3).map(index => metadata(s"db.mv_cached_batch_$index", s"db.cached_source_$index"))
+
+      withNewSession { reader =>
+        reader.conf.set(FeatureGate.CatalogPathKey, catalogPath)
+        entries.foreach(MvCatalog.upsert(reader, _))
+        MvCatalog.list(reader).toSet shouldBe entries.toSet
+        entries.foreach(entry => MvCatalog.lookup(reader, entry.name) shouldBe Some(entry))
+
+        def catalogVersion: Long =
+          DeltaTable.forPath(reader, s"$catalogPath/mv_metadata").history(1).select("version").head().getLong(0)
+
+        for (version <- Seq(5L, 6L)) {
+          val previous = catalogVersion
+          val barrier  = new CyclicBarrier(entries.size)
+          Await.result(
+            Future.traverse(entries) { entry =>
+              Future {
+                withNewSession { writer =>
+                  writer.conf.set(FeatureGate.CatalogPathKey, catalogPath)
+                  val arrival = DeltaGroupCommit.refreshStarted()
+                  try {
+                    arrival.ready()
+                    barrier.await()
+                    DeltaMvCatalogBackend.advanceWithCdfWatermarks(
+                      writer,
+                      entry.name,
+                      version,
+                      Map(entry.sourceTables.head -> (version + 10L))
+                    )
+                  } finally arrival.close()
+                }
+              }
+            },
+            2.minutes
+          )
+          catalogVersion shouldBe previous + 1L
+          val expected = entries.map(entry =>
+            entry.copy(
+              lastVersion = version,
+              properties = entry.properties +
+                (s"${MvMetadata.WatermarkKeyPrefix}${entry.sourceTables.head}" ->
+                  ChangeWatermark.DeltaVersion(version + 10L).encode)
+            )
+          )
+          if (version == 5L) MvCatalog.list(reader).toSet shouldBe expected.toSet
+          expected.foreach(entry => MvCatalog.lookup(reader, entry.name) shouldBe Some(entry))
+          MvCatalog.list(reader).toSet shouldBe expected.toSet
+        }
+      }
+    }
+
+    it("discards cached metadata when the catalog is recreated at the same Delta version") {
+      val catalogPath = s"$root/cached-recreation"
+      val tablePath   = s"$catalogPath/mv_metadata"
+      val retained    = metadata("db.mv_cached_retained", "db.cached_original")
+      val removed     = metadata("db.mv_cached_removed", "db.cached_removed")
+      val replacement = metadata("db.mv_cached_retained", "db.cached_replacement")
+      val added       = metadata("db.mv_cached_added", "db.cached_added")
+
+      withNewSession { session =>
+        session.conf.set(FeatureGate.CatalogPathKey, catalogPath)
+        Seq(retained, removed).foreach(MvCatalog.upsert(session, _))
+        MvCatalog.lookup(session, retained.name) shouldBe Some(retained)
+        MvCatalog.list(session).toSet shouldBe Set(retained, removed)
+
+        val originalId = DeltaTable.forPath(session, tablePath).detail().select("id").head().getString(0)
+        val originalVersion =
+          DeltaTable.forPath(session, tablePath).history(1).select("version").head().getLong(0)
+        deleteDir(new File(tablePath))
+        Seq(replacement, added).foreach(MvCatalog.upsert(session, _))
+
+        DeltaTable.forPath(session, tablePath).detail().select("id").head().getString(0) should not be originalId
+        DeltaTable.forPath(session, tablePath).history(1).select("version").head().getLong(0) shouldBe originalVersion
+        MvCatalog.lookup(session, retained.name) shouldBe Some(replacement)
+        MvCatalog.lookup(session, removed.name) shouldBe None
+        MvCatalog.lookup(session, added.name) shouldBe Some(added)
+        MvCatalog.list(session).toSet shouldBe Set(replacement, added)
+      }
     }
 
     it("keeps shared watermark rows monotonic under synchronized concurrent puts") {

@@ -9,7 +9,7 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.UnsupportedOperationChecker
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.catalyst.util.StringUtils
-import org.apache.spark.sql.openivm.StreamingDatasetAccess
+import org.apache.spark.sql.openivm.{SparkSessionAccess, StreamingDatasetAccess}
 import org.apache.spark.sql.delta.{DeltaLog, DeltaOptions}
 import org.apache.spark.sql.streaming.{StreamingQuery, StreamingQueryException, StreamingQueryListener}
 import org.apache.spark.sql.types.{TimestampNTZType, TimestampType}
@@ -187,10 +187,11 @@ object StreamingTableManager {
         descendants
           .filter(_.kind == "streaming")
           .map(target => StreamingTableRegistry.lifecycleLockKey(target.identity)))
-    val globalLockKeys    = identity +: (dependencySources.map(_.parentIdentity) ++ descendants.map(_.identity))
+    val readLockKeys      = dependencySources.map(_.parentIdentity)
+    val writeLockKeys     = identity +: descendants.map(_.identity)
     val admissionDeadline = insight.startAdmission()
 
-    RefreshMutex.withLocks(globalLockKeys, admissionDeadline) {
+    RefreshMutex.withLocks(readLockKeys, writeLockKeys, admissionDeadline) {
       StreamingTableRegistry.withTargetLocks(spark, lockKeys, admissionDeadline) {
         val verifiedDependencySources = resolveManagedDependencySources(spark, definition)
         if (verifiedDependencySources != dependencySources)
@@ -677,7 +678,7 @@ object StreamingTableManager {
       spark: SparkSession,
       namespace: Option[Seq[String]],
       pattern: Option[String] = None
-  ): Seq[StreamingTableStatus] = {
+  ): Seq[StreamingTableStatus] = SparkSessionAccess.withActiveSession(spark) {
     val catalogNames = candidateCatalogNames(spark, namespace, pattern)
     val knownTargets = StreamingTableRegistry
       .registeredTargets(spark)
@@ -2222,79 +2223,81 @@ object StreamingTableManager {
       spark: SparkSession,
       targetRelation: String,
       command: String
-  )(body: InsightOperation => StreamingTableStatus): StreamingTableStatus = {
-    val insight   = new InsightOperation(UUID.randomUUID().toString, targetRelation, command)
-    val startedAt = System.nanoTime()
-    StreamingInsightEvents.operationStarted(spark, insight.operationId, targetRelation, command)
-    try {
-      insight.initialize(StreamingLifecycleSettings.fromSpark(spark))
-      val status = body(insight)
-      if (status.status == "unhealthy")
-        StreamingInsightEvents.action(
-          spark,
-          insight.operationId,
-          targetRelation,
-          targetKind = "streaming",
-          targetIdentity = targetRelation,
-          causedBy = None,
-          stage = "query",
-          code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingQueryFirstProgressTimeout,
-          message =
-            "The active writer exceeded its first-progress deadline without progress or stream-scoped Spark work.",
-          status = "unhealthy",
-          level = org.openivm.spark.insights.OpenIvmInsightsContract.Level.Warn,
-          runtime = Some(status)
-        )
-      StreamingInsightEvents.operationFinished(
-        spark,
-        insight.operationId,
-        targetRelation,
-        command,
-        outcome = status.status,
-        durationMs = (System.nanoTime() - startedAt) / 1000000L,
-        failed = false,
-        branchCode = insight.branchCode,
-        runtime = Some(insight.terminalStatus(status))
-      )
-      status
-    } catch {
-      case error: StreamingQueryStopException =>
-        StreamingInsightEvents.stopFailed(
-          spark,
-          insight.operationId,
-          targetRelation,
-          command,
-          (System.nanoTime() - startedAt) / 1000000L,
-          insight.branchCode,
-          error
-        )
-        throw error
-      case error: LifecycleLockTimeoutException =>
-        StreamingInsightEvents.admissionFailed(
-          spark,
-          insight.operationId,
-          targetRelation,
-          command,
-          (System.nanoTime() - startedAt) / 1000000L,
-          error
-        )
-        throw error
-      case error: Throwable =>
+  )(body: InsightOperation => StreamingTableStatus): StreamingTableStatus =
+    SparkSessionAccess.withActiveSession(spark) {
+      // Delta's snapshot operations consult the thread-active session even when passed an explicit caller.
+      val insight   = new InsightOperation(UUID.randomUUID().toString, targetRelation, command)
+      val startedAt = System.nanoTime()
+      StreamingInsightEvents.operationStarted(spark, insight.operationId, targetRelation, command)
+      try {
+        insight.initialize(StreamingLifecycleSettings.fromSpark(spark))
+        val status = body(insight)
+        if (status.status == "unhealthy")
+          StreamingInsightEvents.action(
+            spark,
+            insight.operationId,
+            targetRelation,
+            targetKind = "streaming",
+            targetIdentity = targetRelation,
+            causedBy = None,
+            stage = "query",
+            code = org.openivm.spark.insights.OpenIvmInsightsContract.Code.StreamingQueryFirstProgressTimeout,
+            message =
+              "The active writer exceeded its first-progress deadline without progress or stream-scoped Spark work.",
+            status = "unhealthy",
+            level = org.openivm.spark.insights.OpenIvmInsightsContract.Level.Warn,
+            runtime = Some(status)
+          )
         StreamingInsightEvents.operationFinished(
           spark,
           insight.operationId,
           targetRelation,
           command,
-          outcome = s"${command}_failed",
+          outcome = status.status,
           durationMs = (System.nanoTime() - startedAt) / 1000000L,
-          failed = true,
+          failed = false,
           branchCode = insight.branchCode,
-          runtime = insight.observedStatus,
-          error = Some(error)
+          runtime = Some(insight.terminalStatus(status))
         )
-        throw error
+        status
+      } catch {
+        case error: StreamingQueryStopException =>
+          StreamingInsightEvents.stopFailed(
+            spark,
+            insight.operationId,
+            targetRelation,
+            command,
+            (System.nanoTime() - startedAt) / 1000000L,
+            insight.branchCode,
+            error
+          )
+          throw error
+        case error: LifecycleLockTimeoutException =>
+          StreamingInsightEvents.admissionFailed(
+            spark,
+            insight.operationId,
+            targetRelation,
+            command,
+            (System.nanoTime() - startedAt) / 1000000L,
+            error
+          )
+          throw error
+        case error: Throwable =>
+          StreamingInsightEvents.operationFinished(
+            spark,
+            insight.operationId,
+            targetRelation,
+            command,
+            outcome = s"${command}_failed",
+            durationMs = (System.nanoTime() - startedAt) / 1000000L,
+            failed = true,
+            branchCode = insight.branchCode,
+            runtime = insight.observedStatus,
+            error = Some(error)
+          )
+          throw error
+      }
     }
-  }
 
   private def recoveryDetails(intent: StreamingTableResetIntent): Seq[(String, Any)] = {
     val completed = intent.completedDescendantIdentities.toSet

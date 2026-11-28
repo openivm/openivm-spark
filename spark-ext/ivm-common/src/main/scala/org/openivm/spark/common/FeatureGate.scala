@@ -48,12 +48,17 @@ object FeatureGate {
     * so IVM state survives Fabric session recycling. Unset (default) → no sync,
     * local-only behavior unchanged.
     */
-  val StateSyncUriKey: String = "spark.openivm.stateSync.uri"
+  val StateSyncUriKey: String        = "spark.openivm.stateSync.uri"
+  val GuardedStateSyncUriKey: String = "spark.openivm.stateSync.guarded.uri"
+
+  /** Opt in to mutation-covered coalescing for synchronous state snapshots. */
+  val StateSyncCheckpointEnabledKey: String = "spark.openivm.stateSync.checkpoint.enabled"
 
   /** Return from MV commands before remote backup completes (default true).
     * Local commits remain synchronous; driver loss can restore an older remote generation.
     */
-  val StateSyncAsyncEnabledKey: String = "spark.openivm.stateSync.async.enabled"
+  val StateSyncAsyncEnabledKey: String           = "spark.openivm.stateSync.async.enabled"
+  val StateSyncCheckpointReuseEnabledKey: String = "spark.openivm.stateSync.checkpointReuse.enabled"
 
   /** Number of newest published state-sync snapshot generations kept under [[StateSyncUriKey]];
     * older generations are deleted after each publish. Restore only reads the newest one. Minimum 2.
@@ -191,6 +196,11 @@ object FeatureGate {
     * `SELECT * FROM openivm_refresh_profile`).
     */
   val ProfileRefreshKey: String = "spark.openivm.profile.refresh"
+
+  val GeneratedActionOwnershipKey: String = "spark.openivm.refresh.generatedActionOwnership.enabled"
+
+  def generatedActionOwnershipEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, GeneratedActionOwnershipKey, default = false)
 
   /** Cache raw openivm compile/classification results per verified compiler
     * generation, complete request identity, MV schema and structural facts.
@@ -422,6 +432,8 @@ object FeatureGate {
     */
   val WindowSinglePassReplaceEnabledKey: String = "spark.openivm.refresh.windowSinglePassReplace.enabled"
 
+  val GlobalWindowCdfMergeEnabledKey: String = "spark.openivm.refresh.globalWindowCdfMerge.enabled"
+
   /** Reuse a materialized affected-partition key set plus the persisted signed
     * WINDOW_PARTITION cascade for target DELETE+INSERT when the literal-key
     * `REPLACE WHERE` path is unavailable. Default ON; flip OFF to disable key
@@ -458,6 +470,9 @@ object FeatureGate {
     * proves that the advanced Delta versions contain no row changes.
     */
   val NoopFastExitEnabledKey: String = "spark.openivm.refresh.noopFastExit.enabled"
+
+  /** Opt in to the bounded, exact public CDF bag proof for owned MV inputs. */
+  val PublicCdfNoWriteEnabledKey: String = "spark.openivm.refresh.publicCdfNoWrite.enabled"
 
   /** Let CREATE MATERIALIZED VIEW accept an incrementally maintained query that contains a random or
     * time-dependent expression (`rand()`, `uuid()`, `current_date()`, …). Default OFF: incremental
@@ -519,11 +534,17 @@ object FeatureGate {
   def stateSyncUri(spark: SparkSession): Option[String] =
     stateSyncUri(spark.sparkContext.getConf)
 
+  def stateSyncCheckpointEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, StateSyncCheckpointEnabledKey, default = false)
+
   def stateSyncAsyncEnabled(spark: SparkSession): Boolean =
     spark.conf
       .getOption(StateSyncAsyncEnabledKey)
       .map(_.toBoolean)
       .getOrElse(boolConf(spark.sparkContext.getConf, StateSyncAsyncEnabledKey, default = true))
+
+  def stateSyncCheckpointReuseEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, StateSyncCheckpointReuseEnabledKey, default = false)
 
   def stateSyncRetainGenerations(spark: SparkSession): Int =
     math.max(2, spark.sparkContext.getConf.getInt(StateSyncRetainGenerationsKey, StateSyncRetainGenerationsDefault))
@@ -763,6 +784,12 @@ object FeatureGate {
   def windowSinglePassReplaceEnabled(spark: SparkSession): Boolean =
     windowSinglePassReplaceEnabled(spark.sparkContext.getConf)
 
+  def globalWindowCdfMergeEnabled(spark: SparkSession): Boolean =
+    spark.conf
+      .getOption(GlobalWindowCdfMergeEnabledKey)
+      .map(_.toBoolean)
+      .getOrElse(boolConf(spark.sparkContext.getConf, GlobalWindowCdfMergeEnabledKey, default = false))
+
   def windowCascadeMergeEnabled(conf: SparkConf): Boolean =
     boolConf(conf, WindowCascadeMergeEnabledKey, default = true)
 
@@ -792,6 +819,9 @@ object FeatureGate {
 
   def noopFastExitEnabled(spark: SparkSession): Boolean =
     noopFastExitEnabled(spark.sparkContext.getConf)
+
+  def publicCdfNoWriteEnabled(spark: SparkSession): Boolean =
+    boolConf(spark.sparkContext.getConf, PublicCdfNoWriteEnabledKey, default = false)
 
   def allowNonDeterministic(spark: SparkSession): Boolean =
     spark.conf

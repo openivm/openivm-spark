@@ -424,6 +424,7 @@ object OpTypes {
 - `INSERT`, `OVERWRITE`, `UPDATE_AFTER`: synthesize `+1` (`StagingDeltaView.scala:72-77`);
 - `DELETE`, `UPDATE_BEFORE`: synthesize `-1` (`StagingDeltaView.scala:79-84`);
 - `MERGE_SRC`: currently unsupported by that builder and falls through to `None` (`StagingDeltaView.scala:86-88`).
+- Intercepted MERGE no longer stages `MERGE_SRC`: it publishes the exact committed target `DELETE` / `INSERT` bags for its Delta-version interval (see [Intercepted MERGE changes](../../../spark-ext/docs/MATERIALIZED_VIEWS.md#intercepted-merge-changes)). Legacy `MERGE_SRC` records remain unsupported.
 
 ______________________________________________________________________
 
@@ -684,8 +685,10 @@ Records under a key no materialized view reads, such as the view-delta records a
 consumers leaves under its own name, are pruned by that view's refresh (`pruneUnconsumed`); a
 view created later starts after them.
 
-1. Before a refresh publishes its state (`OpenIvmStateSync.backupNow`), `prepare` reads the
-   tombstones and every location still referenced by staging records or MV metadata.
+1. Before a refresh publishes its state, `prepareForRefresh` reads the tombstones. If there are
+   tombstones or the orphan sweep is due, it also reads live references from staging records and
+   MV metadata. Otherwise it returns no plan: if the sweep becomes due during publication, it
+   waits for a later refresh to prepare a full plan. The preflight does not advance the sweep clock.
 1. After the publish returns, `collect` deletes the tombstoned locations nothing references,
    including the inputs of cached view deltas (`openivm-cache:` refs) still awaiting consumers. With
    state sync, the newest published snapshot therefore never references a deleted location;

@@ -15,13 +15,14 @@ on:
       - 'spark-ext/build.sbt'
       - 'spark-ext/dev/docker/entrypoint.sh'
       - 'spark-ext/dev/pins.env'
+      - 'spark-ext/dev/requirements-py4j-*.txt'
       - 'spark-ext/dev/targets/**'
       - 'spark-ext/project/**'
       - '.github/workflows/devcontainer-image.yaml'
   workflow_dispatch:
 
 concurrency:
-  group: devcontainer-image
+  group: devcontainer-image-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -37,6 +38,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Isolate registry credentials
+        run: |
+          config="$RUNNER_TEMP/openivm-image-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$config"
+          echo "DOCKER_CONFIG=$config" >> "$GITHUB_ENV"
 
       - name: Use Node 24.11.1
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0

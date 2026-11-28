@@ -42,7 +42,8 @@ well.
    are extremely slow for Spark I/O. It then runs
    [`contrib/bootstrap-dev-env.sh`](contrib/bootstrap-dev-env.sh), which idempotently installs or validates
    Git, Docker Engine, Buildx, Compose, and the pinned Node/npm version, configures parallel Docker
-   transfers, pulls the pinned devcontainer image, then runs `npm ci`. Java, Scala, sbt, and Spark stay
+   transfers, pulls the public pinned devcontainer image without registry credentials, then runs `npm ci`. Pull failures
+   are reported directly rather than starting an unexpected source build. Java, Scala, sbt, and Spark stay
    inside the devcontainer, which it starts and opens in VS Code through `spark.code-workspace`. After a
    restart, run `task --taskfile contrib/bootstrap-dev-env.yaml up` instead; it keeps WSL and reopens the
    devcontainer.

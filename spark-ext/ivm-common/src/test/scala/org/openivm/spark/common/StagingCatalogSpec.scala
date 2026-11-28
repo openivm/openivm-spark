@@ -1,7 +1,8 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -121,6 +122,53 @@ class StagingCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with Matchers
   }
 
   describe("StagingCatalog.markConsumed") {
+    it("creates missing consumption state and clears only its markers") {
+      val viewName  = "mv_missing_consumption"
+      val baseTable = "orders_missing_consumption"
+      val d         = delta(baseTable, "INSERT", s"$warehouseDir/stg/orders/ins/missing", 2500L)
+      val session   = spark.newSession()
+      session.conf.set("spark.openivm.catalog.backend", "delta")
+      session.conf.set("spark.openivm.catalog.path", s"$warehouseDir/delta-catalog")
+      val name = TableIdentifier(viewName)
+      val meta =
+        MvMetadata(name, "SELECT 1", 0, "SIMPLE_PROJECTION", 0L, Seq(baseTable), "", warehouseDir, ts(0L), Map.empty)
+      StagingCatalog.record(session, d)
+      intercept[IllegalStateException] {
+        StagingCatalog.markConsumed(session, viewName, Seq(d.stagingPath))
+      }
+      java.nio.file.Files.exists(Paths.get(trackedMvDbPath(viewName)).resolve("CURRENT")) shouldBe false
+      MvCatalog.upsert(session, meta)
+      StagingCatalog.markConsumed(session, viewName, Seq(d.stagingPath))
+      StagingCatalog.collectFor(session, viewName, Seq(baseTable)) shouldBe empty
+
+      val db  = openTrackedMvDb(viewName)
+      val key = RocksDBCodec.utf8("unrelated")
+      db.withBatch(batch => OpenIvmRocksDBBatchOps.put(db, batch, "properties", key, RocksDBCodec.utf8("keep")))
+      DeltaMvCatalogBackend.remove(session, name)
+      intercept[IllegalStateException] {
+        StagingCatalog.markConsumed(session, viewName, Seq(d.stagingPath))
+      }
+      MvCatalog.prepareCreate(session, name)
+      StagingCatalog.collectFor(session, viewName, Seq(baseTable)).map(_.stagingPath) shouldBe Seq(d.stagingPath)
+      db.get("properties", key).map(RocksDBCodec.fromUtf8) shouldBe Some("keep")
+      MvCatalog.upsert(session, meta)
+      implicit val executionContext: ExecutionContext = ExecutionContext.global
+      val start                                       = new CyclicBarrier(2)
+      val consume = Future {
+        start.await()
+        try StagingCatalog.markConsumed(session, viewName, Seq(d.stagingPath))
+        catch {
+          case e: IllegalStateException if e.getMessage.contains("untracked materialized view") => ()
+        }
+      }
+      val remove = Future {
+        start.await()
+        MvCatalog.remove(session, name)
+      }
+      Await.result(Future.sequence(Seq(consume, remove)), 60.seconds)
+      StagingCatalog.collectFor(session, viewName, Seq(baseTable)).map(_.stagingPath) shouldBe Seq(d.stagingPath)
+    }
+
     it("records per-MV consumed paths idempotently") {
       StagingCatalog.ensureTables(spark)
       registerTrackedView("mv_x")

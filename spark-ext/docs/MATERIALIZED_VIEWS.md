@@ -61,6 +61,19 @@ without publishing partial cache state. Identity and integrity failures still
 fail the refresh.
 The cache is published only after the target write succeeds.
 
+## CDF window net-change detection
+
+For a downstream-fed window MV that has selected bounded single-pass
+replacement, the existing net-change probe uses the signed change views
+registered for that refresh. It groups by the source's declared row columns,
+not the CDF timestamp or sign. This lets a managed source MV's private state
+change without rewriting or cascading an unchanged public result; normal
+refresh finalization still records the consumed source version.
+
+The probe requires one exact registered CDF range per changed source and a
+matching, unambiguous schema. If it cannot prove the public row bag is
+unchanged, the normal refresh continues. Terminal windows do not run the probe.
+
 ## Refresh timing
 
 With `spark.openivm.profile.refresh=true` and synchronous remote backup enabled,
@@ -122,3 +135,68 @@ staging path keyed by `(base_table, op_type, txn_ts)`. `REFRESH MATERIALIZED VIE
 recompiles the view via openivm + lpts (target dialect `spark`), rewrites the
 emitted DuckDB-style SQL into Spark-executable form (`SparkRefreshRewriter` +
 `LptsSparkDialect`), and applies it to the MV's Delta table.
+
+## Intercepted MERGE changes
+
+In intercept mode, MERGE publishes signed **target** changes from the committed
+Delta-version interval, not its source rows. The existing exact multiset-difference
+capture handles matched updates/deletes, unmatched inserts and target-only actions
+without enabling Delta CDF. Staging records and the source ledger position publish
+together only after capture succeeds; an identity mismatch or unavailable exact
+comparison fails without advancing that position or substituting a full refresh.
+The MERGE itself may already have committed when capture fails; do not blindly
+retry the DML. The existing reconciliation path can recover unrecorded commits.
+
+## Experimental global-window cascades
+
+`spark.openivm.refresh.globalWindowCdfMerge.enabled` is opt-in and defaults to
+`false`. For a global-window recompute with a downstream consumer, actual CDF
+propagation, and a CDF-enabled physical target, it replaces the full target in
+one Delta MERGE. This produces CDF deletes for the old rows and inserts for the
+new rows; the downstream view can consume them incrementally. The full-domain
+rewrite is an executor helper, not generated incremental SQL. It can write a
+large change feed and has not been shown to improve end-to-end performance.
+Unscoped external overwrites and unavailable change history keep their normal
+full-refresh safeguards.
+
+## Opt-in public CDF progress without a materialized-view write
+
+`spark.openivm.refresh.publicCdfNoWrite.enabled` (default `false`, Spark startup
+configuration) can advance a CDF offset without writing the consumer Delta table.
+It is limited to persisted `SIMPLE_PROJECTION` consumers that directly project
+attributes from one verified, owned upstream MV. The captured interval must have
+complete MERGE history without metadata or protocol changes, or a single
+same-table `WRITE` overwrite with literal `true` predicate and complete inferred
+CDF (data-changing adds and removes, no explicit CDC files or deletion vectors).
+A plain, unpartitioned `WRITE` overwrite without a predicate is admitted only
+for versions 0→1 with two small transaction log entries and one small data file
+on each side. The initial Delta commit must establish that the exact file
+removed was the sole live file; the overwrite must leave only its replacement.
+This check reads transaction metadata, not an additional data snapshot. The proof requires an exact signed public row bag, including duplicate and NULL
+multiplicity; commit metrics are not a substitute. The replacement path also
+supports binary, unpadded strings, `DECIMAL(18,2)`, and microsecond timestamps.
+Pins, other replacement intervals, missing identity or history, and unsupported
+plans are not eligible. The usual
+refresh path remains in charge when the proof is unavailable. This relies on
+the existing managed-MV lifecycle locks, not a cross-driver DDL fence.
+
+## Managed initial CTAS namespaces
+
+When `spark.openivm.managedTablesRoot` is set, initial CREATE data writes use the
+logical qualified target identifier plus LOCATION, not a `delta.<path>` CTAS
+identifier. This keeps Fabric auto-discovery in the target's real namespace.
+Non-managed deployments retain concurrent path CTAS. Ownership, table identity,
+precommit cleanup, committed-path reuse and subsequent registration are unchanged.
+
+## Native namespace session isolation
+
+CREATE/REFRESH session clones retain inherited current-catalog/database state
+without revalidating unchanged namespaces through public catalog setters. This
+preserves Fabric internal database names while still propagating non-default
+V2 catalogs and multipart namespaces when their cloned state differs.
+
+## Related contracts
+
+- [Guarded refresh](GUARDED_REFRESH.md) describes query-hash and physical-table identity checks.
+- [State synchronization](STATE_SYNCHRONIZATION.md) describes checkpoint publication and restore.
+- [Generated SQL](GENERATED_SQL.md) describes native-to-Spark dialect translation.

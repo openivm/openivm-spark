@@ -1,0 +1,128 @@
+# Human-readable mirror of manifest.json. NOT parsed by any code: manifest.json is the single
+# machine-read source of truth (allowlists, frozen globs, acceptance, scoring, budgets, lane targets).
+# tests/test_consistency.py asserts that every path and lane below also appears in manifest.json.
+schema: openivm.darwin-manifest/v1
+evidence_class: local-relative-modeled-latency   # relative evidence only; never OneLake proof
+
+reports:
+  perf: openivm.state-guard-perf/v1              # state-guard-perf.json
+  crash: openivm.state-guard-crash/v1            # state-guard-crash.json
+  directory_env: OPENIVM_STATE_GUARD_REPORT_DIR
+suite: npx --no-install nx run spark-ext:state-guard-perf --configuration=<spark-3.5|spark-4.1>   # OPENIVM_STATE_GUARD_SUITE=perf|crash selects the half
+
+acceptance:                                      # ALL required; otherwise combined_score is 0.0 or the candidate is not accepted
+  gates: [allowlist, correctness, crash, incremental, concurrency, report, trust]
+  min_wait_reduction: 0.80                       # lane-targeted waits, median over paired runs
+  min_e2e_improvement: 0.10                      # median over paired runs of (baseline_makespan - candidate_makespan) / baseline_makespan
+  pairs: 3                                       # interleaved baseline/candidate runs, fresh baseline every pair
+  concurrency_slack: 1                           # max_concurrent_engine >= baseline median - 1
+  min_serial_sum_ratio: 0.5                      # serial_sum_ms may not fall below 0.5 x baseline while makespan rises
+  incremental: {full_refresh_count: 0, incremental_count: 6}
+
+scoring:                                         # invalid => 0.0; valid => max(0.001, formula)
+  combined_score: "100*clamp(e2e_improvement_median,-1,1) + 50*clamp(wait_reduction,-1,1) + (25 if accepted)"
+
+budget:                                          # per lane
+  max_iterations: 18
+  early_stopping: {max_iterations_without_improvement: 8, metric: combined_score}
+  model: claude-haiku-4.5                        # the model proven in the preflight
+  agent_timeout_s: 3600
+  iteration_timeout_s: 7200                      # one evaluation: crash suites + 2 x pairs perf suites
+  run_timeout_s: 1200                            # one perf suite run
+  crash_timeout_s: 2400                          # one crash suite run
+  deadline_s: 6600                               # all runs of one evaluation
+
+known_gap: >-
+  documented known gap: MV-version/CDF-watermark (crash between the MV-version write and the
+  CDF-watermark write). Documentation only (crash point mv_version_and_cdf_watermark_gap, known_gap=true): it is
+  never a pass, never counts as recovery qualification and never excuses any other crash point; exercised only when
+  a candidate changes that path (lanes B, D). Stale-snapshot and every other crash failure stays a visible failure.
+
+crash:                                           # state-guard-crash.json; one point per (mode, name)
+  modes: [intercept, cdf]                        # reported and labelled separately
+  min_gated_points: 8
+  candidate_gate: no regression versus the same-box baseline (per point and flag); never filtered
+  recovery_qualified: every gated point passes; baseline failures keep it 0 and the candidate is never accepted
+  witness_cases:                                 # named ScalaTest cases run with the crash suite; each becomes a gated intercept point
+    - InterceptStaleSnapshotCrashSpec: fresh-JVM kill before the snapshot commit record, pre/post-DML snapshot, delta and rocksdb
+    - InterceptStaleSnapshotDeltaSpec / InterceptStaleSnapshotRocksSpec: stale-snapshot recovery, including the downstream cascade (delta)
+    - LegacyInterceptWitnessSpec: legacy intercept bootstrap stays incremental; unreadable target identity fails explicitly
+    - a case that did not run, was ignored or cancelled fails; the exact test names live in manifest.json "witness_cases"
+
+frozen:                                          # any diff vs the baseline => combined_score 0.0
+  - experiments/**
+  - spark-ext/**/src/test/**
+  - spark-ext/build.sbt
+  - spark-ext/project/**
+  - spark-ext/dev/**
+  - spark-ext/project.json
+  - .github/**
+  - project.json
+  - nx.json
+  - package.json
+  - package-lock.json
+  - .devcontainer/**
+  - contrib/**
+  - "**/telemetry/**"
+  - "**/OpenIvmExecutionSpan.scala"
+  - "**/RefreshProfile.scala"
+  - "**/PhaseTimeline.scala"
+  - "*Perf*Spec*, state-guard*, .gitattributes (any path segment)"
+
+reference_evidence:                              # documentation and feedback only, never used for scoring
+  note: modeled latency; spans are nested and non-additive; not OneLake proof
+  mv6_capture_wait_s: 5.509
+  mv5_catalog_finalization_span_s: 12.439
+  mv1_publication_queue_wait_s: 5.817
+  mv6_publication_s: 6.119
+  engine_execution_overlap_s: 31.809
+
+lanes:
+  a:
+    name: shared barrier/lock scope
+    targeted: state_barrier_wait_ms + capture_wait_ms (sum over the six MVs)
+    owned:
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateBarrier.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmRocksDBRegistry.scala
+    shared:
+      - spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala
+  b:
+    name: catalog finalization
+    targeted: catalog_finalize_ms (sum over the six MVs)
+    owned:
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/CdfWatermarkBackend.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/StagingCatalog.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaPathTable.scala
+    shared:
+      - spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaMvCatalogBackend.scala
+  c:
+    name: per-MV publication/queue
+    targeted: publication_queue_wait_ms + publication_ms (sum over the six MVs)
+    owned:
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateSync.scala
+    shared:
+      - spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateBarrier.scala
+  d:
+    name: whole-path efficiency and catalog backend
+    targeted: wall_ms (sum over the six MVs); catalog fs_ops total is informational
+    owned:
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalogBackend.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/FeatureGate.scala
+    shared:
+      - spark-ext/ivm-extension/src/main/scala/org/openivm/spark/commands/MaterializedViewCommands.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaMvCatalogBackend.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/MvCatalog.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/DeltaPathTable.scala
+  e:
+    name: incremental state shipping
+    targeted: counts.state_sync.bytes_uploaded; state-sync write ops are informational
+    owned: []
+    new_files:                                   # the only lane allowed to add files
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateDelta*.scala
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateSyncCodec*.scala
+    shared:
+      - spark-ext/ivm-common/src/main/scala/org/openivm/spark/common/rocksdb/OpenIvmStateSync.scala

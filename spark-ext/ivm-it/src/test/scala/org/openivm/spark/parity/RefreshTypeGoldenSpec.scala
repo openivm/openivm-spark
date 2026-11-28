@@ -22,7 +22,7 @@ class RefreshTypeGoldenSpec extends AnyFunSpec with Matchers with BeforeAndAfter
     "simple-aggregate"  -> "ea266f0312086ec1487d8bb5ef15ab912820dab8e30c89256a7bc42743a2104b",
     "simple-projection" -> "21e85b135bb91afd17bdb6e61eead9ea74e3014478fbd3eb6d414dbb191774ab",
     "window-partition"  -> "b32f3c23c4630ce5610c4e97eaef2f4324effe8a780ef6b23942cd1ef8b252f1",
-    "group-recompute"   -> "2397a64c66471a0fdb822d5f465c02fb0d6b2dc445b43be1d30b38f330690d9c"
+    "group-recompute"   -> "1c90a8d114ff457cda1f9d94d91f950fe8c07c358dcc24aa34c11fbd79c4ac4b"
   )
 
   private val cases: Seq[GoldenCase] = Seq(

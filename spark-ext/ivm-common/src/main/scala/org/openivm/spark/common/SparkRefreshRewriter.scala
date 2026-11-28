@@ -1,5 +1,9 @@
 package org.openivm.spark.common
 
+import java.nio.ByteBuffer
+import java.nio.charset.{CodingErrorAction, StandardCharsets}
+import java.security.MessageDigest
+
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedRelation}
 import org.apache.spark.sql.catalyst.expressions.{And, Cast, EqualTo, Expression}
@@ -14,9 +18,127 @@ import scala.util.Try
   */
 final case class RewrittenRefresh(
     statements: Seq[String],
-    hasRunningWindowProgram: Boolean,
-    aggregateInputPath: Option[String]
+    lineage: Option[RewriteLineage.Snapshot] = None,
+    hasRunningWindowProgram: Boolean = false,
+    aggregateInputPath: Option[String] = None
 )
+
+/** Opt-in structural provenance for one rewriter invocation.
+  *
+  * This API records compiler-source-to-rewriter-output correspondence only. It
+  * does not observe dispatch, execution attempts, physical actions, or elapsed
+  * time. Until those are supplied by the dispatcher, every data-action rewrite
+  * remains `Unknown` and no output is eligible for timing credit. Scratch
+  * object creation/drop outputs are explicitly `ExecutorHelper`. This layer
+  * never claims `NativeDirect` or `VerifiedSparkLowering` equivalence.
+  *
+  * The compiler may normalize names and restore dialect markers before this
+  * rewriter sees SQL. Capture distinguishes native input from normalized-only
+  * cache entries; neither form conveys execution or equivalence credit.
+  */
+object RewriteLineage {
+  sealed trait Classification
+  case object NativeDirect          extends Classification
+  case object VerifiedSparkLowering extends Classification
+  case object ExecutorHelper        extends Classification
+  case object Unknown               extends Classification
+
+  final case class SourceStatement(
+      ordinal: Int,
+      sourceStatementDigest: String,
+      statementKind: String,
+      rewriteRuleName: String,
+      rewriteRuleVersion: String,
+      classification: Classification,
+      outputIndices: Seq[Int]
+  )
+
+  final case class RewriteRule(name: String, version: String, classification: Classification)
+
+  final case class OutputStatement(
+      outputIndex: Int,
+      sourceOrdinal: Int,
+      sourceStatementDigest: String,
+      rewriteRuleName: String,
+      rewriteRuleVersion: String,
+      classification: Classification,
+      additionalRewriteRules: Seq[RewriteRule],
+      timingCreditAllowed: Boolean = false
+  )
+
+  final case class Snapshot(
+      compilerProgramDigest: String,
+      compilerProgramDigestKind: String,
+      normalizedProgramDigest: String,
+      sourceStatements: Seq[SourceStatement],
+      outputs: Seq[OutputStatement]
+  )
+
+  private[common] val publishedSnapshotReuseRule = RewriteRule("reuse-published-snapshot-in-cascade", "1", Unknown)
+
+  /** Default pre/post rewrite passes and the opaque caller hook applied to each output. */
+  val outputPipelineRules: Vector[RewriteRule] = Vector(
+    RewriteRule("expand-source-select-star-except", "1", Unknown),
+    RewriteRule("expand-output-select-star-except", "1", Unknown),
+    RewriteRule("fix-merge-alias-refs", "1", Unknown),
+    RewriteRule("deduplicate-null-safe-merge-source", "1", Unknown),
+    RewriteRule("rewrite-recompute-exists-as-affected-keys-join", "1", Unknown),
+    publishedSnapshotReuseRule,
+    RewriteRule("caller-post-process", "unidentified", Unknown)
+  )
+
+  final class Capture private[RewriteLineage] (
+      private val normalizedBytes: Array[Byte],
+      private val nativeBytes: Option[Array[Byte]]
+  ) {
+    private def decode(bytes: Array[Byte]): String = {
+      val decoder = StandardCharsets.UTF_8
+        .newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+      decoder.decode(ByteBuffer.wrap(bytes)).toString
+    }
+    private[common] def evidenceFor(compiledSql: String): (String, String, String, Seq[String]) = {
+      require(decode(normalizedBytes) == compiledSql, "lineage bytes must match compiledSql")
+      val normalizedStatements = SparkRefreshRewriter.splitStatements(compiledSql).filter(_.trim.nonEmpty)
+      val nativeStatements = nativeBytes
+        .map(decode)
+        .map(SparkRefreshRewriter.splitStatements)
+        .map(_.filter(_.trim.nonEmpty))
+        .filter(_.size == normalizedStatements.size)
+      val native  = nativeStatements.isDefined
+      val digest  = if (native) sha256(nativeBytes.get) else sha256(normalizedBytes)
+      val kind    = if (native) "native_program_utf8" else "normalized_compiler_output_utf8"
+      val sources = nativeStatements.getOrElse(normalizedStatements)
+      (digest, kind, sha256(normalizedBytes), sources)
+    }
+  }
+
+  def captureNativeProgramBytes(bytes: Array[Byte]): Capture =
+    new Capture(bytes.clone(), Some(bytes.clone()))
+
+  def captureCompilerOutput(normalizedSql: String, nativeSql: Option[String]): Capture =
+    new Capture(
+      normalizedSql.getBytes(StandardCharsets.UTF_8),
+      nativeSql.map(_.getBytes(StandardCharsets.UTF_8))
+    )
+
+  /** SHA-256 of a string encoded as UTF-8, returned as lowercase hexadecimal. */
+  def sha256Utf8(value: String): String =
+    sha256(value.getBytes(StandardCharsets.UTF_8))
+
+  private def sha256(bytes: Array[Byte]): String = {
+    val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+    val hex    = "0123456789abcdef"
+    val result = new StringBuilder(digest.length * 2)
+    digest.foreach { b =>
+      val unsigned = b & 0xff
+      result += hex.charAt(unsigned >>> 4)
+      result += hex.charAt(unsigned & 0x0f)
+    }
+    result.toString
+  }
+}
 
 /** Thrown when a snapshot-pinned source read is about to be emitted but the
   * caller supplied no VERIFIED physical Delta path to bind it to.
@@ -564,6 +686,8 @@ object SparkRefreshRewriter {
       windowPartitionSingleDeleteMergeEnabled: Boolean = false,
       mvVersionBeforeRefresh: Option[Long] = None,
       sourceSnapshotRelations: Map[String, String] = Map.empty,
+      lineageCapture: Option[RewriteLineage.Capture] = None,
+      lineagePostProcessRules: Option[Seq[RewriteLineage.RewriteRule]] = None,
       reusePublishedSnapshotForCascade: Boolean = true
   ): RewrittenRefresh = {
     val _ = sourceTempViews // reserved for future passes
@@ -581,23 +705,47 @@ object SparkRefreshRewriter {
       // Preserve column exclusion before individual rewrites strip DuckDB's
       // EXCLUDE syntax. Native source-reconstruction UNIONs require both arms
       // to contain source columns, without the delta's bookkeeping columns.
-      val stmts = splitStatements(compiledSql)
+      val sourceSqlStatements = splitStatements(compiledSql)
+      val stmts = sourceSqlStatements
         .map(_.trim)
         .filter(_.nonEmpty)
         .map(s => expandSelectStarExcept(s, sourceSchemas))
+      val cascade =
+        affectedGroupCascade(stmts, viewLogicalName, viewDeltaPath, mvName, mvLocation, mvVersionBeforeRefresh)
+      val aggregateInputPath = cascade.map(_.inputPath)
+      val inputPath          = aggregateInputPath.getOrElse(viewDeltaPath)
+      val lineageEvidence = lineageCapture match {
+        case Some(capture) => Some(capture.evidenceFor(compiledSql))
+        case None          => None
+      }
+      val lineageInputs = lineageCapture match {
+        case Some(_) =>
+          Some(
+            sourceSqlStatements
+              .filter(_.trim.nonEmpty)
+              .zip(lineageEvidence.get._4)
+              .zipWithIndex
+              .map { case ((normalized, raw), ordinal) =>
+                val statement = expandSelectStarExcept(normalized.trim, sourceSchemas)
+                val kind      = classify(statement, viewLogicalName)
+                val rule =
+                  if (cascade.exists(_.statements.contains(statement)))
+                    LineageRule("affected-group-cascade", "1", RewriteLineage.Unknown)
+                  else lineageRule(kind)
+                SourceInput(statement, ordinal, RewriteLineage.sha256Utf8(raw), kind.toString, rule)
+              }
+          )
+        case None => None
+      }
       val runningSuffix = stmts.exists(
         _.toUpperCase.startsWith(
           s"CREATE OR REPLACE TEMP TABLE OPENIVM_RUN_RESULT_${viewLogicalName.toUpperCase} AS"
         )
       )
 
-      val cascade =
-        affectedGroupCascade(stmts, viewLogicalName, viewDeltaPath, mvName, mvLocation, mvVersionBeforeRefresh)
-      val inputPath = cascade.map(_.inputPath).getOrElse(viewDeltaPath)
-
       var viewDeltaMaterialized   = false
       var hasRunningWindowProgram = false
-      def rewriteStatement(stmt: String): Seq[String] = {
+      def rewriteDefault(stmt: String): Seq[String] = {
         val kind = classify(stmt, viewLogicalName)
         val emitted = kind match {
           case StatementKind.InProgressFlag | StatementKind.Cleanup => Nil
@@ -703,8 +851,21 @@ object SparkRefreshRewriter {
         emitted.map(s => if (marker.isEmpty) s else s"$marker\n$s")
       }
 
-      val rewritten = stmts.flatMap { stmt =>
-        cascade.flatMap(_.statements.get(stmt)).getOrElse(rewriteStatement(stmt))
+      def rewriteOne(stmt: String): Seq[String] =
+        cascade.flatMap(_.statements.get(stmt)).getOrElse(rewriteDefault(stmt))
+
+      val pendingLineage = lineageCapture match {
+        case Some(_) => Some(scala.collection.mutable.ArrayBuffer.empty[PendingOutput])
+        case None    => None
+      }
+      val rewritten: Seq[String] = lineageInputs match {
+        case None => stmts.flatMap(rewriteOne)
+        case Some(inputs) =>
+          inputs.flatMap { input =>
+            val emitted = rewriteOne(input.statement)
+            emitted.foreach(_ => pendingLineage.get += PendingOutput(input.ordinal, input.digest, input.rule))
+            emitted
+          }
       }
 
       // Spark 3.5 does not support the DuckDB `SELECT * EXCEPT (col, ...)` column
@@ -718,16 +879,126 @@ object SparkRefreshRewriter {
       val withDedupedSource  = withAliasFixup.map(s => deduplicateNullSafeMergeSource(s, mvName))
       val withSemiJoinRewrite =
         withDedupedSource.map(s => rewriteRecomputeWhereExistsAsAffectedKeysJoin(s))
+      // These final passes preserve output order and cardinality.
       val withPublishedSnapshotReuse =
         if (reusePublishedSnapshotForCascade)
           reuseFullyReplacedTargetInCascade(withSemiJoinRewrite, mvName, viewLogicalName)
         else withSemiJoinRewrite
-      RewrittenRefresh(withPublishedSnapshotReuse.map(postProcess), hasRunningWindowProgram, cascade.map(_.inputPath))
+      val finalStatements = withPublishedSnapshotReuse.map(postProcess)
+      lineageCapture match {
+        case None =>
+          RewrittenRefresh(
+            finalStatements,
+            hasRunningWindowProgram = hasRunningWindowProgram,
+            aggregateInputPath = aggregateInputPath
+          )
+        case Some(_) =>
+          val pipelineRules = RewriteLineage.outputPipelineRules.dropRight(1).filter { rule =>
+            reusePublishedSnapshotForCascade || rule != RewriteLineage.publishedSnapshotReuseRule
+          } ++ lineagePostProcessRules.getOrElse(RewriteLineage.outputPipelineRules.takeRight(1))
+          val outputs = pendingLineage.get.zipWithIndex.map { case (pending, outputIndex) =>
+            RewriteLineage.OutputStatement(
+              outputIndex,
+              pending.sourceOrdinal,
+              pending.sourceDigest,
+              pending.rule.name,
+              pending.rule.version,
+              pending.rule.classification,
+              pipelineRules
+            )
+          }.toVector
+          val outputIndicesBySource = outputs.groupBy(_.sourceOrdinal).map { case (ordinal, sourceOutputs) =>
+            ordinal -> sourceOutputs.map(_.outputIndex).toVector
+          }
+          val sources = lineageInputs.get.map { input =>
+            RewriteLineage.SourceStatement(
+              input.ordinal,
+              input.digest,
+              input.kind,
+              input.rule.name,
+              input.rule.version,
+              input.rule.classification,
+              outputIndicesBySource.getOrElse(input.ordinal, Seq.empty)
+            )
+          }
+          RewrittenRefresh(
+            finalStatements,
+            Some(
+              RewriteLineage.Snapshot(
+                lineageEvidence.get._1,
+                lineageEvidence.get._2,
+                lineageEvidence.get._3,
+                sources,
+                outputs
+              )
+            ),
+            hasRunningWindowProgram,
+            aggregateInputPath
+          )
+      }
     } finally {
       activeQualifiedNames.set(prior)
       activeSnapshotPins.set(priorPins)
       activePinnedPaths.set(priorPaths)
     }
+  }
+
+  private final case class LineageRule(
+      name: String,
+      version: String,
+      classification: RewriteLineage.Classification
+  )
+  private final case class SourceInput(
+      statement: String,
+      ordinal: Int,
+      digest: String,
+      kind: String,
+      rule: LineageRule
+  )
+  private final case class PendingOutput(sourceOrdinal: Int, sourceDigest: String, rule: LineageRule)
+
+  // Rule names and versions are stable lineage identifiers; a behavior change
+  // that changes a rule's meaning must introduce a new version.
+  private def lineageRule(kind: StatementKind): LineageRule = {
+    val name = kind match {
+      case StatementKind.InProgressFlag               => "suppress-in-progress-flag"
+      case StatementKind.ViewDeltaInsert              => "view-delta-insert"
+      case StatementKind.ViewDeltaCompanion           => "view-delta-companion-insert"
+      case StatementKind.MvMerge                      => "mv-merge"
+      case StatementKind.SimpleProjectionDataInsert   => "simple-projection-data-insert"
+      case StatementKind.ScalarUpdate                 => "scalar-update"
+      case StatementKind.ScalarDeleteMv               => "scalar-delete-mv"
+      case StatementKind.ScalarFullRecomputeInsert    => "scalar-full-recompute-insert"
+      case StatementKind.GroupRecomputeAffectedCreate => "group-recompute-affected-create"
+      case StatementKind.GroupRecomputeAffectedDrop   => "group-recompute-affected-drop"
+      case StatementKind.GroupRecomputeRowsCreate     => "group-recompute-rows-create"
+      case StatementKind.GroupRecomputeRowsInsert     => "group-recompute-rows-insert"
+      case StatementKind.GroupRecomputeRowsDrop       => "group-recompute-rows-drop"
+      case StatementKind.CurrentSnapshotCreate        => "current-snapshot-create"
+      case StatementKind.CurrentSnapshotDrop          => "current-snapshot-drop"
+      case StatementKind.OldSnapshotCreate            => "old-snapshot-create"
+      case StatementKind.NewSnapshotCreate            => "new-snapshot-create"
+      case StatementKind.SnapshotDataInsert           => "snapshot-data-insert"
+      case StatementKind.SnapshotDrop                 => "snapshot-drop"
+      case StatementKind.PartitionScopedDelete        => "partition-scoped-delete"
+      case StatementKind.PartitionScopedInsert        => "partition-scoped-insert"
+      case StatementKind.RunningWindowTempCreate      => "running-window-temp-create"
+      case StatementKind.RunningWindowFastInsert      => "running-window-fast-insert"
+      case StatementKind.RunningWindowCascadeInsert   => "running-window-cascade-insert"
+      case StatementKind.RunningWindowTempDrop        => "running-window-temp-drop"
+      case StatementKind.Cleanup                      => "suppress-cleanup"
+      case StatementKind.Unknown                      => "unknown-statement"
+    }
+    val classification = kind match {
+      case StatementKind.GroupRecomputeAffectedCreate | StatementKind.GroupRecomputeAffectedDrop |
+          StatementKind.GroupRecomputeRowsCreate | StatementKind.GroupRecomputeRowsDrop |
+          StatementKind.CurrentSnapshotCreate | StatementKind.CurrentSnapshotDrop | StatementKind.OldSnapshotCreate |
+          StatementKind.NewSnapshotCreate | StatementKind.SnapshotDrop | StatementKind.RunningWindowTempCreate |
+          StatementKind.RunningWindowTempDrop =>
+        RewriteLineage.ExecutorHelper
+      case _ => RewriteLineage.Unknown
+    }
+    LineageRule(name, "1", classification)
   }
 
   /** Lower the native affected-key snapshot and its signed publication together.
@@ -997,9 +1268,7 @@ object SparkRefreshRewriter {
       // SELECT reads either the cached run_result or the legacy fast/state views. The
       // fallback cascade (openivm_old/openivm_new signed-multiset) is emitted
       // FIRST and CTAS-creates the view-delta path (ViewDeltaInsert); this
-      // statement appends to it. Distinguished from the fallback cascade by the
-      // OPENIVM_RUN_FAST_ or materialized OPENIVM_RUN_RESULT_ reference (the
-      // fallback reads openivm_old/openivm_new).
+      // statement appends to it.
       StatementKind.RunningWindowCascadeInsert
     } else if (upper.contains(s"INSERT INTO OPENIVM_DELTA_${viewLogicalName.toUpperCase}")) {
       // Distinguish the AGGREGATE_GROUP retract companion (refresh_sql.cpp:620,
@@ -2224,15 +2493,16 @@ object SparkRefreshRewriter {
     // The column can be optionally qualified with a table alias prefix
     // (e.g. `d.openivm_timestamp` in the AGGREGATE_GROUP retract companion
     // emitted by openivm when `force_view_delta_cascade=true`).
-    val qcol = "(?<![\\w`])(?:`?\\w++`?\\s*\\.\\s*)?`?openivm_timestamp`?"
-    val tsLiteral =
-      "(?:'[^']*+'::\\s*+TIMESTAMP|CAST\\s*+\\(\\s*+'[^']*+'\\s++AS\\s++TIMESTAMP\\s*+\\)|TIMESTAMP\\s++'[^']*+')"
+    val column = "(?<![\\w`])(?:`?\\w++`?\\s*\\.\\s*)?`?openivm_timestamp`?"
+    val qcol   = "(?:\\(\\s*+" + column + "\\s*+\\)|" + column + ")"
+    val tsLiteral = "(?:'[^']*+'::\\s*+TIMESTAMP|TIMESTAMP\\s++'[^']*+'|" +
+      "CAST\\s*+\\(\\s*+'[^']*+'\\s++AS\\s++TIMESTAMP\\s*+\\))"
     val metadataTable =
       "(?:(?:`?memory`?\\s*+\\.\\s*+`?main`?\\s*+\\.\\s*+)?`?openivm_delta_tables`?)"
     val metadataHorizon =
       "\\(\\s*+SELECT\\s++last_update\\s++FROM\\s++" + metadataTable + "\\s++WHERE\\s++" +
         "view_name\\s*+=\\s*+'[^']*+'\\s++AND\\s++table_name\\s*+=\\s*+'[^']*+'\\s*+\\)"
-    val refreshHorizon = "(?:" + tsLiteral + "|(?>" + metadataHorizon + "))"
+    val refreshHorizon = "(?:\\(\\s*+" + tsLiteral + "\\s*+\\)|" + tsLiteral + "|(?>" + metadataHorizon + "))"
     val cmp            = "\\s*+(?:>=|>|<=|<|=)\\s*+"
     // DuckDB 2.0 can parenthesize the column, TIMESTAMP literal, and whole
     // predicate independently: `((openivm_timestamp) >= (TIMESTAMP '...'))`.
@@ -2249,13 +2519,57 @@ object SparkRefreshRewriter {
     // Case 3: leading `[(]openivm_timestamp OP '...'::TIMESTAMP[)] AND `
     val leadingAnd = ("(?i)" + tsPred + "\\s+AND\\s+").r
 
-    leadingAnd.replaceAllIn(
-      trailingAnd.replaceAllIn(
-        standalone.replaceAllIn(whereLeadingAnd.replaceAllIn(sql, " WHERE "), ""),
-        ""
-      ),
-      ""
-    )
+    def replaceCodeMatches(input: String, pattern: scala.util.matching.Regex, replacement: String): String = {
+      if (pattern.findFirstIn(input).isEmpty) return input
+      val protectedChars = Array.fill(input.length)(false)
+      var i              = 0
+      while (i < input.length) {
+        val start = i
+        val c     = input.charAt(i)
+        if (c == '\'' || c == '"' || c == '`') {
+          i += 1
+          var closed = false
+          while (i < input.length && !closed) {
+            if (input.charAt(i) == c && i + 1 < input.length && input.charAt(i + 1) == c) i += 2
+            else if (input.charAt(i) == c) {
+              i += 1
+              closed = true
+            } else i += 1
+          }
+          java.util.Arrays.fill(protectedChars, start + 1, i, true)
+        } else if (c == '-' && i + 1 < input.length && input.charAt(i + 1) == '-') {
+          i += 2
+          while (i < input.length && input.charAt(i) != '\n') i += 1
+          java.util.Arrays.fill(protectedChars, start, i, true)
+        } else if (c == '/' && i + 1 < input.length && input.charAt(i + 1) == '*') {
+          i += 2
+          var depth = 1
+          while (i + 1 < input.length && depth > 0) {
+            if (input.charAt(i) == '/' && input.charAt(i + 1) == '*') {
+              depth += 1
+              i += 2
+            } else if (input.charAt(i) == '*' && input.charAt(i + 1) == '/') {
+              depth -= 1
+              i += 2
+            } else i += 1
+          }
+          if (depth > 0) i = input.length
+          java.util.Arrays.fill(protectedChars, start, i, true)
+        } else i += 1
+      }
+      pattern.replaceAllIn(
+        input,
+        m =>
+          java.util.regex.Matcher.quoteReplacement(
+            if (protectedChars(m.start)) m.matched else replacement
+          )
+      )
+    }
+
+    val leading  = replaceCodeMatches(sql, whereLeadingAnd, " WHERE ")
+    val single   = replaceCodeMatches(leading, standalone, "")
+    val trailing = replaceCodeMatches(single, trailingAnd, "")
+    replaceCodeMatches(trailing, leadingAnd, "")
   }
 
   /** Rewrite an additional data-bearing INSERT into the already-materialized
@@ -3036,7 +3350,7 @@ object SparkRefreshRewriter {
         val closeIdx = findMatchingCloseParen(stmt, openIdx)
         if (closeIdx < 0) return stmt
         val afterSubquery = stmt.substring(closeIdx + 1)
-        val aliasRe       = """(?is)^\s+(\w+)\b(.*)$""".r
+        val aliasRe       = """(?is)^\s+(?:AS\s+)?((?!AS\b|WHERE\b)(?:`(?:``|[^`])+`|"(?:[a-zA-Z0-9_]+)"|\w+))(.*)$""".r
         aliasRe.findFirstMatchIn(afterSubquery) match {
           case None => stmt
           case Some(aliasMatch) =>
@@ -4072,6 +4386,10 @@ object SparkRefreshRewriter {
     }
   }
 
+  // Native scalar programs prefix the already-quoted output name: d_`days`,
+  // not `d_days`. Treat that compiler token as one alias until it is inlined.
+  private val ScalarDeltaAliasToken = """(?:d_)?(?:`(?:``|[^`])*`|"(?:[^"]|"")*"|\w+)"""
+
   /** Inline the `WITH openivm_delta AS (<cte>) UPDATE` pattern into a plain UPDATE.
     *
     * Finds `WITH openivm_delta AS (` in `stmt`, paren-matches the CTE body, builds
@@ -4090,23 +4408,23 @@ object SparkRefreshRewriter {
         val cteBody    = stmt.substring(openParenIdx + 1, closeParenIdx).trim
         val updatePart = stmt.substring(closeParenIdx + 1).trim
         val aliasMap   = parseCteSelectAliases(cteBody)
-        val refRe      = """(?i)\(\s*SELECT\s+(\w+)\s+FROM\s+openivm_delta\s*\)""".r
+        val refRe      = ("""(?i)\(\s*SELECT\s+(""" + ScalarDeltaAliasToken + """)\s+FROM\s+openivm_delta\s*\)""").r
         refRe.replaceAllIn(
           updatePart,
           mm => {
-            val alias = mm.group(1).toUpperCase
-            aliasMap.get(alias) match {
-              case None => mm.matched
-              case Some(expr) =>
-                java.util.regex.Matcher.quoteReplacement(s"(SELECT $expr FROM $deltaRef)")
-            }
+            val alias = mm.group(1).toUpperCase(java.util.Locale.ROOT)
+            val replacement = aliasMap
+              .get(alias)
+              .map(expr => s"(SELECT $expr FROM $deltaRef)")
+              .getOrElse(mm.matched)
+            java.util.regex.Matcher.quoteReplacement(replacement)
           }
         )
     }
   }
 
   /** Find the index of the `)` that closes the `(` at `openIdx`, respecting
-    * nesting and single-quoted string literals (with `''` as escape).
+    * nesting, string literals and delimited identifiers with doubled escapes.
     * Returns -1 if not found.
     */
   private def findMatchingCloseParen(s: String, openIdx: Int): Int = {
@@ -4114,6 +4432,8 @@ object SparkRefreshRewriter {
     var i     = openIdx
     while (i < s.length) {
       s(i) match {
+        case '`' => i = skipDelimited(s, i, '`')
+        case '"' => i = skipDelimited(s, i, '"')
         case '\'' =>
           i += 1
           var done = false
@@ -4147,20 +4467,19 @@ object SparkRefreshRewriter {
     * → Map("D_TOTAL" → "SUM(openivm_multiplicity * total)")
     */
   private def parseCteSelectAliases(cteBody: String): Map[String, String] = {
-    val upper       = cteBody.toUpperCase.trim
-    val selectStart = if (upper.startsWith("SELECT")) 6 else return Map.empty
+    val selectStart = if (startsWithSqlKeyword(cteBody, 0, "SELECT")) 6 else return Map.empty
 
     var depth   = 0
     var fromIdx = -1
     var i       = selectStart
-    while (i < upper.length && fromIdx < 0) {
-      upper(i) match {
-        case '(' => depth += 1; i += 1
-        case ')' => depth -= 1; i += 1
-        case 'F'
-            if depth == 0 && i + 4 <= upper.length &&
-              upper.substring(i, i + 4) == "FROM" &&
-              (i + 4 >= upper.length || upper(i + 4).isWhitespace) =>
+    while (i < cteBody.length && fromIdx < 0) {
+      cteBody(i) match {
+        case '\'' => i = skipSingleQuoted(cteBody, i)
+        case '`'  => i = skipDelimited(cteBody, i, '`')
+        case '"'  => i = skipDelimited(cteBody, i, '"')
+        case '('  => depth += 1; i += 1
+        case ')'  => depth -= 1; i += 1
+        case _ if depth == 0 && startsWithSqlKeyword(cteBody, i, "FROM") =>
           fromIdx = i
         case _ => i += 1
       }
@@ -4170,11 +4489,11 @@ object SparkRefreshRewriter {
       if (fromIdx > 0) cteBody.substring(selectStart, fromIdx).trim
       else cteBody.substring(selectStart).trim
 
-    splitSelectList(selectList).flatMap { item =>
+    splitTopLevelCsv(selectList).flatMap { item =>
       val trimmed = item.trim
-      val asRe    = """(?i)\s+AS\s+(\w+)\s*$""".r
+      val asRe    = ("""(?i)\s+AS\s+(""" + ScalarDeltaAliasToken + """)\s*$""").r
       asRe.findFirstMatchIn(trimmed).map { m =>
-        m.group(1).toUpperCase -> trimmed.substring(0, m.start).trim
+        m.group(1).toUpperCase(java.util.Locale.ROOT) -> trimmed.substring(0, m.start).trim
       }
     }.toMap
   }

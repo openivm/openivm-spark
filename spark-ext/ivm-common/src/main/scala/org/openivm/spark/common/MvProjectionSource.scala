@@ -20,13 +20,30 @@ object MvProjectionSource {
     case _                                => None
   }
 
-  def isProjection(spark: SparkSession, source: String): Boolean =
-    try projection(spark.table(source).queryExecution.analyzed).nonEmpty
-    catch { case _: AnalysisException => false }
+  def projectionView(spark: SparkSession, source: String): Option[View] =
+    try projection(spark.table(source).queryExecution.analyzed)
+    catch { case _: AnalysisException => None }
 
-  def project(raw: DataFrame, schema: StructType, metadataColumns: Seq[String] = Nil): DataFrame = {
+  def isProjection(spark: SparkSession, source: String): Boolean = projectionView(spark, source).nonEmpty
+
+  def outputNames(spark: SparkSession, source: String): PublicOutputNames =
+    projectionView(spark, source).fold(PublicOutputNames.Empty)(view => PublicOutputNames.of(view.desc.properties))
+
+  /** Backing columns carry the view's [[PublicOutputNames]] physical names; rows staged through the public
+    * schema keep public names, so a missing physical name falls back to the public one.
+    */
+  def project(
+      raw: DataFrame,
+      schema: StructType,
+      metadataColumns: Seq[String] = Nil,
+      names: PublicOutputNames = PublicOutputNames.Empty
+  ): DataFrame = {
     val columns = schema.fields.map { field =>
-      val matches = raw.schema.fields.filter(_.name.equalsIgnoreCase(field.name))
+      val physicalMatches =
+        names.physicalFor(field.name).toSeq.flatMap(name => raw.schema.fields.filter(_.name.equalsIgnoreCase(name)))
+      val matches =
+        if (physicalMatches.nonEmpty) physicalMatches
+        else raw.schema.fields.filter(_.name.equalsIgnoreCase(field.name)).toSeq
       require(matches.length == 1, s"Public MV column '${field.name}' did not resolve uniquely on backing state")
       val physical = matches.head
       val value    = col(quote(physical.name))
@@ -57,7 +74,7 @@ object MvProjectionSource {
         if (options.get("readChangeFeed").exists(_.equalsIgnoreCase("true")))
           Seq("_change_type", "_commit_version", "_commit_timestamp")
         else Nil
-      project(raw, logical.schema, metadata)
+      project(raw, logical.schema, metadata, PublicOutputNames.of(view.desc.properties))
     }
   }
 

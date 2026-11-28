@@ -79,6 +79,29 @@ object OpenIvmRocksDBRegistry {
       }
     }
 
+    def checkpoint(
+        spark: SparkSession,
+        destination: java.nio.file.Path,
+        reuse: Boolean
+    ): OpenIvmCheckpointReuse.Capture = {
+      lock.lock()
+      try {
+        if (retired) throw SlotRetiredSignal
+        if (entry != null) {
+          if (reuse) OpenIvmCheckpointReuse.checkpoint(entry.db, destination)
+          else {
+            entry.db.checkpointTo(destination)
+            OpenIvmCheckpointReuse.Capture("fresh")
+          }
+        } else {
+          val db = new OpenIvmRocksDB(canonicalPath, OpenIvmRocksDBConf.fromSpark(spark), Seq.empty)
+          try db.checkpointTo(destination)
+          finally db.close()
+          OpenIvmCheckpointReuse.Capture(if (reuse) "fallback" else "fresh")
+        }
+      } finally lock.unlock()
+    }
+
     def closeNow(): Boolean = {
       lock.lock()
       try {
@@ -241,7 +264,21 @@ object OpenIvmRocksDBRegistry {
   def getOrOpen(spark: SparkSession, dbPath: String, columnFamilies: Seq[String]): OpenIvmRocksDB = {
     installShutdownHookIfNeeded()
     OpenIvmStateSync.maybeRestore(spark)
+    if (new java.io.File(dbPath, "CURRENT").isFile)
+      OpenIvmStateBarrier.withDbOperation(dbPath) {
+        getOrOpenAfterRestore(spark, dbPath, columnFamilies)
+      }
+    else
+      OpenIvmStateBarrier.withDbMutation(dbPath) {
+        getOrOpenAfterRestore(spark, dbPath, columnFamilies)
+      }
+  }
 
+  private def getOrOpenAfterRestore(
+      spark: SparkSession,
+      dbPath: String,
+      columnFamilies: Seq[String]
+  ): OpenIvmRocksDB = {
     val appId         = spark.sparkContext.applicationId
     val canonicalPath = canonicalLocalPath(dbPath)
     val requestedColumnFamilies =
@@ -277,6 +314,12 @@ object OpenIvmRocksDBRegistry {
   }
 
   def close(dbPath: String): Unit = {
+    OpenIvmStateBarrier.withDbOperation(dbPath) {
+      closeUnderBarrier(dbPath)
+    }
+  }
+
+  private def closeUnderBarrier(dbPath: String): Unit = {
     val canonicalPath = canonicalLocalPath(dbPath)
     val slot          = entries.get(canonicalPath)
     if (slot != null) {
@@ -303,7 +346,10 @@ object OpenIvmRocksDBRegistry {
       else {
         val slot = entries.get(canonicalPath)
         if (slot == null) Left("absent")
-        else slot.captureMetadataIfOpen(spark.sparkContext.applicationId, budget)
+        else
+          OpenIvmStateBarrier.withDbInspection(canonicalPath, budget) {
+            slot.captureMetadataIfOpen(spark.sparkContext.applicationId, budget)
+          }
       }
     canonicalPath -> result
   }
@@ -322,7 +368,12 @@ object OpenIvmRocksDBRegistry {
     * is never silently swallowed, and the path stays reopenable. Exclusion is
     * per-slot; other paths are never blocked.
     */
-  def closeAndDelete(dbPath: String)(delete: String => Unit): Unit = {
+  def closeAndDelete(dbPath: String)(delete: String => Unit): Unit =
+    OpenIvmStateBarrier.withDbMutation(dbPath) {
+      closeAndDeleteUnderBarrier(dbPath)(delete)
+    }
+
+  private def closeAndDeleteUnderBarrier(dbPath: String)(delete: String => Unit): Unit = {
     val canonicalPath = canonicalLocalPath(dbPath)
     var completed     = false
     while (!completed) {
@@ -340,18 +391,44 @@ object OpenIvmRocksDBRegistry {
   def closeAllForSparkContext(appId: String): Unit = {
     listenerAppIds.remove(appId)
     entries.entrySet().asScala.toSeq.foreach { mapEntry =>
-      mapEntry.getValue.closeForAppId(appId)
-      pruneSlotIfEmpty(mapEntry.getKey)
+      OpenIvmStateBarrier.withDbOperation(mapEntry.getKey) {
+        mapEntry.getValue.closeForAppId(appId)
+        pruneSlotIfEmpty(mapEntry.getKey)
+      }
     }
     OpenIvmMaintenanceCoordinator.shutdownIfIdle()
   }
 
   def closeAll(): Unit = {
     entries.entrySet().asScala.toSeq.foreach { mapEntry =>
-      mapEntry.getValue.closeNow()
-      pruneSlotIfEmpty(mapEntry.getKey)
+      OpenIvmStateBarrier.withDbOperation(mapEntry.getKey) {
+        mapEntry.getValue.closeNow()
+        pruneSlotIfEmpty(mapEntry.getKey)
+      }
     }
     OpenIvmMaintenanceCoordinator.shutdownIfIdle()
+  }
+
+  private[rocksdb] def checkpoint(
+      spark: SparkSession,
+      dbPath: String,
+      destination: java.nio.file.Path,
+      reuse: Boolean
+  ): OpenIvmCheckpointReuse.Capture = {
+    val canonicalPath                           = canonicalLocalPath(dbPath)
+    var completed                               = false
+    var outcome: OpenIvmCheckpointReuse.Capture = null
+    while (!completed) {
+      val slot = slotFor(canonicalPath)
+      try {
+        outcome = slot.checkpoint(spark, destination, reuse)
+        completed = true
+      } catch {
+        case SlotRetiredSignal => evictIfRetired(canonicalPath, slot)
+      }
+    }
+    pruneSlotIfEmpty(canonicalPath)
+    outcome
   }
 
   private def slotFor(canonicalPath: String): Slot = {

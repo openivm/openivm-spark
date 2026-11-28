@@ -1,7 +1,13 @@
 package org.openivm.spark.common
 
 import org.apache.spark.sql.SparkSession
-import org.openivm.spark.common.rocksdb.{OpenIvmRocksDB, OpenIvmRocksDBBatchOps, OpenIvmRocksDBRegistry, RocksDBCodec}
+import org.openivm.spark.common.rocksdb.{
+  OpenIvmRocksDB,
+  OpenIvmRocksDBBatchOps,
+  OpenIvmRocksDBRegistry,
+  OpenIvmStateBarrier,
+  RocksDBCodec
+}
 
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.{FileVisitResult, Files, Path, Paths, SimpleFileVisitor}
@@ -82,11 +88,47 @@ object StagingCatalog {
   private val MvDbColumnFamilies   = OpenIvmStatePaths.PerMvColumnFamilies
   private val BaseDbColumnFamilies = OpenIvmStatePaths.BaseTableColumnFamilies
 
-  private val StagingCf  = "staging"
-  private val ConsumedCf = "consumed"
-  private val LedgerCf   = "ledger"
-  private val GcCf       = "gc"
-  private val LedgerKey  = RocksDBCodec.utf8("source")
+  private val StagingCf                = "staging"
+  private val ConsumedCf               = "consumed"
+  private val MetaCf                   = "meta"
+  private val LedgerCf                 = "ledger"
+  private val GcCf                     = "gc"
+  private val LedgerKey                = RocksDBCodec.utf8("source")
+  private val CompletedRefreshKey      = RocksDBCodec.utf8("_ivm_completed_refresh_witness")
+  val CompletedRefreshTokenKey: String = "_ivm_completed_refresh_token"
+
+  final case class CompletedRefreshWitness(token: String, dataVersion: Long, tableId: String)
+
+  def completedRefreshWitness(spark: SparkSession, viewName: String): Option[CompletedRefreshWitness] =
+    openTrackedMvDb(spark, viewName).flatMap(_.get(MetaCf, CompletedRefreshKey)).map { value =>
+      val parts = RocksDBCodec.splitComposite(value, 3)
+      require(parts.length == 3, s"Invalid completed refresh witness for $viewName")
+      val token = RocksDBCodec.fromUtf8(parts.head)
+      require(token.nonEmpty, s"Empty completed refresh witness for $viewName")
+      val tableId = RocksDBCodec.fromUtf8(parts(2))
+      require(tableId.nonEmpty, s"Empty completed refresh table identity for $viewName")
+      CompletedRefreshWitness(token, RocksDBCodec.decodeLongBE(parts(1)), tableId)
+    }
+
+  def recordCompletedRefresh(
+      spark: SparkSession,
+      viewName: String,
+      token: String,
+      dataVersion: Long,
+      tableId: String
+  ): Unit = {
+    require(token.nonEmpty, "Completed refresh token must not be empty")
+    require(tableId.nonEmpty, "Completed refresh table identity must not be empty")
+    val db = OpenIvmRocksDBRegistry.getOrOpen(
+      spark,
+      OpenIvmStatePaths.perMvDbPath(spark, viewName),
+      MvDbColumnFamilies
+    )
+    val value = RocksDBCodec.compositeKey(
+      Seq(RocksDBCodec.utf8(token), RocksDBCodec.encodeLongBE(dataVersion), RocksDBCodec.utf8(tableId))
+    )
+    db.withBatch(batch => OpenIvmRocksDBBatchOps.put(db, batch, MetaCf, CompletedRefreshKey, value))
+  }
 
   private def baseTableDbPath(spark: SparkSession, baseTable: String): String =
     OpenIvmStatePaths.baseTableDbPath(spark, baseTable)
@@ -264,18 +306,47 @@ object StagingCatalog {
   def markConsumed(spark: SparkSession, viewName: String, paths: Seq[String]): Unit = {
     if (paths.isEmpty) return
 
-    openTrackedMvDb(spark, viewName).foreach { mvDb =>
+    def writeConsumed(mvDb: OpenIvmRocksDB): Unit =
       mvDb.withBatch { batch =>
         paths.distinct.foreach { path =>
           OpenIvmRocksDBBatchOps.put(mvDb, batch, ConsumedCf, RocksDBCodec.utf8(path), Array.emptyByteArray)
         }
       }
-    }
+
+    if (FeatureGate.deltaCatalogEnabled(spark))
+      consumptionLifecycleLock(spark, viewName).synchronized {
+        val name = org.apache.spark.sql.catalyst.parser.CatalystSqlParser.parseTableIdentifier(viewName)
+        if (MvCatalog.lookupStored(spark, name).isEmpty)
+          throw new IllegalStateException(s"Cannot mark staging consumed for untracked materialized view $viewName")
+        val mvDb =
+          OpenIvmRocksDBRegistry.getOrOpen(spark, OpenIvmStatePaths.perMvDbPath(spark, viewName), MvDbColumnFamilies)
+        writeConsumed(mvDb)
+      }
+    else openTrackedMvDb(spark, viewName).foreach(writeConsumed)
   }
+
+  private val consumptionLifecycleLocks = Array.fill(128)(new Object)
+
+  private[common] def consumptionLifecycleLock(spark: SparkSession, viewName: String): Object = {
+    val hash = OpenIvmStatePaths.perMvDbPath(spark, viewName).hashCode & Int.MaxValue
+    consumptionLifecycleLocks(hash % consumptionLifecycleLocks.length)
+  }
+
+  private[common] def removeConsumedForView(spark: SparkSession, viewName: String): Unit =
+    openTrackedMvDb(spark, viewName).foreach { mvDb =>
+      val keys = mvDb.prefixScan(ConsumedCf, Array.emptyByteArray).map { case (key, _) => key.clone() }.toList
+      if (keys.nonEmpty)
+        mvDb.withBatch(batch => keys.foreach(key => OpenIvmRocksDBBatchOps.delete(mvDb, batch, ConsumedCf, key)))
+    }
 
   def pruneFullyConsumed(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = {
     if (viewsByTable.isEmpty) return
+    OpenIvmStateBarrier.withMutation(spark) {
+      pruneFullyConsumedUnderBarrier(spark, viewsByTable)
+    }
+  }
 
+  private def pruneFullyConsumedUnderBarrier(spark: SparkSession, viewsByTable: Map[String, Seq[String]]): Unit = {
     val mvDbCache = mutable.HashMap.empty[String, Option[OpenIvmRocksDB]]
 
     def trackedMvDb(viewName: String): Option[OpenIvmRocksDB] =
@@ -349,6 +420,33 @@ object StagingCatalog {
         }
     }
 
+  final case class GarbageCollectionPaths(tombstoned: Set[String], referenced: Set[String])
+
+  /** Reuse one shard inventory for both scans; skip live staging reads only if there are no
+    * tombstones and the caller does not need references for a sweep.
+    */
+  private[common] def garbageCollectionPaths(
+      spark: SparkSession,
+      sweepDue: => Boolean
+  ): Option[GarbageCollectionPaths] = {
+    val baseDbs = OpenIvmStatePaths
+      .existingBaseTableDbPaths(spark)
+      .map(dbPath => OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies))
+    val tombstones = Set.newBuilder[String]
+    baseDbs.foreach(_.foreachPrefix(GcCf, Array.emptyByteArray) { (key, _) =>
+      tombstones += RocksDBCodec.fromUtf8(key)
+    })
+    val tombstoned = tombstones.result()
+    if (tombstoned.isEmpty && !sweepDue) None
+    else {
+      val referenced = Set.newBuilder[String]
+      baseDbs.foreach(_.foreachPrefix(StagingCf, Array.emptyByteArray) { (key, _) =>
+        referenced += decodeStagingKey(key)._2
+      })
+      Some(GarbageCollectionPaths(tombstoned, referenced.result()))
+    }
+  }
+
   /** Staging locations whose records were pruned and that await deletion. A location may only be
     * deleted once a durable state that no longer references it exists: with state sync enabled,
     * after the next published snapshot; otherwise immediately, since local RocksDB is durable.
@@ -401,6 +499,11 @@ object StagingCatalog {
     * @param sources  the view's qualified source names
     */
   def forgetConsumed(spark: SparkSession, viewName: String, sources: Seq[String]): Unit =
+    OpenIvmStateBarrier.withMutation(spark) {
+      forgetConsumedUnderBarrier(spark, viewName, sources)
+    }
+
+  private def forgetConsumedUnderBarrier(spark: SparkSession, viewName: String, sources: Seq[String]): Unit =
     openTrackedMvDb(spark, viewName).foreach { mvDb =>
       val referenced = sources.distinct.iterator.flatMap { source =>
         val dbPath = baseTableDbPath(spark, source)
@@ -423,7 +526,12 @@ object StagingCatalog {
     * path. Used by source-version advancement rollback before the operation is
     * published as committed metadata.
     */
-  def removeStagingPathEverywhere(spark: SparkSession, stagingPath: String): Unit = {
+  def removeStagingPathEverywhere(spark: SparkSession, stagingPath: String): Unit =
+    OpenIvmStateBarrier.withMutation(spark) {
+      removeStagingPathEverywhereUnderBarrier(spark, stagingPath)
+    }
+
+  private def removeStagingPathEverywhereUnderBarrier(spark: SparkSession, stagingPath: String): Unit = {
     OpenIvmStatePaths.existingBaseTableDbPaths(spark).foreach { dbPath =>
       val baseDb = OpenIvmRocksDBRegistry.getOrOpen(spark, dbPath, BaseDbColumnFamilies)
       val victims = baseDb

@@ -21,6 +21,7 @@ import org.openivm.spark.commands.ReleaseOpenIvmInsightsRequestCommand
 import org.openivm.spark.commands.ShowMaterializedViewRefreshSqlCommand
 import org.openivm.spark.commands.ShowOpenIvmInsightsCommand
 import org.openivm.spark.commands.ShowRefreshProfileCommand
+import org.openivm.spark.commands.ShowRefreshEligibilityCommand
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funspec.AnyFunSpec
 import org.scalatest.matchers.should.Matchers
@@ -342,11 +343,107 @@ class IvmParserSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll {
   // Test 3 — REFRESH MATERIALIZED VIEW
   // ---------------------------------------------------------------------------
   describe("REFRESH MATERIALIZED VIEW") {
+    it("parses eligibility with canonical hash and rejects malformed inputs") {
+      val prefix = "SHOW OPENIVM REFRESH ELIGIBILITY "
+      val suffix = " EXPECT QUERY HASH '0123456789ABCDEFabcdef0123456789'"
+      val cmd = spark.sessionState.sqlParser
+        .parsePlan(prefix + "`Lakehouse`.`dbo`.`mv`" + suffix)
+        .asInstanceOf[ShowRefreshEligibilityCommand]
+      cmd.name shouldBe TableIdentifier("mv", Some("dbo"), Some("Lakehouse"))
+      cmd.expectedQueryHash shouldBe "0123456789abcdefabcdef0123456789"
+      cmd.output.map(_.name) shouldBe Seq("status", "query_hash", "target", "target_table_id", "reason")
+      Seq(
+        prefix + "`a`.`b`.`c`.`d`" + suffix,
+        prefix + "mv EXPECT QUERY HASH 'bad'",
+        prefix + "mv EXPECT QUERY HASH 0123456789abcdef0123456789abcdef",
+        prefix + "mv EXPECT QUERY HASH '0123456789abcdef0123456789abcdef' EXTRA"
+      ).foreach(sqlText => intercept[ParseException](spark.sessionState.sqlParser.parsePlan(sqlText)))
+    }
+
     it("parses to RefreshMaterializedViewCommand") {
       val plan = spark.sessionState.sqlParser.parsePlan("REFRESH MATERIALIZED VIEW v")
       plan shouldBe a[RefreshMaterializedViewCommand]
       val cmd = plan.asInstanceOf[RefreshMaterializedViewCommand]
       cmd.name shouldBe TableIdentifier("v")
+      cmd.expectedQueryHash shouldBe None
+    }
+
+    it("parses and normalizes an expected query hash for a qualified target") {
+      val plan = spark.sessionState.sqlParser.parsePlan(
+        "refresh materialized view `db`.`expect` expect query hash '0123456789ABCDEFabcdef0123456789' if exists;"
+      )
+      val cmd = plan.asInstanceOf[RefreshMaterializedViewCommand]
+      cmd.name shouldBe TableIdentifier("expect", Some("db"))
+      cmd.expectedQueryHash shouldBe Some("0123456789abcdefabcdef0123456789")
+      cmd.expectedTableId shouldBe None
+    }
+
+    it("parses a canonical table identity pin and rejects malformed pins") {
+      val prefix = "REFRESH MATERIALIZED VIEW `Lakehouse`.`dbo`.`id` EXPECT QUERY HASH " +
+        "'0123456789abcdef0123456789abcdef' EXPECT TABLE ID "
+      val cmd = spark.sessionState.sqlParser
+        .parsePlan(prefix + "'ABCDEF01-2345-6789-ABCD-EF0123456789' IF EXISTS")
+        .asInstanceOf[RefreshMaterializedViewCommand]
+      cmd.name shouldBe TableIdentifier("id", Some("dbo"), Some("Lakehouse"))
+      cmd.expectedTableId shouldBe Some("abcdef01-2345-6789-abcd-ef0123456789")
+      spark.sessionState.sqlParser
+        .parsePlan("REFRESH MATERIALIZED VIEW default.id")
+        .asInstanceOf[RefreshMaterializedViewCommand]
+        .name shouldBe TableIdentifier("id", Some("default"))
+      Seq(
+        prefix + "'abcdef0123456789abcdef0123456789' IF EXISTS",
+        prefix + "'abcdef01-2345-6789-abcd-ef012345678g' IF EXISTS",
+        prefix + "'abcdef01-2345-6789-abcd-ef0123456789'",
+        "REFRESH MATERIALIZED VIEW v EXPECT TABLE ID 'abcdef01-2345-6789-abcd-ef0123456789' IF EXISTS"
+      ).foreach(sqlText => intercept[ParseException](spark.sessionState.sqlParser.parsePlan(sqlText)))
+    }
+
+    it("preserves three-part targets and rejects four-part targets") {
+      val suffix = "EXPECT QUERY HASH '0123456789abcdef0123456789abcdef' IF EXISTS"
+      val cmd = spark.sessionState.sqlParser
+        .parsePlan(s"REFRESH MATERIALIZED VIEW `Lakehouse`.`dbo`.`mv` $suffix")
+        .asInstanceOf[RefreshMaterializedViewCommand]
+      cmd.name shouldBe TableIdentifier("mv", Some("dbo"), Some("Lakehouse"))
+      val error = intercept[ParseException] {
+        spark.sessionState.sqlParser.parsePlan(
+          s"REFRESH MATERIALIZED VIEW `Workspace`.`Lakehouse`.`dbo`.`mv` $suffix"
+        )
+      }
+      error.getMessage should include("Identifier has too many parts")
+    }
+
+    it("preserves EXPECT as a non-reserved identifier") {
+      val cmd = spark.sessionState.sqlParser
+        .parsePlan("REFRESH MATERIALIZED VIEW expect")
+        .asInstanceOf[RefreshMaterializedViewCommand]
+      cmd.name shouldBe TableIdentifier("expect")
+      cmd.expectedQueryHash shouldBe None
+    }
+
+    it("rejects malformed or incomplete expected query hash clauses") {
+      val validHash = "0123456789abcdef0123456789abcdef"
+      val statements = Seq(
+        "EXPECT QUERY HASH",
+        s"EXPECT QUERY HASH '$validHash'",
+        s"EXPECT QUERY HASH '$validHash' IF",
+        s"EXPECT QUERY HASH '$validHash' EXISTS",
+        s"EXPECT QUERY HASH '$validHash' IF NOT EXISTS",
+        s"EXPECT QUERY HASH '$validHash' IF EXISTS EXTRA",
+        s"EXPECT HASH '$validHash' IF EXISTS",
+        s"EXPECT QUERY HASH $validHash IF EXISTS",
+        "EXPECT QUERY HASH '' IF EXISTS",
+        "EXPECT QUERY HASH '0123456789abcdef0123456789abcde' IF EXISTS",
+        "EXPECT QUERY HASH '0123456789abcdef0123456789abcdef0' IF EXISTS",
+        "EXPECT QUERY HASH '0123456789abcdef0123456789abcdeg' IF EXISTS",
+        "EXPECT QUERY HASH '0123456789abcdef0123456789abcde''f' IF EXISTS"
+      )
+      statements.foreach { suffix =>
+        withClue(suffix) {
+          an[ParseException] should be thrownBy spark.sessionState.sqlParser.parsePlan(
+            s"REFRESH MATERIALIZED VIEW v $suffix"
+          )
+        }
+      }
     }
   }
 

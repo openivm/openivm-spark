@@ -206,14 +206,14 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     val file = dir.resolve(s"openivm_compiled_queries_$key.sql")
     val req  = CompileRequest("mv", "SELECT id FROM src", Map("src" -> StructType.fromDDL("id INT")))
     try {
-      Files.write(
-        file,
-        s"create table memory.main.openivm_data_$key as SELECT id, 1 AS openivm_running_input_0 FROM memory.main.src;"
-          .getBytes("UTF-8")
-      )
+      val queries = s"create table memory.main.openivm_data_$key as SELECT ';openivm_delta_$key' AS label, " +
+        "id, 1 AS openivm_running_input_0 FROM memory.main.src; SELECT 99 AS trailing_statement;"
+      Files.write(file, queries.getBytes("UTF-8"))
       val initial = sharedCompiler.parseInitialLoadSql(dir, req, key)
       initial should include("openivm_running_input_0")
+      initial should include(s"';openivm_delta_$key'")
       initial should not include "memory.main."
+      initial should not include "trailing_statement"
     } finally {
       Files.deleteIfExists(file)
       Files.deleteIfExists(dir)
@@ -1086,6 +1086,14 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
     normalized should include(s"/* openivm_delta_$key */")
   }
 
+  it should "leave unrelated qualified and non-suffix native-like identifiers unchanged" in {
+    val key = "__openivm_mv_6d656d6f7279_6d61696e_6d76"
+    val sql = s"""SELECT * FROM other.openivm_data_$key
+                 |JOIN other."openivm_data_$key" USING (id)
+                 |JOIN openivm_data_${key}_suffix USING (id)""".stripMargin
+    OpenIvmCompiler.normalizeNativeViewObjects(sql, key, "mv") shouldBe sql
+  }
+
   it should "read the encoded native initial-load file and retain hidden keys and source pins" in {
     val key  = "__openivm_mv_6d656d6f7279_6d61696e_6d76"
     val dir  = Files.createTempDirectory("openivm-native-initial-load-")
@@ -1370,6 +1378,98 @@ class OpenIvmCompilerSpec extends AnyFlatSpec with Matchers with BeforeAndAfterA
       ex.getMessage should include("failed during openivm_compile_with_facts")
       ex.getMessage should include("CLI stderr:\nsynthetic CLI failure\nsecond line")
       assertCliStopped(dir)
+    }
+  }
+
+  it should "emit correlated driver and helper phases without altering CLI output" in {
+    withFakeCli(
+      """cat > /dev/null
+        |printf '%s\n' '{"refresh_type":2,"refresh_type_name":"SIMPLE_PROJECTION","sql":"SELECT 1;"}'
+        |""".stripMargin
+    ) { (compiler, dir, context) =>
+      implicit val ec: ExecutionContext = context
+      val events                        = new ConcurrentLinkedQueue[String]()
+      val identity =
+        CompileTraceContext("refresh-1", Some("request-1"), "db.mv", enabled = true, sqlExecutionId = Some("sql-1"))
+      val traceFailures = new java.util.concurrent.atomic.AtomicInteger()
+      val tracer = new CompilerTrace(
+        Some(identity),
+        line => { events.add(line); () },
+        () => { traceFailures.incrementAndGet(); () }
+      )
+      val result = awaitCli(15.seconds) { compiler.compileWithTrace(cliTestRequest, tracer) }
+      traceFailures.get() shouldBe 0
+      result.sql shouldBe "SELECT 1;"
+      val mapper = new com.fasterxml.jackson.databind.ObjectMapper()
+      val rows   = events.iterator().asScala.map(line => mapper.readTree(line)).toVector
+      val phases = rows.map(_.path("phase").asText()).toSet
+      phases should contain allOf ("compile_total", "helper_start", "helper_wait", "native_launch",
+      "native_lifecycle", "worker_output", "worker_cleanup", "worker_total", "driver_output_read", "driver_cleanup")
+      rows.foreach { row =>
+        row.path("operation_id").asText() shouldBe "refresh-1"
+        row.path("request_id").asText() shouldBe "request-1"
+        row.path("materialized_view").asText() shouldBe "db.mv"
+        row.path("sql_execution_id").asText() shouldBe "sql-1"
+        row.path("duration_ns").asLong() should be >= 0L
+        java.time.Instant.parse(row.path("start_utc").asText())
+      }
+      rows.find(_.path("phase").asText() == "native_launch").get.path("clock_domain").asText() shouldBe "helper"
+      events.asScala.mkString should not include cliTestRequest.viewSql
+      assertCliStopped(dir)
+    }
+  }
+
+  it should "separately correlate the scalar retry attempt" in {
+    withFakeCli(
+      """cat > /dev/null
+        |if [[ ! -e "$fixture_dir/retried" ]]; then
+        |  : > "$fixture_dir/retried"
+        |  printf 'unix_timestamp is unsupported\n' >&2
+        |else
+        |  printf '%s\n' '{"openivm_bridge_view_key":"__openivm_mv_retry"}'
+        |  printf '%s\n' '{"refresh_type":1,"refresh_type_name":"FULL_REFRESH","sql":"SELECT 1 FROM memory.main.openivm_data___openivm_mv_retry;"}'
+        |fi
+        |""".stripMargin
+    ) { (compiler, _, context) =>
+      implicit val ec: ExecutionContext = context
+      val events                        = new ConcurrentLinkedQueue[String]()
+      val tracer = new CompilerTrace(
+        Some(CompileTraceContext("refresh-retry", None, "mv", enabled = true)),
+        line => { events.add(line); () }
+      )
+      val request = cliTestRequest.copy(viewSql = "SELECT unix_timestamp(id) FROM cli_source")
+      val result  = awaitCli(15.seconds) { compiler.compileWithTrace(request, tracer) }
+      result.refreshTypeName shouldBe "FULL_REFRESH"
+      result.nativeSql shouldBe Some("SELECT 1 FROM memory.main.openivm_data___openivm_mv_retry;")
+      result.sql shouldBe s"SELECT 1 FROM openivm_data_${request.viewName};"
+      val mapper = new com.fasterxml.jackson.databind.ObjectMapper()
+      val rows   = events.iterator().asScala.map(line => mapper.readTree(line)).toVector
+      rows.filter(_.path("phase").asText() == "worker_total").map(_.path("attempt").asInt()).toSet shouldBe Set(1, 2)
+      rows.exists(r => r.path("phase").asText() == "scalar_retry" && r.path("attempt").asInt() == 2) shouldBe true
+    }
+  }
+
+  it should "retain failure behavior and return helper launch failure timing" in {
+    withFakeCli("") { (compiler, dir, context) =>
+      implicit val ec: ExecutionContext = context
+      dir.resolve("duckdb").toFile.setExecutable(false) shouldBe true
+      val events = new ConcurrentLinkedQueue[String]()
+      val tracer = new CompilerTrace(
+        Some(CompileTraceContext("refresh-2", None, "db.mv", enabled = true)),
+        line => { events.add(line); () }
+      )
+      val ex = the[OpenIvmCompileException] thrownBy awaitCli(15.seconds) {
+        compiler.compileWithTrace(cliTestRequest, tracer)
+      }
+      ex.getMessage should include("DuckDB CLI I/O helper failed")
+      val rows =
+        events.iterator().asScala.map(line => new com.fasterxml.jackson.databind.ObjectMapper().readTree(line)).toVector
+      rows.exists(r =>
+        r.path("phase").asText() == "native_launch" && r.path("status").asText() == "failed"
+      ) shouldBe true
+      rows.exists(r =>
+        r.path("phase").asText() == "compile_total" && r.path("status").asText() == "failed"
+      ) shouldBe true
     }
   }
 

@@ -88,6 +88,19 @@ class MvCatalogSpec extends AnyFunSpec with BeforeAndAfterAll with BeforeAndAfte
       properties = Map("owner" -> "alice", "tier" -> "gold")
     )
 
+  it("atomically advances the MV version and retains monotonic CDF watermarks") {
+    val entry = sampleMeta("atomic_cdf", Seq("atomic_source"))
+    MvCatalog.upsert(spark, entry)
+    MvCatalog.advanceWithCdfWatermarks(spark, entry.name, 5L, Map("atomic_source" -> 9L))
+    MvCatalog.advanceWithCdfWatermarks(spark, entry.name, 4L, Map("atomic_source" -> 20L))
+    MvCatalog.advanceWithCdfWatermarks(spark, entry.name, 6L, Map("atomic_source" -> 7L))
+
+    val updated = MvCatalog.lookup(spark, entry.name).get
+    updated.lastVersion shouldBe 6L
+    updated.properties("owner") shouldBe "alice"
+    updated.changeWatermarks("atomic_source") shouldBe ChangeWatermark.DeltaVersion(9L)
+  }
+
   it("prepares metadata shards without publishing a view or dependency") {
     val meta = sampleMeta("prepared", Seq("prepared_orders"))
     MvCatalog.prepareCreate(spark, meta.name)

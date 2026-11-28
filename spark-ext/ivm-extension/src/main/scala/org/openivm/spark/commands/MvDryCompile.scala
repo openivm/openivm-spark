@@ -8,7 +8,8 @@ import org.openivm.spark.compiler.{
   CompiledRefresh,
   CompileRequest,
   LptsSparkDialect,
-  OpenIvmCompileException,
+  OpenIvmCompiler,
+  SparkExpressionPrepass,
   SparkTimeTravelSql
 }
 
@@ -77,13 +78,16 @@ object MvDryCompile {
   def dryCompile(
       spark: SparkSession,
       name: TableIdentifier,
-      queryText: String,
+      userQueryText: String,
       clusterColumns: Seq[String] = Seq.empty
   ): DryCompileResult = {
     import MvCommandHelper._
     // Clustering is a physical-layout hint only; it changes neither the refresh
     // classification nor the rewritten SQL, so it is intentionally unused here.
     val _ = clusterColumns
+    // Classify exactly what CREATE compiles; the registry keeps the public schema.
+    val queryText =
+      PublicOutputNames.plan(spark, userQueryText).fold(userQueryText)(_.physicalSql)
 
     val (qualNames, qualSchemas, compileSchemas, shortToQual) =
       collectSourceSchemas(spark, queryText)
@@ -102,7 +106,7 @@ object MvDryCompile {
       Map.empty
     )
     val analyzed     = spark.sql(queryText).queryExecution.analyzed
-    val outputSchema = spark.sql(queryText).schema
+    val outputSchema = spark.sql(userQueryText).schema
 
     // Best-effort workload facts. Cold-DAG stub tables are plain parquet (not
     // Delta), so stats/constraint discovery may throw — fall back to defaults.
@@ -120,22 +124,20 @@ object MvDryCompile {
       }
 
     val compiler = OpenIvmCompilers.forSession(spark)
-    val compiled =
-      try
-        compiler.compile(
-          CompileRequest(
-            viewName = name.table,
-            viewSql = queryText,
-            sources = compileSchemas,
-            sourceQualifiedNames = pinBinding.friendlyByShort,
-            sourceSnapshotPinnedPaths = pinnedPathByShort(pinBinding),
-            facts = workloadFacts
-          )
-        )
-      catch {
-        case _: OpenIvmCompileException =>
-          CompiledRefresh(RefreshTypeCode.FullRefresh, "FULL_REFRESH", "", "")
-      }
+    val expressionBridge = SparkExpressionPrepass.prepare(
+      queryText,
+      spark.sessionState.conf.caseSensitiveAnalysis,
+      analyzedPlan = Some(analyzed)
+    )
+    val compileRequest = CompileRequest(
+      viewName = name.table,
+      viewSql = expressionBridge.sql,
+      sources = compileSchemas,
+      sourceQualifiedNames = pinBinding.friendlyByShort,
+      sourceSnapshotPinnedPaths = pinnedPathByShort(pinBinding),
+      facts = workloadFacts
+    )
+    val compiled = compiler.compile(compileRequest)
 
     val location = mvLocation(spark, name)
 
@@ -184,7 +186,9 @@ object MvDryCompile {
         queryText,
         qualSchemas,
         pinBinding.friendlyByShort,
-        pinBinding.resolvedPins
+        pinBinding.resolvedPins,
+        expressionBridge,
+        compileRequest
       )
 
     DryCompileResult(name, classification, compiled, qualNames, rewrittenStatements, outputSchema)
@@ -205,13 +209,19 @@ object MvDryCompile {
       queryText: String,
       qualSchemas: Map[String, StructType],
       shortToQual: Map[String, String],
-      resolvedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin]
+      resolvedPins: Seq[SparkTimeTravelSql.ResolvedSnapshotPin],
+      expressionBridge: SparkExpressionPrepass.Prepared,
+      compileRequest: CompileRequest
   ): Seq[String] = {
     import MvCommandHelper._
     if (classification.refreshType == RefreshTypeCode.FullRefresh) {
       val body =
-        if (compiled.initialLoadSql.nonEmpty) compiled.initialLoadSql
-        else queryText
+        if (compiled.initialLoadSql.nonEmpty) {
+          val translated = LptsSparkDialect.translate(compiled.initialLoadSql)
+          val restored   = expressionBridge.markers.restore(translated)
+          expressionBridge.markers.requireAllSeen()
+          OpenIvmCompiler.reattachBareInitialLoadSources(restored, compileRequest)
+        } else queryText
       SparkMergeAssembler
         .assemble(
           AssemblyInput(
@@ -231,7 +241,7 @@ object MvDryCompile {
         if (classification.refreshType == RefreshTypeCode.AggregateHaving || topKViewSpec.suffixSql.nonEmpty)
           dataTableId(name)
         else name
-      SparkRefreshRewriter
+      val rewritten = SparkRefreshRewriter
         .rewrite(
           compiledSql = compiled.sql,
           mvName = writeTarget,
@@ -239,7 +249,10 @@ object MvDryCompile {
           viewLogicalName = name.table,
           sourceTempViews = Map.empty,
           viewDeltaPath = viewDeltaPath,
-          postProcess = LptsSparkDialect.translate,
+          postProcess = sql => {
+            val translated = LptsSparkDialect.translate(sql)
+            expressionBridge.markers.restore(translated)
+          },
           sourceSchemas = qualSchemas.map { case (qual, schema) =>
             qual.split("\\.").last -> schema.fieldNames.toSeq
           },
@@ -267,6 +280,8 @@ object MvDryCompile {
           windowPartitionSingleDeleteMergeEnabled = FeatureGate.windowPartitionSingleDeleteMergeEnabled(spark)
         )
         .statements
+      expressionBridge.markers.requireAllSeen()
+      rewritten
     }
   }
 }

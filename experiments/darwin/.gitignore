@@ -1,0 +1,26 @@
+__pycache__/
+output/
+outputs/
+reports/
+runs/
+artifacts/
+
+# Darwin runs place configs, homes, reports and outputs in this directory. Only the
+# harness, its docs and one end-to-end sample per folder are tracked; the rest is ignored.
+/*
+!/.gitignore
+!/README.md
+!/docs/
+!/evaluator/
+!/evaluator.lock.json
+!/manifest.json
+!/manifest.yaml
+!/provision-agent-tools.sh
+!/tests/
+!/validate-offline.sh
+!/configs/
+/configs/*
+!/configs/lane-a.yaml
+!/fixtures/
+/fixtures/*
+!/fixtures/make_fixtures.py

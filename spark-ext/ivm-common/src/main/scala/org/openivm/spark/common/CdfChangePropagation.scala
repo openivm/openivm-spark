@@ -116,7 +116,17 @@ final class CdfChangePropagation extends ChangePropagation {
       sourceTable: String,
       sourceSchema: StructType,
       batches: Seq[ChangeBatch]
-  ): String = {
+  ): String =
+    registerSourceDeltaWithCoverage(spark, sourceTable, sourceSchema, batches)._1
+
+  private[spark] def registerSourceDeltaWithCoverage(
+      spark: SparkSession,
+      sourceTable: String,
+      sourceSchema: StructType,
+      batches: Seq[ChangeBatch]
+  ): (String, Option[CdfChangePropagation.RegisteredDeltaView]) = {
+    import CdfChangePropagation.RegisteredDeltaView
+
     val short    = sourceTable.split("\\.").last
     val viewName = s"openivm_delta_$short"
 
@@ -137,18 +147,23 @@ final class CdfChangePropagation extends ChangePropagation {
         raw.createOrReplaceTempView(transformedAlias)
         val sql = s"""CREATE OR REPLACE TEMP VIEW `$viewName` AS
                      |SELECT $userCols,
-                     |       CAST(`_commit_timestamp` AS TIMESTAMP) AS openivm_timestamp,
+                     |       CAST(`_commit_timestamp` AS TIMESTAMP) AS ${CdfChangePropagation.TimestampColumn},
                      |       CASE
                      |         WHEN `_change_type` IN ('insert', 'update_postimage') THEN CAST(1 AS INT)
                      |         WHEN `_change_type` IN ('delete', 'update_preimage')  THEN CAST(-1 AS INT)
-                     |       END AS openivm_multiplicity
+                     |       END AS ${CdfChangePropagation.SignColumn}
                      |FROM `$transformedAlias`
                      |WHERE `_change_type` IN ('insert', 'delete', 'update_preimage', 'update_postimage')""".stripMargin
         spark.sql(sql)
-        sql
+        // The existing registration reads only the first CDF range. Do not certify broader coverage.
+        val coverage =
+          if (batches.size == 1 && b.baseTable == sourceTable && b.hasBaseline)
+            Some(RegisteredDeltaView(b, viewName, sourceSchema))
+          else None
+        (sql, coverage)
 
       case None =>
-        registerEmptyDeltaView(spark, sourceTable, sourceSchema)
+        (registerEmptyDeltaView(spark, sourceTable, sourceSchema), None)
     }
   }
 
@@ -168,11 +183,12 @@ final class CdfChangePropagation extends ChangePropagation {
     CdfWatermarkCatalog.removeForBaseTable(spark, baseTable)
 
   /**
-   * Per-(view, source) last-consumed Delta version: prefer the value
-   * persisted in [[CdfWatermarkCatalog]] (carries cross-refresh state),
-   * fall back to the value captured at MV CREATE time (carried in
-   * `persisted`). A source with neither (e.g. a view created under intercept
-   * mode) is absent; [[collectChanges]] reports it as a batch without a
+   * Per-(view, source) last-consumed Delta version: take the greater of the
+   * separate watermark catalog and the version committed with MV metadata.
+   * Repair an existing lagging watermark from durable metadata before collecting
+   * changes. Missing catalog entries can be untouched baselines; use metadata
+   * without creating an entry for those sources. A source with neither (e.g. a
+   * view created under intercept mode) is absent; [[collectChanges]] reports it as a batch without a
    * baseline, which REFRESH recomputes and re-baselines rather than
    * replaying the whole change feed onto the view's rows.
    */
@@ -183,6 +199,12 @@ final class CdfChangePropagation extends ChangePropagation {
       persisted: Map[String, ChangeWatermark]
   ): Map[String, Long] = {
     val liveBySource = CdfWatermarkCatalog.getAll(spark, viewName, sources)
+    val lagging = sources.distinct.flatMap { src =>
+      persisted.get(src).collect {
+        case ChangeWatermark.DeltaVersion(version) if liveBySource.get(src).exists(_ < version) => src -> version
+      }
+    }.toMap
+    if (lagging.nonEmpty) CdfWatermarkCatalog.putAll(spark, viewName, lagging)
     sources.distinct.flatMap { src =>
       val live = liveBySource.get(src)
       val seed = persisted.get(src).collect { case ChangeWatermark.DeltaVersion(v) => v }
@@ -197,6 +219,10 @@ final class CdfChangePropagation extends ChangePropagation {
 }
 
 object CdfChangePropagation {
+
+  private[spark] final case class RegisteredDeltaView(batch: CdfChangeBatch, name: String, rowSchema: StructType)
+  private[spark] val TimestampColumn = "openivm_timestamp"
+  private[spark] val SignColumn      = "openivm_multiplicity"
 
   /**
    * `true` when the Delta table identified by `name` has
